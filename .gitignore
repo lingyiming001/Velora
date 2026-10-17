@@ -1,0 +1,23 @@
+# Local and generated files (project-continuity)
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.*.example
+!.env.*.sample
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+.swiftpm/
+.build/
+*.xcresult
+
+AGENTS.md
+docs/dev/
+
+# Local and generated files (project-continuity)
+.agents/
+.idea/
