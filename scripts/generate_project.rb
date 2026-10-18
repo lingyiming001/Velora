@@ -29,7 +29,9 @@ def add_sources(project, target, root, top_level)
 end
 
 %w[App Domain Data Features].each { |folder| add_sources(project, target, root, folder) }
-assets = project.main_group.children.find { |group| group.display_name == 'App' }.new_file('Assets.xcassets')
+app_group = project.main_group.children.find { |group| group.display_name == 'App' }
+%w[Info.plist Velora.entitlements].each { |file| app_group.new_file(file) }
+assets = app_group.new_file('Assets.xcassets')
 target.resources_build_phase.add_file_reference(assets)
 
 
@@ -47,6 +49,9 @@ target.build_configurations.each do |configuration|
   settings['PRODUCT_BUNDLE_IDENTIFIER'] = 'com.velora.app'
   settings['PRODUCT_NAME'] = 'Velora'
   settings['ASSETCATALOG_COMPILER_APPICON_NAME'] = 'AppIcon'
+  settings['CODE_SIGN_ENTITLEMENTS'] = 'App/Velora.entitlements'
+  settings['ENABLE_HARDENED_RUNTIME'] = 'YES'
+  settings['ENABLE_APP_SANDBOX'] = 'NO'
   settings['GENERATE_INFOPLIST_FILE'] = 'YES'
   settings['INFOPLIST_FILE'] = 'App/Info.plist'
   settings['MARKETING_VERSION'] = '0.1.0'
@@ -59,7 +64,8 @@ target.build_configurations.each do |configuration|
   settings['SWIFT_VERSION'] = '5.0'
   settings['MACOSX_DEPLOYMENT_TARGET'] = '14.0'
   settings['OTHER_LDFLAGS'] = ['$(inherited)', '-lsqlite3']
-  settings['CODE_SIGNING_ALLOWED'] = 'NO'
+  settings['CODE_SIGN_STYLE'] = 'Manual'
+  settings['CODE_SIGN_IDENTITY'] = '-'
 end
 
 tests.build_configurations.each do |configuration|
@@ -70,12 +76,14 @@ tests.build_configurations.each do |configuration|
   settings['MACOSX_DEPLOYMENT_TARGET'] = '14.0'
   settings['TEST_HOST'] = '$(BUILT_PRODUCTS_DIR)/Velora.app/Contents/MacOS/Velora'
   settings['BUNDLE_LOADER'] = '$(TEST_HOST)'
-  settings['CODE_SIGNING_ALLOWED'] = 'NO'
+  settings['CODE_SIGN_STYLE'] = 'Manual'
+  settings['CODE_SIGN_IDENTITY'] = '-'
 end
 
 project.save
 scheme = Xcodeproj::XCScheme.new
 scheme.add_build_target(target)
 scheme.add_test_target(tests)
+scheme.set_launch_target(target)
 scheme.save_as(project_path, 'Velora')
 puts project_path

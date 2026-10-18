@@ -58,6 +58,17 @@ MCP 默认关闭，启用后仅监听本机且默认只读；允许写入后，�
 
 工程使用一个 App target，按职责组织为 `App/`（入口）、`Domain/`（模型）、`Data/SQLite/`（本地数据）、`Features/`（界面和状态）及 `Tests/`。实际目录和新增文件放置规则见 [项目目录结构](docs/08-Project-Structure.md)。新增 Swift 文件后运行 `scripts/generate_project.rb` 更新工程。
 
+## 在 Xcode 中运行
+
+打开 `Velora.xcodeproj`，选择共享 Scheme **Velora** 和 **My Mac**，按 `⌘R` 运行；`⌘U` 运行测试。
+
+- App target：**Velora**；图标在 `App/Assets.xcassets/AppIcon.appiconset`，General 中选择 AppIcon。
+- Info 页管理显示名、版本、分类及麦克风/语音识别用途说明；`App/Info.plist` 保留局域网访问配置。
+- `App/Velora.entitlements` 启用 Hardened Runtime 所需的音频输入权限；系统授权仍在主动录音时申请。
+- 默认使用本机 ad-hoc 签名（Sign to Run Locally），无需开发者团队；发布时在 Signing & Capabilities 配置自己的团队及分发签名。
+- 当前关闭 App Sandbox，以兼容已有自选存储目录、备份及本机 MCP 服务。发布沙盒版本需另行实现安全作用域文件访问。
+- 工程生成脚本保留上述配置及 Run/Profile 的 App 可执行文件设置。
+
 ## 拟议开发环境
 
 - Xcode 27、Swift、SwiftUI + AppKit，最低 macOS 14（暂定，仍需目标设备验证）。

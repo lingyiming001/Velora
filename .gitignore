@@ -1,23 +1,27 @@
-# Local and generated files (project-continuity)
+# Personal OS and editor state
 .DS_Store
 Thumbs.db
+*.xcuserstate
+xcuserdata/
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/shelf/
+
+# Local environment configuration (keep shareable examples)
 .env
 .env.*
 !.env.example
 !.env.sample
 !.env.*.example
 !.env.*.sample
-DerivedData/
-build/
-*.xcuserstate
-xcuserdata/
-.swiftpm/
-.build/
+
+# Personal agent progress and temporary verification output
+/.agents/STATUS.md
+/.agents/LOG.md
+/.agents/test/
+
+# Build products and caches
+/DerivedData/
+/build/
+/.build/
 *.xcresult
-
-AGENTS.md
-docs/dev/
-
-# Local and generated files (project-continuity)
-.agents/
-.idea/
