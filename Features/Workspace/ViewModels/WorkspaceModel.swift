@@ -161,13 +161,17 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
-    func addBlock(_ kind: BlockKind = .paragraph) {
+    func addBlock(_ kind: BlockKind = .paragraph, after previous: Block? = nil) {
         guard let id = selectedPageID else { return }
         Task {
             do {
-                let block = try await store.createBlock(pageID: id, kind: kind)
+                let block = try await store.createBlock(pageID: id, kind: kind, after: previous)
                 if selectedPageID == id {
-                    blocks.append(block)
+                    if let previous, let index = blocks.firstIndex(where: { $0.id == previous.id }) {
+                        blocks.insert(block, at: index + 1)
+                    } else {
+                        blocks.append(block)
+                    }
                     requestFocus(block.id, offset: 0)
                 }
             } catch { report(error) }
@@ -180,12 +184,15 @@ final class WorkspaceModel: ObservableObject {
 
     func changeRichText(_ text: String, formatting: [TextStyleRun], in block: Block) {
         guard let index = blocks.firstIndex(where: { $0.id == block.id }) else { return }
-        blocks[index].text = text
-        blocks[index].formatting = formatting
+        guard blocks[index].text != text || blocks[index].formatting != formatting else { return }
+        var updated = blocks[index]
+        updated.text = text
+        updated.formatting = formatting
+        blocks[index] = updated
         latestText[block.id] = text
         latestFormatting[block.id] = formatting
         pendingWrites[block.id]?.cancel()
-        saving = true
+        if !saving { saving = true }
         pendingWrites[block.id] = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled, let self else { return }

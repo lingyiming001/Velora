@@ -96,4 +96,13 @@ struct Block: Identifiable, Hashable, Sendable {
     var language: String = "Plain Text"
     var collapsed: Bool = false
     var formatting: [TextStyleRun] = []
+
+    var hasContent: Bool {
+        if kind == .divider || kind == .tableOfContents { return true }
+        if kind == .table, let data = text.data(using: .utf8),
+           let rows = try? JSONDecoder().decode([[String]].self, from: data) {
+            return rows.joined().contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        }
+        return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 }

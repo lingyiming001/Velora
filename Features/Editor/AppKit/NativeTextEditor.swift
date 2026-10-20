@@ -237,8 +237,23 @@ struct NativeTextEditor: NSViewRepresentable {
             view.needsDisplay = true
         }
 
+        private struct MeasurementInput: Equatable {
+            var text: String
+            var runs: [TextStyleRun]
+            var font: NSFont
+            var width: CGFloat
+            var inset: NSSize
+            var language: String?
+        }
+        private var lastMeasurement: MeasurementInput?
+
         func measure(_ view: NSTextView) {
             guard let container = view.textContainer, let layout = view.layoutManager else { return }
+            let input = MeasurementInput(text: view.string, runs: lastAppliedRuns, font: parent.font,
+                                         width: container.containerSize.width, inset: view.textContainerInset,
+                                         language: parent.codeLanguage)
+            guard input != lastMeasurement, input.width > 0 else { return }
+            lastMeasurement = input
             layout.ensureLayout(for: container)
             let used = layout.usedRect(for: container)
             let bottom = max(used.maxY, layout.extraLineFragmentRect.maxY)
@@ -311,6 +326,12 @@ private final class CodeTextView: NSTextView {
 
 /// Lightweight lexical coloring; temporary layout attributes leave plain text and undo history intact.
 private enum CodeSyntax {
+    private static let regexCache: NSCache<NSString, NSRegularExpression> = {
+        let cache = NSCache<NSString, NSRegularExpression>()
+        cache.countLimit = 32
+        return cache
+    }()
+
     static func highlight(_ text: String, language: String, dark: Bool, layout: NSLayoutManager) {
         let lang = language.lowercased()
         let keywordSets: [String: String] = [
@@ -330,7 +351,15 @@ private enum CodeSyntax {
         let comments = hashComments ? #"#[^\n]*"# : #"//[^\n]*|/\*[\s\S]*?\*/"#
         let strings = #""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`"#
         let pattern = "(?<comment>" + comments + ")|(?<string>" + strings + ")|(?<number>" + #"\b\d+(?:\.\d+)?\b"# + ")|(?<keyword>\\b(?:" + words + ")\\b)"
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: lang == "sql" ? [.caseInsensitive] : []) else { return }
+        let cacheKey = (key + ":" + (hashComments ? "hash" : "slash")) as NSString
+        let regex: NSRegularExpression
+        if let cached = regexCache.object(forKey: cacheKey) {
+            regex = cached
+        } else {
+            guard let compiled = try? NSRegularExpression(pattern: pattern, options: lang == "sql" ? [.caseInsensitive] : []) else { return }
+            regexCache.setObject(compiled, forKey: cacheKey)
+            regex = compiled
+        }
         let colors: [(String, NSColor)] = [
             ("comment", dark ? NSColor(red: 0.45, green: 0.53, blue: 0.61, alpha: 1) : NSColor(red: 0.49, green: 0.55, blue: 0.62, alpha: 1)),
             ("string", dark ? NSColor(red: 0.65, green: 0.8, blue: 0.57, alpha: 1) : NSColor(red: 0.2, green: 0.47, blue: 0.36, alpha: 1)),

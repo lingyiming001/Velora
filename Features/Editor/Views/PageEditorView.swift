@@ -112,18 +112,28 @@ private struct EditorBlockRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            VStack(spacing: 3) {
+            Group {
+            if block.hasContent {
+            HStack(spacing: 2) {
+                Button { model.addBlock(after: block) } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 16, weight: .regular))
+                        .frame(width: 24, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("在下方添加块")
+                .accessibilityLabel("在下方添加块")
                 blockMenu
-                Button {
-                    let modifiers = NSApp.currentEvent?.modifierFlags ?? []
-                    model.selectBlock(block.id, extend: modifiers.contains(.shift), toggle: modifiers.contains(.command))
-                } label: {
-                    Image(systemName: model.selectedBlockIDs.contains(block.id) ? "checkmark.circle.fill" : "circle")
-                        .font(.system(size: 12)).frame(width: 32, height: 20)
-                }.buttonStyle(.plain).foregroundStyle(model.selectedBlockIDs.contains(block.id) ? Color.accentColor : Color.secondary)
-                    .opacity(hovered || !model.selectedBlockIDs.isEmpty ? 1 : 0.35)
-                    .help("选择块；Shift 连续选择，⌘ 点击多选")
-            }.frame(width: 34).padding(.top, 2)
+            }
+            .foregroundStyle(Color(red: 0.45, green: 0.47, blue: 0.56))
+            } else {
+                Color.clear.frame(width: 50, height: 28).allowsHitTesting(false)
+            }
+            }
+            .frame(width: 50)
+            .padding(.top, block.kind == .code ? 12 : 1)
+            .opacity(hovered || focused || model.selectedBlockIDs.contains(block.id) ? 1 : 0.55)
             VStack(alignment: .leading, spacing: 8) {
             if block.kind == .image {
                 VStack(alignment: .leading, spacing: 10) {
@@ -204,6 +214,7 @@ private struct EditorBlockRow: View {
         .padding(.horizontal, block.kind == .callout ? 12 : 0)
         .background(block.kind == .callout ? Color.orange.opacity(0.1) : .clear, in: RoundedRectangle(cornerRadius: 8))
         .sheet(isPresented: $selectingImage) { ImageSourcePicker(initialValue: block.text) { model.changeText($0, in: block) } }
+        .contentShape(Rectangle())
         .onHover { hovered = $0 }
         .zIndex(showingCommands ? 1 : 0)
     }
@@ -234,12 +245,20 @@ private struct EditorBlockRow: View {
             Button("选择此块") { model.selectBlock(block.id) }
             Button("全选文档内容  ⌘A") { model.selectAllBlocks() }
         } label: {
-            HStack(spacing: 2) { Image(systemName: "ellipsis"); Image(systemName: "chevron.down").font(.system(size: 7, weight: .bold)) }
-                .foregroundStyle(.secondary).frame(width: 32, height: 24)
+            HStack(spacing: 4) {
+                ForEach(0..<2) { _ in
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 15, weight: .bold))
+                        .rotationEffect(.degrees(90))
+                        .frame(width: 4, height: 18)
+                }
+            }
+            .frame(width: 24, height: 28)
+            .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 34)
-        .opacity(hovered || focused || model.selectedBlockIDs.contains(block.id) ? 1 : 0.6)
-        .help("更改块类型或删除")
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 24, height: 28)
+        .help("块操作：更改类型、选择或删除")
+        .accessibilityLabel("块操作")
     }
 
     private var collapseButton: some View {
@@ -397,6 +416,8 @@ private struct EditorBlockRow: View {
             }
         }
         .contextMenu {
+            Button("复制代码", systemImage: "doc.on.doc", action: copyCode)
+            Divider()
             Button("转为正文") { model.changeKind(.paragraph, of: block) }
             Button("删除代码块", role: .destructive) { model.delete(block) }
         }
@@ -406,6 +427,12 @@ private struct EditorBlockRow: View {
             .strokeBorder(focused ? Color.indigo.opacity(0.35) : Color.primary.opacity(0.08), lineWidth: 1))
         .shadow(color: .black.opacity(colorScheme == .dark ? 0.12 : 0.025), radius: 8, y: 3)
         .padding(.vertical, 6)
+    }
+
+    private func copyCode() {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        copied = pasteboard.setString(block.text, forType: .string)
     }
 
     private var codeHeader: some View {
@@ -434,14 +461,15 @@ private struct EditorBlockRow: View {
             Spacer(minLength: 8)
             Text("\(block.text.isEmpty ? 0 : block.text.components(separatedBy: "\n").count) 行")
                 .monospacedDigit().foregroundStyle(.tertiary)
-            Button {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(block.text, forType: .string)
-                copied = true
-            } label: {
-                Image(systemName: copied ? "checkmark" : "doc.on.doc").frame(width: 24, height: 24)
+            Button(action: copyCode) {
+                Label(copied ? "已复制" : "复制", systemImage: copied ? "checkmark" : "doc.on.doc")
+                    .padding(.horizontal, 8)
+                    .frame(height: 24)
+                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 5))
+                    .contentShape(Rectangle())
             }
-            .help(copied ? "已复制" : "复制代码").accessibilityLabel("复制代码")
+            .help(copied ? "已复制到剪贴板" : "复制代码到剪贴板")
+            .accessibilityLabel(copied ? "已复制到剪贴板" : "复制代码到剪贴板")
             .task(id: copied) {
                 if copied {
                     try? await Task.sleep(for: .seconds(2))

@@ -4,6 +4,42 @@ import XCTest
 
 @MainActor
 final class EditorInteractionTests: XCTestCase {
+    func testEmptyBlocksHideControlsAndStructuralBlocksRemainUsable() {
+        var block = Block(id: UUID(), pageID: UUID(), kind: .paragraph, text: " \n\t", order: 1024, checked: false)
+        XCTAssertFalse(block.hasContent)
+        block.text = "内容"; XCTAssertTrue(block.hasContent)
+        block.kind = .table; block.text = #"[["", " "], ["", ""]]"#
+        XCTAssertFalse(block.hasContent)
+        block.text = #"[["名称", ""], ["", ""]]"#; XCTAssertTrue(block.hasContent)
+        block.text = ""; block.kind = .divider; XCTAssertTrue(block.hasContent)
+        block.kind = .tableOfContents; XCTAssertTrue(block.hasContent)
+    }
+
+    func testHeightMeasurementSkipsUnchangedContentAndInvalidatesForWidthAndText() {
+        var heights: [CGFloat] = []
+        let font = NSFont.systemFont(ofSize: 17)
+        let editor = NativeTextEditor(text: "内容", font: font, onHeightChange: { heights.append($0) }, onChange: { _ in })
+        let coordinator = NativeTextEditor.Coordinator(parent: editor)
+        let view = NSTextView(frame: NSRect(x: 0, y: 0, width: 300, height: 100))
+        view.isVerticallyResizable = true
+        view.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        view.textContainer?.widthTracksTextView = false
+        view.textContainer?.heightTracksTextView = false
+        view.font = font; view.string = "内容"
+        view.textContainer?.containerSize = NSSize(width: 300, height: CGFloat.greatestFiniteMagnitude)
+        coordinator.measure(view)
+        for _ in 0..<100 { coordinator.measure(view) }
+        XCTAssertEqual(heights.count, 1)
+        view.string = String(repeating: "更多内容", count: 100)
+        coordinator.measure(view)
+        XCTAssertEqual(heights.count, 2)
+        XCTAssertGreaterThan(heights[1], heights[0])
+        view.textContainer?.containerSize.width = 150
+        coordinator.measure(view)
+        XCTAssertEqual(heights.count, 3)
+        XCTAssertGreaterThan(heights[2], heights[1])
+    }
+
     private func fixture() async throws -> (URL, SQLiteStore, WorkspaceModel, [Block]) {
         let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent(".agents/test/editor-" + UUID().uuidString)
@@ -19,6 +55,18 @@ final class EditorInteractionTests: XCTestCase {
         for _ in 0..<100 where model.blocks.count != blocks.count { try await Task.sleep(for: .milliseconds(5)) }
         XCTAssertEqual(model.blocks.count, blocks.count)
         return (directory, store, model, blocks)
+    }
+
+    func testUnchangedTextDoesNotStartAutosave() async throws {
+        let (_, _, model, _) = try await fixture()
+        let block = try XCTUnwrap(model.blocks.first)
+        XCTAssertFalse(model.saving)
+        model.changeRichText(block.text, formatting: block.formatting, in: block)
+        XCTAssertFalse(model.saving)
+        model.changeText("新内容", in: block)
+        XCTAssertTrue(model.saving)
+        await model.flushAll()
+        XCTAssertFalse(model.saving)
     }
 
     func testRangeSelectionDeleteAndSelectAllLeavesWritableParagraph() async throws {

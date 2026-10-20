@@ -240,10 +240,18 @@ actor SQLiteStore {
 
     func createBlock(pageID: UUID, kind: BlockKind, after: Block? = nil) throws -> Block {
         let existing = try blocks(in: pageID)
-        let nextOrder = (existing.map(\.order).max() ?? 0) + 1024
-        let block = Block(id: UUID(), pageID: pageID, kind: kind, text: "", order: nextOrder, checked: false)
-        try run("INSERT INTO blocks(id,page_id,kind,body,sort_order,checked) VALUES(?,?,?,?,?,0)",
-                [block.id.uuidString, pageID.uuidString, kind.rawValue, "", String(block.order)])
+        let insertionIndex = after.flatMap { previous in existing.firstIndex(where: { $0.id == previous.id }) }.map { $0 + 1 } ?? existing.count
+        let block = Block(id: UUID(), pageID: pageID, kind: kind, text: "", order: Int64(insertionIndex + 1) * 1024, checked: false)
+        try transaction {
+            if insertionIndex < existing.count {
+                for (index, item) in existing.enumerated() {
+                    let order = (index + (index >= insertionIndex ? 2 : 1)) * 1024
+                    try run("UPDATE blocks SET sort_order=? WHERE id=?", [String(order), item.id.uuidString])
+                }
+            }
+            try run("INSERT INTO blocks(id,page_id,kind,body,sort_order,checked) VALUES(?,?,?,?,?,0)",
+                    [block.id.uuidString, pageID.uuidString, kind.rawValue, "", String(block.order)])
+        }
         return block
     }
 

@@ -2,6 +2,23 @@ import XCTest
 @testable import Velora
 
 final class SQLiteStoreTests: XCTestCase {
+    func testInsertBlockAfterKeepsOrderAfterReopen() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/BlockInsertion-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("test.sqlite")
+        let store = try SQLiteStore(databaseURL: url)
+        let page = try await store.createPage()
+        let first = try await store.createBlock(pageID: page.id, kind: .paragraph)
+        let last = try await store.createBlock(pageID: page.id, kind: .code)
+        let middle = try await store.createBlock(pageID: page.id, kind: .paragraph, after: first)
+        let next = try await store.createBlock(pageID: page.id, kind: .todo, after: first)
+        let reopened = try SQLiteStore(databaseURL: url)
+        let blocks = try await reopened.blocks(in: page.id)
+        XCTAssertEqual(blocks.map(\.id), [first.id, next.id, middle.id, last.id])
+        XCTAssertEqual(Set(blocks.map(\.order)).count, 4)
+    }
+
     @MainActor
     func testAssistantCompletionURLs() throws {
         let cases = [
