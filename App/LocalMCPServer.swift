@@ -22,8 +22,8 @@ final class LocalMCPServer {
         listener.stateUpdateHandler = { [weak self] state in
             Task { @MainActor in
                 switch state {
-                case .ready: self?.onStatus?("运行中 · 127.0.0.1:\(self?.port ?? 0)")
-                case .failed(let error): self?.onStatus?("启动失败：\(error.localizedDescription)"); self?.stop()
+                case .ready: self?.onStatus?(L10n.tr("运行中 · 127.0.0.1:\(self?.port ?? 0)"))
+                case .failed(let error): self?.onStatus?(L10n.tr("启动失败：\(error.localizedDescription)")); self?.stop()
                 default: break
                 }
             }

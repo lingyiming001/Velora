@@ -34,14 +34,14 @@ struct WorkspaceCatalog: Codable {
 
     static func load(from url: URL, legacyDatabaseURL: URL) throws -> WorkspaceCatalog {
         guard FileManager.default.fileExists(atPath: url.path) else {
-            let profile = WorkspaceProfile(id: UUID(), name: "默认工作空间", summary: "", symbol: WorkspaceProfile.symbols[0],
+            let profile = WorkspaceProfile(id: UUID(), name: L10n.tr("默认工作空间"), summary: "", symbol: WorkspaceProfile.symbols[0],
                                            color: "indigo", databasePath: legacyDatabaseURL.path, createdAt: Date())
             return WorkspaceCatalog(workspaces: [profile], activeID: profile.id)
         }
         let catalog = try JSONDecoder().decode(Self.self, from: Data(contentsOf: url))
         guard !catalog.workspaces.isEmpty, catalog.workspaces.contains(where: { $0.id == catalog.activeID }),
               Set(catalog.workspaces.map(\.id)).count == catalog.workspaces.count else {
-            throw AppError.message("工作空间配置无效，请检查 workspaces.json")
+            throw AppError.message(L10n.tr("工作空间配置无效，请检查 workspaces.json"))
         }
         return catalog
     }
@@ -55,20 +55,20 @@ struct WorkspaceCatalog: Codable {
         var result = profile
         result.name = result.name.trimmingCharacters(in: .whitespacesAndNewlines)
         result.summary = result.summary.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !result.name.isEmpty, result.name.count <= 60 else { throw AppError.message("工作空间名称需为 1–60 个字符") }
-        guard result.summary.count <= 500 else { throw AppError.message("简介最多 500 个字符") }
+        guard !result.name.isEmpty, result.name.count <= 60 else { throw AppError.message(L10n.tr("工作空间名称需为 1–60 个字符")) }
+        guard result.summary.count <= 500 else { throw AppError.message(L10n.tr("简介最多 500 个字符")) }
         guard !workspaces.contains(where: { $0.id != result.id && $0.name.compare(result.name, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }) else {
-            throw AppError.message("已存在同名工作空间")
+            throw AppError.message(L10n.tr("已存在同名工作空间"))
         }
         guard WorkspaceProfile.symbols.contains(result.symbol), WorkspaceProfile.colors.contains(result.color) else {
-            throw AppError.message("请选择有效的图标和颜色")
+            throw AppError.message(L10n.tr("请选择有效的图标和颜色"))
         }
         return result
     }
 
     mutating func remove(_ id: UUID) throws {
-        guard workspaces.count > 1 else { throw AppError.message("至少需要保留一个工作空间") }
-        guard let index = workspaces.firstIndex(where: { $0.id == id }) else { throw AppError.message("工作空间不存在") }
+        guard workspaces.count > 1 else { throw AppError.message(L10n.tr("至少需要保留一个工作空间")) }
+        guard let index = workspaces.firstIndex(where: { $0.id == id }) else { throw AppError.message(L10n.tr("工作空间不存在")) }
         removedWorkspaces.append(workspaces.remove(at: index))
         if activeID == id { activeID = workspaces[0].id }
     }

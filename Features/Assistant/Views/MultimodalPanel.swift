@@ -30,24 +30,24 @@ struct MultimodalPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Label("多模态工具", systemImage: "sparkles").font(.title2.bold())
+                Label(L10n.tr("多模态工具"), systemImage: "sparkles").font(.title2.bold())
                 Spacer()
-                Button("配置模型…") { openSettings() }
-                Button("关闭") { cancel(); dismiss() }.keyboardShortcut(.cancelAction).disabled(inserting)
+                Button(L10n.tr("配置模型…")) { openSettings() }
+                Button(L10n.tr("关闭")) { cancel(); dismiss() }.keyboardShortcut(.cancelAction).disabled(inserting)
             }
-            Picker("用途", selection: $capability) {
+            Picker(L10n.tr("用途"), selection: $capability) {
                 ForEach(AICapability.allCases) { Text($0.label).tag($0) }
             }.pickerStyle(.segmented).disabled(working || inserting)
             HStack {
-                Picker("使用模型", selection: Binding<UUID?>(get: { models.selected(for: capability)?.id }, set: {
+                Picker(L10n.tr("使用模型"), selection: Binding<UUID?>(get: { models.selected(for: capability)?.id }, set: {
                     if let id = $0 { models.select(id, for: capability) }
                 })) {
-                    Text("未配置此类模型").tag(Optional<UUID>.none)
+                    Text(L10n.tr("未配置此类模型")).tag(Optional<UUID>.none)
                     ForEach(models.profiles(for: capability)) { Text($0.name + " · " + $0.model).tag(Optional($0.id)) }
                 }
                 if working { ProgressView().controlSize(.small) }
             }.disabled(working || inserting)
-            if !enabled { Text("请在设置 → AI 助手中启用 AI 功能。").font(.callout).foregroundStyle(.secondary) }
+            if !enabled { Text(L10n.tr("请在设置 → AI 助手中启用 AI 功能。")).font(.callout).foregroundStyle(.secondary) }
             if capability != .transcription {
                 TextEditor(text: $prompt).font(.body).frame(height: 95)
                     .padding(8).background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
@@ -57,20 +57,20 @@ struct MultimodalPanel: View {
             }
             if capability == .vision {
                 HStack {
-                    Button(image.isEmpty ? "选择图片（URL / 本地）…" : "更换图片…") { choosingImage = true }
-                    if !image.isEmpty { Label("已选择一张图片", systemImage: "checkmark.circle") }
+                    Button(image.isEmpty ? L10n.tr("选择图片（URL / 本地）…") : L10n.tr("更换图片…")) { choosingImage = true }
+                    if !image.isEmpty { Label(L10n.tr("已选择一张图片"), systemImage: "checkmark.circle") }
                 }.disabled(working)
             }
             if capability == .transcription {
                 HStack {
-                    Button("选择音频文件…") { chooseAudio() }
-                    Text(audioName.isEmpty ? "支持 MP3 / M4A / WAV 等，最大 25 MB" : audioName).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Button(L10n.tr("选择音频文件…")) { chooseAudio() }
+                    Text(audioName.isEmpty ? L10n.tr("支持 MP3 / M4A / WAV 等，最大 25 MB") : audioName).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }.disabled(working)
             }
             HStack {
-                Text("仅发送当前输入和所选附件，不自动发送页面内容。").font(.caption).foregroundStyle(.secondary)
+                Text(L10n.tr("仅发送当前输入和所选附件，不自动发送页面内容。")).font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                if working { Button("取消请求") { cancel() } }
+                if working { Button(L10n.tr("取消请求")) { cancel() } }
                 else { Button(actionLabel) { run() }.buttonStyle(.borderedProminent).disabled(!canRun || inserting) }
             }
             Divider()
@@ -80,45 +80,45 @@ struct MultimodalPanel: View {
                     if !generatedImage.isEmpty { MediaImageView(source: generatedImage).frame(height: 240) }
                     if let data = speechData {
                         HStack {
-                            Button("播放语音") { play(data) }
-                            Button("停止") { playback?.stop() }
-                            Button("保存音频…") { saveAudio(data) }
+                            Button(L10n.tr("播放语音")) { play(data) }
+                            Button(L10n.tr("停止")) { playback?.stop() }
+                            Button(L10n.tr("保存音频…")) { saveAudio(data) }
                         }
-                        Text("此语音由 AI 生成。").font(.caption).foregroundStyle(.secondary)
+                        Text(L10n.tr("此语音由 AI 生成。")).font(.caption).foregroundStyle(.secondary)
                     }
                     if !status.isEmpty { Text(status).font(.callout).foregroundStyle(.secondary).textSelection(.enabled) }
                 }.frame(maxWidth: .infinity, alignment: .leading)
             }.frame(maxHeight: .infinity)
             if !reply.isEmpty || !generatedImage.isEmpty {
                 HStack {
-                    if !reply.isEmpty { Button("复制文字") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(reply, forType: .string) } }
+                    if !reply.isEmpty { Button(L10n.tr("复制文字")) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(reply, forType: .string) } }
                     Spacer()
-                    Button(inserting ? "正在插入…" : "插入当前页面") { insertResult() }
+                    Button(inserting ? L10n.tr("正在插入…") : L10n.tr("插入当前页面")) { insertResult() }
                         .disabled(services.model?.selectedPage == nil || working || inserting)
                 }
             }
         }.padding(24).frame(width: 760, height: 680)
         .sheet(isPresented: $choosingImage) { ImageSourcePicker(initialValue: image) { image = $0 } }
         .onChange(of: capability) { _, _ in clearResult() }
-        .onChange(of: services.currentWorkspace?.id) { _, _ in clearResult(); status = "工作空间已切换，请重新生成。" }
+        .onChange(of: services.currentWorkspace?.id) { _, _ in clearResult(); status = L10n.tr("工作空间已切换，请重新生成。") }
         .onDisappear { cancel() }
         .interactiveDismissDisabled(inserting)
     }
 
     private var promptHint: String {
         switch capability {
-        case .vision: "输入你想了解的图片内容，例如：提取图片中的文字"
-        case .imageGeneration: "描述你希望生成的图片"
-        case .speech: "输入要朗读的文字"
-        default: "输入问题或指令"
+        case .vision: L10n.tr("输入你想了解的图片内容，例如：提取图片中的文字")
+        case .imageGeneration: L10n.tr("描述你希望生成的图片")
+        case .speech: L10n.tr("输入要朗读的文字")
+        default: L10n.tr("输入问题或指令")
         }
     }
     private var actionLabel: String {
         switch capability {
-        case .transcription: "转写音频"
-        case .imageGeneration: "生成图片"
-        case .speech: "生成并播放语音"
-        default: "发送"
+        case .transcription: L10n.tr("转写音频")
+        case .imageGeneration: L10n.tr("生成图片")
+        case .speech: L10n.tr("生成并播放语音")
+        default: L10n.tr("发送")
         }
     }
     private var canRun: Bool {
@@ -139,7 +139,7 @@ struct MultimodalPanel: View {
     }
     private func run() {
         guard canRun, let profile = models.selected(for: capability) else { return }
-        clearResult(); working = true; status = "正在请求「\(profile.name)」…"
+        clearResult(); working = true; status = L10n.tr("正在请求「\(profile.name)」…")
         let token = UUID(); requestID = token
         let text = prompt; let selectedImage = image; let selectedAudio = audio
         operation = Task {
@@ -151,7 +151,7 @@ struct MultimodalPanel: View {
                     let result = try await client.chat(profile: profile, messages: [AIClient.userMessage(text, image: profile.capability == .vision ? selectedImage : nil)])
                     try Task.checkCancellation(); reply = result
                 case .transcription:
-                    guard let selectedAudio else { throw AppError.message("请先选择音频") }
+                    guard let selectedAudio else { throw AppError.message(L10n.tr("请先选择音频")) }
                     let result = try await client.transcribe(profile: profile, audio: selectedAudio)
                     try Task.checkCancellation(); reply = result
                 case .imageGeneration:
@@ -161,21 +161,21 @@ struct MultimodalPanel: View {
                     let result = try await client.speech(profile: profile, text: text)
                     try Task.checkCancellation(); speechData = result; play(result)
                 }
-                if profile.capability != .speech { status = "已完成，可查看结果后选择是否插入页面。" }
+                if profile.capability != .speech { status = L10n.tr("已完成，可查看结果后选择是否插入页面。") }
             } catch { if !Task.isCancelled { status = error.localizedDescription } }
         }
     }
     private func play(_ data: Data) {
         do {
             playback?.stop(); playback = try AVAudioPlayer(data: data)
-            guard playback?.play() == true else { throw AppError.message("无法播放服务返回的音频") }
-            status = "正在播放 AI 生成的语音"
+            guard playback?.play() == true else { throw AppError.message(L10n.tr("无法播放服务返回的音频")) }
+            status = L10n.tr("正在播放 AI 生成的语音")
         } catch { status = error.localizedDescription }
     }
     private func saveAudio(_ data: Data) {
-        let panel = NSSavePanel(); panel.allowedContentTypes = [.mp3]; panel.nameFieldStringValue = "Velora语音.mp3"
+        let panel = NSSavePanel(); panel.allowedContentTypes = [.mp3]; panel.nameFieldStringValue = L10n.tr("Velora语音.mp3")
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { try data.write(to: url, options: .atomic); status = "音频已保存" }
+        do { try data.write(to: url, options: .atomic); status = L10n.tr("音频已保存") }
         catch { status = error.localizedDescription }
     }
     private func insertResult() {
@@ -190,12 +190,12 @@ struct MultimodalPanel: View {
                     if source.hasPrefix("data:") { stored = source }
                     else { stored = try await AIClient.downloadImage(source) }
                     try Task.checkCancellation()
-                    guard services.model === model else { throw AppError.message("工作空间已切换，请重新选择页面") }
+                    guard services.model === model else { throw AppError.message(L10n.tr("工作空间已切换，请重新选择页面")) }
                     try await model.insertMedia(.image, text: stored, pageID: pageID)
                 } else {
                     _ = try await model.executeTool("append_text", arguments: ["page_id": pageID.uuidString, "text": text])
                 }
-                status = "结果已插入页面"
+                status = L10n.tr("结果已插入页面")
             } catch { if !Task.isCancelled { status = error.localizedDescription } }
         }
     }

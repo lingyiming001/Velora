@@ -8,7 +8,7 @@ struct AutomationAction: Codable, Identifiable {
         let labels = ["create_page": "新建页面", "rename_page": "重命名页面", "move_page": "移动页面",
                       "trash_page": "移到回收箱", "restore_page": "恢复页面", "append_text": "追加正文", "open_page": "打开页面",
                       "set_theme": "切换主题", "backup": "立即备份"]
-        return (labels[name] ?? name) + (arguments["title"].map { " · \($0)" } ?? "")
+        return L10n.text(labels[name] ?? name) + (arguments["title"].map { " · \($0)" } ?? "")
     }
 }
 
@@ -22,7 +22,24 @@ enum AssistantService {
     static func localPlan(_ input: String, model: WorkspaceModel) -> AssistantPlan? {
         let command = input.trimmingCharacters(in: .whitespacesAndNewlines)
         func plan(_ name: String, _ arguments: [String: String]) -> AssistantPlan {
-            AssistantPlan(message: "请确认以下操作。", actions: [AutomationAction(name: name, arguments: arguments)])
+            AssistantPlan(message: L10n.text("请确认以下操作。"), actions: [AutomationAction(name: name, arguments: arguments)])
+        }
+        let english = command.lowercased()
+        if ["backup", "back up now"].contains(english) { return plan("backup", [:]) }
+        if english == "dark mode" { return plan("set_theme", ["theme": "dark"]) }
+        if english == "light mode" { return plan("set_theme", ["theme": "light"]) }
+        if english == "system theme" { return plan("set_theme", ["theme": "system"]) }
+        if english == "move page to root", let page = model.selectedPage {
+            return plan("move_page", ["page_id": page.id.uuidString, "parent_id": ""])
+        }
+        for prefix in ["new page ", "create page "] where english.hasPrefix(prefix) {
+            let title = String(command.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            return plan("create_page", ["title": title.isEmpty ? L10n.text("未命名") : title])
+        }
+        if english.hasPrefix("open ") {
+            let title = String(command.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let matches = model.pages.filter { !$0.archived && $0.title.caseInsensitiveCompare(title) == .orderedSame }
+            if matches.count == 1 { return plan("open_page", ["page_id": matches[0].id.uuidString]) }
         }
         if command == "备份" || command == "立即备份" { return plan("backup", [:]) }
         if command == "切换深色主题" { return plan("set_theme", ["theme": "dark"]) }

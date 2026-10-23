@@ -6,11 +6,11 @@ enum AICapability: String, Codable, CaseIterable, Identifiable {
     var id: String { rawValue }
     var label: String {
         switch self {
-        case .chat: "文字对话"
-        case .vision: "图片理解"
-        case .transcription: "语音转文字"
-        case .imageGeneration: "图片生成"
-        case .speech: "语音朗读"
+        case .chat: L10n.tr("文字对话")
+        case .vision: L10n.tr("图片理解")
+        case .transcription: L10n.tr("语音转文字")
+        case .imageGeneration: L10n.tr("图片生成")
+        case .speech: L10n.tr("语音朗读")
         }
     }
     var path: String {
@@ -26,7 +26,7 @@ enum AICapability: String, Codable, CaseIterable, Identifiable {
 struct AIModelProfile: Codable, Identifiable, Equatable {
     var id = UUID()
     var name = ""
-    var provider = "自定义兼容服务"
+    var provider = L10n.tr("自定义兼容服务")
     var endpoint = ""
     var model = ""
     var capability: AICapability = .chat
@@ -53,10 +53,10 @@ final class AIModelStore: ObservableObject {
         self.defaults = defaults
         if let data = defaults.data(forKey: storageKey) {
             do { configuration = try JSONDecoder().decode(AIModelConfiguration.self, from: data) }
-            catch { self.error = "模型配置无法读取，原配置已保留：" + error.localizedDescription }
+            catch { self.error = L10n.tr("模型配置无法读取，原配置已保留：") + error.localizedDescription }
         } else if let endpoint = defaults.string(forKey: "aiEndpoint"), !endpoint.isEmpty {
             var legacy = AIModelProfile()
-            legacy.name = "原有模型"; legacy.endpoint = endpoint
+            legacy.name = L10n.tr("原有模型"); legacy.endpoint = endpoint
             legacy.model = defaults.string(forKey: "aiModel") ?? ""; legacy.usesLegacyKey = true
             configuration.profiles = [legacy]; configuration.defaults[AICapability.chat.rawValue] = legacy.id
             persist()
@@ -79,12 +79,12 @@ final class AIModelStore: ObservableObject {
         profile.model = profile.model.trimmingCharacters(in: .whitespacesAndNewlines)
         profile.endpoint = profile.endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
         profile.voice = profile.voice.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !profile.name.isEmpty, !profile.model.isEmpty else { throw AppError.message("请填写配置名称和模型 ID") }
+        guard !profile.name.isEmpty, !profile.model.isEmpty else { throw AppError.message(L10n.tr("请填写配置名称和模型 ID")) }
         guard !profiles.contains(where: { $0.id != profile.id && $0.name.caseInsensitiveCompare(profile.name) == .orderedSame }) else {
-            throw AppError.message("已存在同名模型配置")
+            throw AppError.message(L10n.tr("已存在同名模型配置"))
         }
         _ = try AIClient.endpoint(profile.endpoint, capability: profile.capability)
-        if profile.capability == .speech && profile.voice.isEmpty { throw AppError.message("请填写服务商支持的音色 ID") }
+        if profile.capability == .speech && profile.voice.isEmpty { throw AppError.message(L10n.tr("请填写服务商支持的音色 ID")) }
         return profile
     }
     func upsert(_ profile: AIModelProfile) throws {

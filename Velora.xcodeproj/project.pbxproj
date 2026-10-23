@@ -7,46 +7,54 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		EB72EE6F43FD4A00991AC6FE /* VoiceInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = A69403FD7C644C43B77CFB48 /* VoiceInput.swift */; };
-		4FCF21D9EEFD4C0E9AD4B935 /* LocalMCPServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC125582F2FB4D1D92B6BDF7 /* LocalMCPServer.swift */; };
-		C52935923D2A4894867F54F4 /* AssistantServices.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61F5BAF533C8443DB295A117 /* AssistantServices.swift */; };
-		AAA41095FC4E44C293C98F91 /* ApplicationServices.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BC74BE78F254EEABDA64824 /* ApplicationServices.swift */; };
-        C18AB9194CF848B89F11C001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C18AB9194CF848B89F11C002 /* Assets.xcassets */; };
+		026BBC2D22B34EF18383D0B6 /* AIModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 969FA62D7C6A4F269081DD52 /* AIModels.swift */; };
+		08E613158A8B17A243241BF0 /* Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = B7B9D840965625AA074920E9 /* Localizable.strings */; };
 		0DC255272BBB5C06CDA6E0E9 /* Block.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFBCF699684C7BCAC089A8A1 /* Block.swift */; };
 		0F6937F8685074253B047A26 /* Page.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99597F8496E0CA34112812DF /* Page.swift */; };
 		1A278DBD1185E47BBAE40173 /* SQLiteStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31EC1B575815E1E6B6CCE9D9 /* SQLiteStore.swift */; };
 		21118453014E5D989CDE4677 /* PageEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71A53E8F45160115B83B6AA4 /* PageEditorView.swift */; };
-		3A65536C908B0846C69B7061 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7D8EC1CBEB362E0E917518F1 /* Cocoa.framework */; };
-		5CE065BEE1B1B44605B7FA58 /* WorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02B6B4A2AFBA3427A30BB973 /* WorkspaceView.swift */; };
-		5ED6FBF907D40F3CF2412644 /* SearchPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C5860EE6F92B7076EABFBA3 /* SearchPanel.swift */; };
-		6641EBFE2D52291A81C20F05 /* WorkspaceModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD010430D407DAD77387D392 /* WorkspaceModel.swift */; };
-		85724AAEA5DE53DF2E412511 /* SQLiteStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CD042CC04B82FCE2ACF42BD /* SQLiteStoreTests.swift */; };
-		86C92740B9E200BE00B0345E /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7D8EC1CBEB362E0E917518F1 /* Cocoa.framework */; };
-		A41FF370EDF6C15EEE241498 /* StoreError.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2BF87A0768118D4ACFF9506 /* StoreError.swift */; };
-		A4A8636A03440BD6E37A415B /* NativeTextEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = CEB5B3C1FD9A21217B05C352 /* NativeTextEditor.swift */; };
-		BF926A87E52E0B846B4A9DC9 /* VeloraApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CF85B79010E697C24B8CB8C /* VeloraApp.swift */; };
-		DF157E29F3343AB886472B1B /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EFF0A010F24602006589C38 /* SettingsView.swift */; };
-		46A5BD0169E04255BE321D67 /* WorkspaceCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38B2427AE72946B48B4558BD /* WorkspaceCatalog.swift */; };
-		C1C2FB0039F24BA89D53EC9D /* WorkspaceManagerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 094144E12AF2482492EDDF52 /* WorkspaceManagerView.swift */; };
-		026BBC2D22B34EF18383D0B6 /* AIModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 969FA62D7C6A4F269081DD52 /* AIModels.swift */; };
-		9BB7070A0D9A4045B5126109 /* AIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1FDEDB9AA8584B63BC3BBCF1 /* AIClient.swift */; };
-		F2CE4E70AC5A4C14B7A0B750 /* AIModelsSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B0121A66A114B639DCC1C5B /* AIModelsSettings.swift */; };
-		C541E5A211CB46E594DC2CF2 /* ImageSourcePicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6481537527D2442EB1456BA6 /* ImageSourcePicker.swift */; };
-		7F7B348FFA01479AA49600EF /* MultimodalPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F2793E88DB74DA6A0781580 /* MultimodalPanel.swift */; };
-		3E89A6711DC3416083E0E584 /* MultimodalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C87B1316C5A14A7487A66D0B /* MultimodalTests.swift */; };
-		36B3AB19FED845299B909D89 /* DocumentTransfer.swift in Sources */ = {isa = PBXBuildFile; fileRef = C26A4D97132B4C6B97BB22E9 /* DocumentTransfer.swift */; };
-		D896941A3D6A4FDFB728A16E /* HTMLTransfer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5959F2BFB6184055990A3C02 /* HTMLTransfer.swift */; };
-		65C258567F664B22A8D73E49 /* DocumentExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 289DA47DC8584EEC91A2F9B8 /* DocumentExporter.swift */; };
-		BBB17E30D640447BB8CADD1F /* DocumentImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E0830B778C14D11899B68CA /* DocumentImporter.swift */; };
-		647FFF94F1FD4D59A8979DC9 /* TransferPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 111E9515E21C45C081ADD8B5 /* TransferPanel.swift */; };
-		3F5B060EA9C14A34BB491899 /* DocumentTransferTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D756C8E75A214181B715131E /* DocumentTransferTests.swift */; };
+		244B906916BE488C8E494178 /* EditorInteractionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB2A053EE5E1404397203B1A /* EditorInteractionTests.swift */; };
 		336A801E0B324960AEA255F1 /* ZIPPackage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09780685CBD140259CFB7A75 /* ZIPPackage.swift */; };
 		340CEC8847A34A55A52B6BFA /* DOCXTransfer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52C3EAE2AFC849D49722D3DA /* DOCXTransfer.swift */; };
+		36B3AB19FED845299B909D89 /* DocumentTransfer.swift in Sources */ = {isa = PBXBuildFile; fileRef = C26A4D97132B4C6B97BB22E9 /* DocumentTransfer.swift */; };
+		3746F8DF4990312B070008F3 /* DocumentRenderSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB26D2058C3C10FA926E9BB9 /* DocumentRenderSession.swift */; };
 		3A40F14679A64B5ABB34C54B /* TextStyleRun.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8600891F931B41DDB6C47CDF /* TextStyleRun.swift */; };
-		9EB6442768324540A845096B /* RichTextFormatting.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1E84744314C4BA2BCFA5A60 /* RichTextFormatting.swift */; };
-		BF29A8D01F2E409780FB028D /* DocumentKeyboardCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84878590C21D41979F13B3A5 /* DocumentKeyboardCapture.swift */; };
+		3A65536C908B0846C69B7061 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7D8EC1CBEB362E0E917518F1 /* Cocoa.framework */; };
+		3E89A6711DC3416083E0E584 /* MultimodalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C87B1316C5A14A7487A66D0B /* MultimodalTests.swift */; };
+		3F5B060EA9C14A34BB491899 /* DocumentTransferTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D756C8E75A214181B715131E /* DocumentTransferTests.swift */; };
+		46A5BD0169E04255BE321D67 /* WorkspaceCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38B2427AE72946B48B4558BD /* WorkspaceCatalog.swift */; };
+		4D6144E67462304CEB570135 /* WorkspaceBackup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 89AA49206C86E73135B585B6 /* WorkspaceBackup.swift */; };
+		4FCF21D9EEFD4C0E9AD4B935 /* LocalMCPServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC125582F2FB4D1D92B6BDF7 /* LocalMCPServer.swift */; };
+		5A29BDA4CCDAAA16BCE3BC3E /* Localization.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0EA33182C661A7931340AE1 /* Localization.swift */; };
+		5CE065BEE1B1B44605B7FA58 /* WorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02B6B4A2AFBA3427A30BB973 /* WorkspaceView.swift */; };
+		5ED6FBF907D40F3CF2412644 /* SearchPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C5860EE6F92B7076EABFBA3 /* SearchPanel.swift */; };
+		647FFF94F1FD4D59A8979DC9 /* TransferPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 111E9515E21C45C081ADD8B5 /* TransferPanel.swift */; };
+		65C258567F664B22A8D73E49 /* DocumentExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 289DA47DC8584EEC91A2F9B8 /* DocumentExporter.swift */; };
+		6641EBFE2D52291A81C20F05 /* WorkspaceModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD010430D407DAD77387D392 /* WorkspaceModel.swift */; };
+		66E96C81E9268AAE8E3BBD73 /* RenderAssets in Resources */ = {isa = PBXBuildFile; fileRef = 27E15E8B4952CFB8B185DDE5 /* RenderAssets */; };
 		6ECBC9C5DCDF4D8D89FDBD6A /* RichInlineContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C9E57B65B72430AA44E6941 /* RichInlineContent.swift */; };
-		244B906916BE488C8E494178 /* EditorInteractionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB2A053EE5E1404397203B1A /* EditorInteractionTests.swift */; };
+		7F7B348FFA01479AA49600EF /* MultimodalPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F2793E88DB74DA6A0781580 /* MultimodalPanel.swift */; };
+		85724AAEA5DE53DF2E412511 /* SQLiteStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CD042CC04B82FCE2ACF42BD /* SQLiteStoreTests.swift */; };
+		86C92740B9E200BE00B0345E /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7D8EC1CBEB362E0E917518F1 /* Cocoa.framework */; };
+		9BB7070A0D9A4045B5126109 /* AIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1FDEDB9AA8584B63BC3BBCF1 /* AIClient.swift */; };
+		9EB6442768324540A845096B /* RichTextFormatting.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1E84744314C4BA2BCFA5A60 /* RichTextFormatting.swift */; };
+		A41FF370EDF6C15EEE241498 /* StoreError.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2BF87A0768118D4ACFF9506 /* StoreError.swift */; };
+		A4A8636A03440BD6E37A415B /* NativeTextEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = CEB5B3C1FD9A21217B05C352 /* NativeTextEditor.swift */; };
+		AAA41095FC4E44C293C98F91 /* ApplicationServices.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BC74BE78F254EEABDA64824 /* ApplicationServices.swift */; };
+		BBB17E30D640447BB8CADD1F /* DocumentImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E0830B778C14D11899B68CA /* DocumentImporter.swift */; };
+		BF29A8D01F2E409780FB028D /* DocumentKeyboardCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84878590C21D41979F13B3A5 /* DocumentKeyboardCapture.swift */; };
+		BF926A87E52E0B846B4A9DC9 /* VeloraApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CF85B79010E697C24B8CB8C /* VeloraApp.swift */; };
+		C18AB9194CF848B89F11C001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C18AB9194CF848B89F11C002 /* Assets.xcassets */; };
+		C1C2FB0039F24BA89D53EC9D /* WorkspaceManagerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 094144E12AF2482492EDDF52 /* WorkspaceManagerView.swift */; };
+		C52935923D2A4894867F54F4 /* AssistantServices.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61F5BAF533C8443DB295A117 /* AssistantServices.swift */; };
+		C541E5A211CB46E594DC2CF2 /* ImageSourcePicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6481537527D2442EB1456BA6 /* ImageSourcePicker.swift */; };
+		CEE436FDE3FF1F63436B0EC2 /* RichBlockPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67DD4F6EA053BEE6C01B5AB1 /* RichBlockPreview.swift */; };
+		D896941A3D6A4FDFB728A16E /* HTMLTransfer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5959F2BFB6184055990A3C02 /* HTMLTransfer.swift */; };
+		DF157E29F3343AB886472B1B /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EFF0A010F24602006589C38 /* SettingsView.swift */; };
+		DF22D1F8CFF664FB3B0E22B8 /* ClipboardDocument.swift in Sources */ = {isa = PBXBuildFile; fileRef = 881BA19E9C882BDA2F34F41E /* ClipboardDocument.swift */; };
+		EB72EE6F43FD4A00991AC6FE /* VoiceInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = A69403FD7C644C43B77CFB48 /* VoiceInput.swift */; };
+		EF88E1BED62AEF6AB7549608 /* MathMLToOfficeMath.swift in Sources */ = {isa = PBXBuildFile; fileRef = 768F17F2800F00EF581BCB93 /* MathMLToOfficeMath.swift */; };
+		F2CE4E70AC5A4C14B7A0B750 /* AIModelsSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B0121A66A114B639DCC1C5B /* AIModelsSettings.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -60,49 +68,58 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-        C18AB9194CF848B89F11C003 /* Velora.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Velora.entitlements; sourceTree = "<group>"; };
-        C18AB9194CF848B89F11C004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		A69403FD7C644C43B77CFB48 /* VoiceInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceInput.swift; sourceTree = "<group>"; };
-		CC125582F2FB4D1D92B6BDF7 /* LocalMCPServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalMCPServer.swift; sourceTree = "<group>"; };
-		61F5BAF533C8443DB295A117 /* AssistantServices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AssistantServices.swift; sourceTree = "<group>"; };
-		3BC74BE78F254EEABDA64824 /* ApplicationServices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ApplicationServices.swift; sourceTree = "<group>"; };
-        C18AB9194CF848B89F11C002 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		02B6B4A2AFBA3427A30BB973 /* WorkspaceView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WorkspaceView.swift; sourceTree = "<group>"; };
+		094144E12AF2482492EDDF52 /* WorkspaceManagerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceManagerView.swift; sourceTree = "<group>"; };
+		09780685CBD140259CFB7A75 /* ZIPPackage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZIPPackage.swift; sourceTree = "<group>"; };
+		0B0121A66A114B639DCC1C5B /* AIModelsSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIModelsSettings.swift; sourceTree = "<group>"; };
+		111E9515E21C45C081ADD8B5 /* TransferPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../../Transfer/Views/TransferPanel.swift; sourceTree = "<group>"; };
 		14272FF33FD23E0CA631CAA1 /* Velora.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Velora.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		1FDEDB9AA8584B63BC3BBCF1 /* AIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIClient.swift; sourceTree = "<group>"; };
+		27E15E8B4952CFB8B185DDE5 /* RenderAssets */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = folder; path = RenderAssets; sourceTree = "<group>"; };
+		289DA47DC8584EEC91A2F9B8 /* DocumentExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentExporter.swift; sourceTree = "<group>"; };
+		2C9E57B65B72430AA44E6941 /* RichInlineContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RichInlineContent.swift; sourceTree = "<group>"; };
 		31EC1B575815E1E6B6CCE9D9 /* SQLiteStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SQLiteStore.swift; sourceTree = "<group>"; };
+		38B2427AE72946B48B4558BD /* WorkspaceCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceCatalog.swift; sourceTree = "<group>"; };
+		3BC74BE78F254EEABDA64824 /* ApplicationServices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ApplicationServices.swift; sourceTree = "<group>"; };
+		3D31759E7CB5500E9C5BFA58 /* en */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.strings; name = en; path = en.lproj/Localizable.strings; sourceTree = "<group>"; };
+		3E0830B778C14D11899B68CA /* DocumentImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentImporter.swift; sourceTree = "<group>"; };
+		52C3EAE2AFC849D49722D3DA /* DOCXTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DOCXTransfer.swift; sourceTree = "<group>"; };
+		5959F2BFB6184055990A3C02 /* HTMLTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTMLTransfer.swift; sourceTree = "<group>"; };
+		61F5BAF533C8443DB295A117 /* AssistantServices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AssistantServices.swift; sourceTree = "<group>"; };
+		630DF478802F4FDF61D769DE /* zh-Hans */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "zh-Hans.lproj/Localizable.strings"; sourceTree = "<group>"; };
+		6481537527D2442EB1456BA6 /* ImageSourcePicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageSourcePicker.swift; sourceTree = "<group>"; };
+		67DD4F6EA053BEE6C01B5AB1 /* RichBlockPreview.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RichBlockPreview.swift; sourceTree = "<group>"; };
 		71A53E8F45160115B83B6AA4 /* PageEditorView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PageEditorView.swift; sourceTree = "<group>"; };
+		768F17F2800F00EF581BCB93 /* MathMLToOfficeMath.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MathMLToOfficeMath.swift; sourceTree = "<group>"; };
 		7CD042CC04B82FCE2ACF42BD /* SQLiteStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SQLiteStoreTests.swift; sourceTree = "<group>"; };
 		7D8EC1CBEB362E0E917518F1 /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/Cocoa.framework; sourceTree = DEVELOPER_DIR; };
+		7F2793E88DB74DA6A0781580 /* MultimodalPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../../Assistant/Views/MultimodalPanel.swift; sourceTree = "<group>"; };
+		84878590C21D41979F13B3A5 /* DocumentKeyboardCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentKeyboardCapture.swift; sourceTree = "<group>"; };
+		8600891F931B41DDB6C47CDF /* TextStyleRun.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextStyleRun.swift; sourceTree = "<group>"; };
+		881BA19E9C882BDA2F34F41E /* ClipboardDocument.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ClipboardDocument.swift; sourceTree = "<group>"; };
+		89AA49206C86E73135B585B6 /* WorkspaceBackup.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WorkspaceBackup.swift; sourceTree = "<group>"; };
 		8C5860EE6F92B7076EABFBA3 /* SearchPanel.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SearchPanel.swift; sourceTree = "<group>"; };
+		969FA62D7C6A4F269081DD52 /* AIModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIModels.swift; sourceTree = "<group>"; };
 		99597F8496E0CA34112812DF /* Page.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = Page.swift; sourceTree = "<group>"; };
 		9CF85B79010E697C24B8CB8C /* VeloraApp.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VeloraApp.swift; sourceTree = "<group>"; };
 		9EFF0A010F24602006589C38 /* SettingsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		A0EA33182C661A7931340AE1 /* Localization.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = Localization.swift; sourceTree = "<group>"; };
+		A69403FD7C644C43B77CFB48 /* VoiceInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceInput.swift; sourceTree = "<group>"; };
+		AB26D2058C3C10FA926E9BB9 /* DocumentRenderSession.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = DocumentRenderSession.swift; sourceTree = "<group>"; };
 		BFBCF699684C7BCAC089A8A1 /* Block.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = Block.swift; sourceTree = "<group>"; };
+		C18AB9194CF848B89F11C002 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		C18AB9194CF848B89F11C003 /* Velora.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Velora.entitlements; sourceTree = "<group>"; };
+		C18AB9194CF848B89F11C004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		C26A4D97132B4C6B97BB22E9 /* DocumentTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentTransfer.swift; sourceTree = "<group>"; };
+		C87B1316C5A14A7487A66D0B /* MultimodalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultimodalTests.swift; sourceTree = "<group>"; };
+		CC125582F2FB4D1D92B6BDF7 /* LocalMCPServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalMCPServer.swift; sourceTree = "<group>"; };
 		CEB5B3C1FD9A21217B05C352 /* NativeTextEditor.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = NativeTextEditor.swift; sourceTree = "<group>"; };
+		D756C8E75A214181B715131E /* DocumentTransferTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentTransferTests.swift; sourceTree = "<group>"; };
 		DD010430D407DAD77387D392 /* WorkspaceModel.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WorkspaceModel.swift; sourceTree = "<group>"; };
+		E1E84744314C4BA2BCFA5A60 /* RichTextFormatting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RichTextFormatting.swift; sourceTree = "<group>"; };
+		EB2A053EE5E1404397203B1A /* EditorInteractionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorInteractionTests.swift; sourceTree = "<group>"; };
 		F2BF87A0768118D4ACFF9506 /* StoreError.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = StoreError.swift; sourceTree = "<group>"; };
 		FC4805F4634DF2ABA391E290 /* VeloraTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = VeloraTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		38B2427AE72946B48B4558BD /* WorkspaceCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceCatalog.swift; sourceTree = "<group>"; };
-		094144E12AF2482492EDDF52 /* WorkspaceManagerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceManagerView.swift; sourceTree = "<group>"; };
-		969FA62D7C6A4F269081DD52 /* AIModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AIModels.swift"; sourceTree = "<group>"; };
-		1FDEDB9AA8584B63BC3BBCF1 /* AIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AIClient.swift"; sourceTree = "<group>"; };
-		0B0121A66A114B639DCC1C5B /* AIModelsSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AIModelsSettings.swift"; sourceTree = "<group>"; };
-		6481537527D2442EB1456BA6 /* ImageSourcePicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ImageSourcePicker.swift"; sourceTree = "<group>"; };
-		7F2793E88DB74DA6A0781580 /* MultimodalPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../Assistant/Views/MultimodalPanel.swift"; sourceTree = "<group>"; };
-		C87B1316C5A14A7487A66D0B /* MultimodalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultimodalTests.swift; sourceTree = "<group>"; };
-		C26A4D97132B4C6B97BB22E9 /* DocumentTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DocumentTransfer.swift"; sourceTree = "<group>"; };
-		5959F2BFB6184055990A3C02 /* HTMLTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HTMLTransfer.swift"; sourceTree = "<group>"; };
-		289DA47DC8584EEC91A2F9B8 /* DocumentExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DocumentExporter.swift"; sourceTree = "<group>"; };
-		3E0830B778C14D11899B68CA /* DocumentImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DocumentImporter.swift"; sourceTree = "<group>"; };
-		111E9515E21C45C081ADD8B5 /* TransferPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../Transfer/Views/TransferPanel.swift"; sourceTree = "<group>"; };
-		D756C8E75A214181B715131E /* DocumentTransferTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentTransferTests.swift; sourceTree = "<group>"; };
-		09780685CBD140259CFB7A75 /* ZIPPackage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZIPPackage.swift; sourceTree = "<group>"; };
-		52C3EAE2AFC849D49722D3DA /* DOCXTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DOCXTransfer.swift; sourceTree = "<group>"; };
-		8600891F931B41DDB6C47CDF /* TextStyleRun.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextStyleRun.swift; sourceTree = "<group>"; };
-		E1E84744314C4BA2BCFA5A60 /* RichTextFormatting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RichTextFormatting.swift; sourceTree = "<group>"; };
-		84878590C21D41979F13B3A5 /* DocumentKeyboardCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentKeyboardCapture.swift; sourceTree = "<group>"; };
-		2C9E57B65B72430AA44E6941 /* RichInlineContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RichInlineContent.swift; sourceTree = "<group>"; };
-		EB2A053EE5E1404397203B1A /* EditorInteractionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorInteractionTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -248,9 +265,16 @@
 				969FA62D7C6A4F269081DD52 /* AIModels.swift */,
 				38B2427AE72946B48B4558BD /* WorkspaceCatalog.swift */,
 				9CF85B79010E697C24B8CB8C /* VeloraApp.swift */,
-                C18AB9194CF848B89F11C002 /* Assets.xcassets */,
-                C18AB9194CF848B89F11C003 /* Velora.entitlements */,
-                C18AB9194CF848B89F11C004 /* Info.plist */,
+				C18AB9194CF848B89F11C002 /* Assets.xcassets */,
+				C18AB9194CF848B89F11C003 /* Velora.entitlements */,
+				C18AB9194CF848B89F11C004 /* Info.plist */,
+				27E15E8B4952CFB8B185DDE5 /* RenderAssets */,
+				AB26D2058C3C10FA926E9BB9 /* DocumentRenderSession.swift */,
+				768F17F2800F00EF581BCB93 /* MathMLToOfficeMath.swift */,
+				881BA19E9C882BDA2F34F41E /* ClipboardDocument.swift */,
+				A0EA33182C661A7931340AE1 /* Localization.swift */,
+				89AA49206C86E73135B585B6 /* WorkspaceBackup.swift */,
+				B7B9D840965625AA074920E9 /* Localizable.strings */,
 			);
 			name = App;
 			path = App;
@@ -346,6 +370,7 @@
 			children = (
 				71A53E8F45160115B83B6AA4 /* PageEditorView.swift */,
 				6481537527D2442EB1456BA6 /* ImageSourcePicker.swift */,
+				67DD4F6EA053BEE6C01B5AB1 /* RichBlockPreview.swift */,
 			);
 			name = Views;
 			path = Views;
@@ -418,11 +443,11 @@
 			};
 			buildConfigurationList = 9494B719CD74D41F860ED81A /* Build configuration list for PBXProject "Velora" */;
 			compatibilityVersion = "Xcode 3.2";
-			developmentRegion = en;
+			developmentRegion = "zh-Hans";
 			hasScannedForEncodings = 0;
 			knownRegions = (
 				en,
-				Base,
+				"zh-Hans",
 			);
 			mainGroup = 88D99831CF14503470FEAD71;
 			minimizedProjectReferenceProxies = 0;
@@ -449,7 +474,9 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-                C18AB9194CF848B89F11C001 /* Assets.xcassets in Resources */,
+				C18AB9194CF848B89F11C001 /* Assets.xcassets in Resources */,
+				66E96C81E9268AAE8E3BBD73 /* RenderAssets in Resources */,
+				08E613158A8B17A243241BF0 /* Localizable.strings in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -504,6 +531,12 @@
 				5CE065BEE1B1B44605B7FA58 /* WorkspaceView.swift in Sources */,
 				647FFF94F1FD4D59A8979DC9 /* TransferPanel.swift in Sources */,
 				C1C2FB0039F24BA89D53EC9D /* WorkspaceManagerView.swift in Sources */,
+				CEE436FDE3FF1F63436B0EC2 /* RichBlockPreview.swift in Sources */,
+				3746F8DF4990312B070008F3 /* DocumentRenderSession.swift in Sources */,
+				EF88E1BED62AEF6AB7549608 /* MathMLToOfficeMath.swift in Sources */,
+				DF22D1F8CFF664FB3B0E22B8 /* ClipboardDocument.swift in Sources */,
+				5A29BDA4CCDAAA16BCE3BC3E /* Localization.swift in Sources */,
+				4D6144E67462304CEB570135 /* WorkspaceBackup.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -518,13 +551,25 @@
 		};
 /* End PBXTargetDependency section */
 
+/* Begin PBXVariantGroup section */
+		B7B9D840965625AA074920E9 /* Localizable.strings */ = {
+			isa = PBXVariantGroup;
+			children = (
+				3D31759E7CB5500E9C5BFA58 /* en */,
+				630DF478802F4FDF61D769DE /* zh-Hans */,
+			);
+			name = Localizable.strings;
+			sourceTree = "<group>";
+		};
+/* End PBXVariantGroup section */
+
 /* Begin XCBuildConfiguration section */
 		27AED996DC2D75B484BCD81C /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
-				CODE_SIGN_STYLE = Manual;
 				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.velora.app.tests;
@@ -538,23 +583,23 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_STYLE = Manual;
-				CODE_SIGN_IDENTITY = "-";
-				COMBINE_HIDPI_IMAGES = YES;
 				CODE_SIGN_ENTITLEMENTS = App/Velora.entitlements;
-				ENABLE_HARDENED_RUNTIME = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = App/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Velora;
-                INFOPLIST_FILE = App/Info.plist;
-                MARKETING_VERSION = 0.1.0;
-                CURRENT_PROJECT_VERSION = 1;
-                INFOPLIST_KEY_CFBundleShortVersionString = 0.1.0;
-                INFOPLIST_KEY_NSMicrophoneUsageDescription = "将你的语音转换为可预览的 Velora 操作指令。";
-                INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "识别你主动录入的语音指令，用于操作 Velora。";
+				INFOPLIST_KEY_CFBundleShortVersionString = 0.1.0;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "将你的语音转换为可预览的 Velora 操作指令。";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "识别你主动录入的语音指令，用于操作 Velora。";
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 0.1.0;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lsqlite3",
@@ -570,8 +615,8 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
-				CODE_SIGN_STYLE = Manual;
 				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.velora.app.tests;
@@ -585,23 +630,23 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_STYLE = Manual;
-				CODE_SIGN_IDENTITY = "-";
-				COMBINE_HIDPI_IMAGES = YES;
 				CODE_SIGN_ENTITLEMENTS = App/Velora.entitlements;
-				ENABLE_HARDENED_RUNTIME = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = App/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Velora;
-                INFOPLIST_FILE = App/Info.plist;
-                MARKETING_VERSION = 0.1.0;
-                CURRENT_PROJECT_VERSION = 1;
-                INFOPLIST_KEY_CFBundleShortVersionString = 0.1.0;
-                INFOPLIST_KEY_NSMicrophoneUsageDescription = "将你的语音转换为可预览的 Velora 操作指令。";
-                INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "识别你主动录入的语音指令，用于操作 Velora。";
+				INFOPLIST_KEY_CFBundleShortVersionString = 0.1.0;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "将你的语音转换为可预览的 Velora 操作指令。";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "识别你主动录入的语音指令，用于操作 Velora。";
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 0.1.0;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lsqlite3",

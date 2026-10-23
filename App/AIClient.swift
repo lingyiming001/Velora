@@ -57,7 +57,7 @@ struct AIClient {
             case 429: reason = "请求限流或额度不足，请稍后重试"
             default: reason = "请检查服务状态和请求参数"
             }
-            throw AppError.message("请求失败（HTTP \(response.statusCode)）：\(reason)")
+            throw AppError.message(L10n.tr("请求失败（HTTP \(response.statusCode)）：\(L10n.text(reason))"))
         }
         return data
     }

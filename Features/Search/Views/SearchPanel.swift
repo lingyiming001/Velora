@@ -11,7 +11,7 @@ struct SearchPanel: View {
         VStack(spacing: 0) {
             HStack {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("搜索页面与内容", text: $query)
+                TextField(L10n.tr("搜索页面与内容"), text: $query)
                     .textFieldStyle(.plain).focused($focused)
                     .onSubmit { openFirst() }
             }
@@ -22,7 +22,7 @@ struct SearchPanel: View {
                 Button {
                     Task { await model.flushAll(); model.select(page.id); isPresented = false }
                 } label: {
-                    Label(page.title.isEmpty ? "未命名" : page.title, systemImage: "doc.text")
+                    Label(page.title.isEmpty ? L10n.tr("未命名") : page.title, systemImage: "doc.text")
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .buttonStyle(.plain)

@@ -146,7 +146,7 @@ final class MultimodalTests: XCTestCase {
         }
         let malformed = client { _ in (200, Data(#"{"wrong":"response"}"#.utf8)) }
         do { _ = try await malformed.chat(profile: profile(.chat), messages: []); XCTFail("Invalid response should fail") }
-        catch { XCTAssertTrue(error.localizedDescription.contains("格式")) }
+        catch { XCTAssertTrue(error.localizedDescription.contains(L10n.text("接口响应不符合 Chat Completions 格式"))) }
     }
 
     func testLocalImageSurvivesOriginalRemovalAndDatabaseSnapshot() async throws {

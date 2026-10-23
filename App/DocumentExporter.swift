@@ -8,7 +8,7 @@ enum DocumentExporter {
         let value = input.components(separatedBy: forbidden).joined(separator: "-").trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ".")))
         return value.isEmpty ? "未命名" : String(value.prefix(80))
     }
-    static func write(_ document: TransferDocument, format: TransferFormat, to destination: URL) throws {
+    static func write(_ document: TransferDocument, format: TransferFormat, to destination: URL) async throws {
         _ = try document.orderedPages()
         let data: Data
         var assetDirectory: URL?
@@ -17,7 +17,16 @@ enum DocumentExporter {
             case .json:
                 let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
                 data = try encoder.encode(document)
-            case .html: data = Data(try HTMLTransfer.document(document).utf8)
+            case .pdf:
+                data = try await EmbeddedPDF.exportPDF(document)
+            case .html, .word:
+                let renderer = DocumentRenderSession(); defer { renderer.close() }
+                try await renderer.render(document)
+                switch format {
+                case .html: data = Data(try await renderer.html(document).utf8)
+                case .word: data = try await renderer.word(document)
+                default: throw AppError.message("无法导出此格式")
+                }
             case .text: data = Data(try document.orderedPages().map { "\(document.path(for: $0))\n\(String(repeating: "=", count: 30))\n\(plain($0))" }.joined(separator: "\n\n").utf8)
             case .markdown:
                 let folder = destination.deletingLastPathComponent().appendingPathComponent(safeName(destination.deletingPathExtension().lastPathComponent) + ".assets-" + UUID().uuidString.prefix(8), isDirectory: true)
@@ -25,9 +34,6 @@ enum DocumentExporter {
                 let output = try document.orderedPages().map { try markdown($0, assetDirectory: folder) }.joined(separator: "\n\n---\n\n")
                 if FileManager.default.fileExists(atPath: folder.path) { assetDirectory = folder }
                 data = Data(output.utf8)
-            case .word:
-                data = try DOCXTransfer.encode(document)
-            case .pdf: data = try pdf(richText(document))
             }
             try data.write(to: destination, options: .atomic)
         } catch {
@@ -36,7 +42,7 @@ enum DocumentExporter {
         }
     }
 
-    static func markdownFolder(_ document: TransferDocument, in parent: URL) throws -> URL {
+    static func markdownFolder(_ document: TransferDocument, in parent: URL) async throws -> URL {
         let root = parent.appendingPathComponent(safeName(document.name) + "-" + UUID().uuidString.prefix(8), isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         do {
@@ -46,24 +52,30 @@ enum DocumentExporter {
                 let directory = parent.appendingPathComponent(safeName(page.title) + "-" + page.id.uuidString.prefix(8), isDirectory: true)
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
                 locations[page.id] = directory
-                try write(TransferDocument(name: page.title, pages: [TransferPage(id: page.id, title: page.title, archived: page.archived, blocks: page.blocks)]), format: .markdown, to: directory.appendingPathComponent("index.md"))
+                try await write(TransferDocument(name: page.title, pages: [TransferPage(id: page.id, title: page.title, archived: page.archived, blocks: page.blocks)]), format: .markdown, to: directory.appendingPathComponent("index.md"))
             }
             return root
         } catch { try? FileManager.default.removeItem(at: root); throw error }
     }
 
-    static func markdown(_ page: TransferPage, assetDirectory: URL) throws -> String {
+    static func markdown(_ page: TransferPage, assetDirectory: URL?) throws -> String {
         var imageIndex = 0
+        var number = 0
         let blocks = try page.blocks.map { block -> String in
+            number = block.kind == .numbered ? number + 1 : 0
             let inline = RichInlineContent.markdown(block.text, runs: block.formatting)
             switch block.kind {
             case .heading: return "# " + inline
             case .heading2: return "## " + inline
             case .heading3: return "### " + inline
-            case .bullet: return "- " + block.text.replacingOccurrences(of: "\n", with: "\n  ")
-            case .numbered: return "1. " + block.text.replacingOccurrences(of: "\n", with: "\n   ")
-            case .todo: return "- [\(block.checked ? "x" : " ")] " + block.text
-            case .quote, .callout: return block.text.components(separatedBy: "\n").map { "> " + $0 }.joined(separator: "\n")
+            case .bullet: return "- " + inline.replacingOccurrences(of: "\n", with: "\n  ")
+            case .numbered: return "\(number). " + inline.replacingOccurrences(of: "\n", with: "\n   ")
+            case .todo: return "- [\(block.checked ? "x" : " ")] " + inline
+            case .equation: return "$$\n" + DocumentTransfer.equationSource(block.text) + "\n$$"
+            case .markdown: return block.text
+            case .warning: return "> [!WARNING]\n" + block.text.components(separatedBy: "\n").map { "> " + $0 }.joined(separator: "\n")
+            case .success: return "> [!TIP]\n" + block.text.components(separatedBy: "\n").map { "> " + $0 }.joined(separator: "\n")
+            case .quote, .callout: return inline.components(separatedBy: "\n").map { "> " + $0 }.joined(separator: "\n")
             case .divider: return "---"
             case .code:
                 let runs = block.text.components(separatedBy: CharacterSet(charactersIn: "\n"))
@@ -71,10 +83,21 @@ enum DocumentExporter {
                 let fence = String(repeating: "`", count: max(3, longest + 1))
                 let language = block.language == "Plain Text" ? "" : block.language.replacingOccurrences(of: "`", with: "").replacingOccurrences(of: "\n", with: " ")
                 return fence + language + "\n" + block.text + "\n" + fence
+            case .pdfDocument:
+                let images = try EmbeddedPDF.images(block.text)
+                return try images.enumerated().map { index, source in
+                    guard let assetDirectory else { return "![PDF 第 \(index + 1) 页](<" + source + ">)" }
+                    try FileManager.default.createDirectory(at: assetDirectory, withIntermediateDirectories: true)
+                    let file = assetDirectory.appendingPathComponent("pdf-" + page.id.uuidString.prefix(8) + "-" + UUID().uuidString.prefix(8) + ".png")
+                    guard let split = source.range(of: ";base64,"), let data = Data(base64Encoded: String(source[split.upperBound...])) else { throw AppError.message("PDF 图像无法读取") }
+                    try data.write(to: file)
+                    return "![PDF 第 \(index + 1) 页](<" + assetDirectory.lastPathComponent + "/" + file.lastPathComponent + ">)"
+                }.joined(separator: "\n\n")
             case .image:
                 guard !block.text.isEmpty else { return "<!-- 未选择图片 -->" }
                 let image = try ImageSource.validated(block.text)
                 if image.hasPrefix("data:"), let split = image.range(of: ";base64,"), let bytes = Data(base64Encoded: String(image[split.upperBound...])) {
+                    guard let assetDirectory else { return "![图片](<" + image + ">)" }
                     try FileManager.default.createDirectory(at: assetDirectory, withIntermediateDirectories: true)
                     imageIndex += 1
                     let ext = image.hasPrefix("data:image/jpeg") ? "jpg" : image.hasPrefix("data:image/gif") ? "gif" : image.hasPrefix("data:image/webp") ? "webp" : "png"
@@ -86,7 +109,7 @@ enum DocumentExporter {
                 return "![图片](<" + image + ">)"
             case .table:
                 guard let data = block.text.data(using: .utf8), let rows = try? JSONDecoder().decode([[String]].self, from: data), let first = rows.first else { return block.text }
-                func row(_ cells: [String]) -> String { "| " + cells.map { $0.replacingOccurrences(of: "|", with: "\\|").replacingOccurrences(of: "\n", with: "<br>") }.joined(separator: " | ") + " |" }
+                func row(_ cells: [String]) -> String { "| " + cells.map { TableCellContent.markdown($0, layout: block.tableLayout) }.joined(separator: " | ") + " |" }
                 return ([row(first), row(Array(repeating: "---", count: first.count))] + rows.dropFirst().map(row)).joined(separator: "\n")
             case .video, .audio, .file, .bookmark: return "[\(block.kind.label)](<\(block.text)>)"
             case .tableOfContents: return "<!-- 页面目录 -->"
@@ -102,10 +125,11 @@ enum DocumentExporter {
             case .todo: return (block.checked ? "☑ " : "☐ ") + block.text
             case .bullet: return "• " + block.text
             case .numbered: return "1. " + block.text
+            case .pdfDocument: return EmbeddedPDF.document(block.text)?.string ?? "[PDF 原件无可提取文字]"
             case .image: return block.text.hasPrefix("data:") ? "[本地图片]" : "[图片] " + block.text
             case .table:
                 guard let data = block.text.data(using: .utf8), let rows = try? JSONDecoder().decode([[String]].self, from: data) else { return block.text }
-                return rows.map { $0.joined(separator: " | ") }.joined(separator: "\n")
+                return rows.map { $0.map { TableCellContent.visible($0, layout: block.tableLayout) }.joined(separator: " | ") }.joined(separator: "\n")
             case .divider: return "--------------------"
             default: return block.text
             }

@@ -19,10 +19,11 @@ enum RichTextFormatting {
         let italic = style.italic ?? baseTraits.contains(.italicFontMask)
         font = NSFontManager.shared.convert(font, toHaveTrait: bold ? .boldFontMask : .unboldFontMask)
         font = NSFontManager.shared.convert(font, toHaveTrait: italic ? .italicFontMask : .unitalicFontMask)
-        var attributes: [NSAttributedString.Key: Any] = [.font: font]
+        var attributes: [NSAttributedString.Key: Any] = [.font: font, NSAttributedString.Key("VeloraInlineCode"): style.code]
         if let italic = style.italic { attributes[.obliqueness] = italic && !NSFontManager.shared.traits(of: font).contains(.italicFontMask) ? 0.18 : 0.0 }
         attributes[.underlineStyle] = style.underline ? NSUnderlineStyle.single.rawValue : 0
         attributes[.strikethroughStyle] = style.strikethrough ? NSUnderlineStyle.single.rawValue : 0
+        if let value = style.link.flatMap(HTMLTransfer.safeLink) { attributes[.link] = value }
         if let value = style.color.flatMap(color) { attributes[.foregroundColor] = value }
         if let value = style.highlight.flatMap(color) { attributes[.backgroundColor] = value }
         return attributes
@@ -38,6 +39,8 @@ enum RichTextFormatting {
             let font = attrs[.font] as? NSFont ?? base
             let traits = NSFontManager.shared.traits(of: font); let baseTraits = NSFontManager.shared.traits(of: base)
             var style = InlineTextStyle()
+            style.code = attrs[NSAttributedString.Key("VeloraInlineCode")] as? Bool ?? false
+            style.link = (attrs[.link] as? URL)?.absoluteString ?? (attrs[.link] as? String)
             if font.familyName != base.familyName { style.fontFamily = font.familyName ?? font.fontName }
             if abs(font.pointSize - base.pointSize) > 0.1 { style.fontSize = Double(font.pointSize) }
             if traits.contains(.boldFontMask) != baseTraits.contains(.boldFontMask) { style.bold = traits.contains(.boldFontMask) }
@@ -54,42 +57,87 @@ enum RichTextFormatting {
 }
 
 enum TextFormatAction {
-    case bold, italic, underline, strikethrough, clear
+    case bold, italic, underline, strikethrough, clear, copyStyle, pasteStyle
     case size(Double), family(String), color(String?), highlight(String?)
 }
 
+/// A separate pasteboard keeps visual styles independent of copied content.
+final class TextStyleClipboard: ObservableObject {
+    static let shared = TextStyleClipboard()
+    static let type = NSPasteboard.PasteboardType("com.velora.text-style")
+    private let pasteboard: NSPasteboard
+    @Published private(set) var style: InlineTextStyle?
+
+    init(pasteboard: NSPasteboard = NSPasteboard(name: .init("com.velora.text-style"))) {
+        self.pasteboard = pasteboard
+        style = pasteboard.data(forType: Self.type).flatMap { try? JSONDecoder().decode(InlineTextStyle.self, from: $0) }
+    }
+    func read() -> InlineTextStyle? {
+        pasteboard.data(forType: Self.type).flatMap { try? JSONDecoder().decode(InlineTextStyle.self, from: $0) }
+    }
+    func copy(attributes: [NSAttributedString.Key: Any], base: NSFont) {
+        let font = attributes[.font] as? NSFont ?? base
+        let traits = NSFontManager.shared.traits(of: font)
+        var copied = InlineTextStyle()
+        copied.fontFamily = font.familyName ?? font.fontName
+        copied.fontSize = Double(font.pointSize)
+        copied.bold = traits.contains(.boldFontMask)
+        copied.italic = traits.contains(.italicFontMask) || ((attributes[.obliqueness] as? NSNumber)?.doubleValue ?? 0) > 0
+        copied.underline = (attributes[.underlineStyle] as? NSNumber)?.intValue ?? 0 != 0
+        copied.strikethrough = (attributes[.strikethroughStyle] as? NSNumber)?.intValue ?? 0 != 0
+        copied.color = (attributes[.foregroundColor] as? NSColor).flatMap(RichTextFormatting.hex)
+        copied.highlight = (attributes[.backgroundColor] as? NSColor).flatMap(RichTextFormatting.hex)
+        guard let data = try? JSONEncoder().encode(copied) else { return }
+        pasteboard.clearContents()
+        guard pasteboard.setData(data, forType: Self.type) else { return }
+        style = copied
+    }
+}
+
+final class SelectionFormatState: ObservableObject {
+    @Published var style: InlineTextStyle
+    init(_ style: InlineTextStyle) { self.style = style }
+}
+
 struct SelectionFormatBar: View {
-    var style: InlineTextStyle
+    @ObservedObject var state: SelectionFormatState
+    @ObservedObject var clipboard: TextStyleClipboard
+    private var style: InlineTextStyle { state.style }
     var apply: (TextFormatAction) -> Void
-    private let colors: [(String, String)] = [("红色", "D93D3D"), ("橙色", "D97015"), ("绿色", "24844B"), ("蓝色", "2563EB"), ("紫色", "7C3AED"), ("灰色", "737373"), ("黑色", "222222")]
+    private let colors: [(String, String)] = [(L10n.tr("红色"), "D93D3D"), (L10n.tr("橙色"), "D97015"), (L10n.tr("绿色"), "24844B"), (L10n.tr("蓝色"), "2563EB"), (L10n.tr("紫色"), "7C3AED"), (L10n.tr("灰色"), "737373"), (L10n.tr("黑色"), "222222")]
     var body: some View {
         HStack(spacing: 4) {
-            Menu(style.fontFamily ?? "系统字体") {
+            Menu(style.fontFamily ?? L10n.text("系统字体")) {
                 ForEach(["系统字体", "PingFang SC", "Songti SC", "Heiti SC", "Helvetica Neue", "Arial", "Times New Roman", "Menlo"], id: \.self) { family in
-                    Button(family) { apply(.family(family)) }
+                    Button(L10n.text(family)) { apply(.family(family)) }
                 }
             }.frame(width: 95)
             Menu("\(Int(style.fontSize ?? 17))") {
                 ForEach([10, 12, 14, 16, 17, 18, 20, 24, 28, 32, 40, 48], id: \.self) { size in Button("\(size) pt") { apply(.size(Double(size))) } }
-            }.frame(width: 43).help("文字大小")
+            }.frame(width: 43).help(L10n.tr("文字大小"))
             Divider().frame(height: 18)
-            formatButton("B", help: "加粗 ⌘B", active: style.bold == true) { apply(.bold) }
-            formatButton("I", help: "斜体 ⌘I", active: style.italic == true) { apply(.italic) }
-            formatButton("U", help: "下划线 ⌘U", active: style.underline) { apply(.underline) }
-            formatButton("S̶", help: "删除线", active: style.strikethrough) { apply(.strikethrough) }
+            formatButton("B", help: L10n.tr("加粗 ⌘B"), active: style.bold == true) { apply(.bold) }
+            formatButton("I", help: L10n.tr("斜体 ⌘I"), active: style.italic == true) { apply(.italic) }
+            formatButton("U", help: L10n.tr("下划线 ⌘U"), active: style.underline) { apply(.underline) }
+            formatButton("S̶", help: L10n.tr("删除线"), active: style.strikethrough) { apply(.strikethrough) }
             Menu {
-                Button("自动颜色") { apply(.color(nil)) }
+                Button(L10n.tr("自动颜色")) { apply(.color(nil)) }
                 ForEach(colors, id: \.0) { name, hex in Button(name) { apply(.color(hex)) } }
             } label: { Image(systemName: "textformat").foregroundStyle(Color(nsColor: style.color.flatMap(RichTextFormatting.color) ?? .labelColor)) }
-                .frame(width: 35).help("文字颜色")
+                .frame(width: 35).help(L10n.tr("文字颜色"))
             Menu {
-                Button("无高亮") { apply(.highlight(nil)) }
-                Button("黄色") { apply(.highlight("FFF1A8")) }
-                Button("绿色") { apply(.highlight("D4F4DD")) }
-                Button("蓝色") { apply(.highlight("DCEAFF")) }
-                Button("粉色") { apply(.highlight("FCE0EE")) }
-            } label: { Image(systemName: "highlighter") }.frame(width: 33).help("背景高亮")
-            Button { apply(.clear) } label: { Image(systemName: "textformat.alt") }.help("清除格式")
+                Button(L10n.tr("无高亮")) { apply(.highlight(nil)) }
+                Button(L10n.tr("黄色")) { apply(.highlight("FFF1A8")) }
+                Button(L10n.tr("绿色")) { apply(.highlight("D4F4DD")) }
+                Button(L10n.tr("蓝色")) { apply(.highlight("DCEAFF")) }
+                Button(L10n.tr("粉色")) { apply(.highlight("FCE0EE")) }
+            } label: { Image(systemName: "highlighter") }.frame(width: 33).help(L10n.tr("背景高亮"))
+            Menu {
+                Button(L10n.tr("复制样式")) { apply(.copyStyle) }
+                Button(L10n.tr("粘贴样式")) { apply(.pasteStyle) }.disabled(clipboard.style == nil)
+            } label: { Label(L10n.tr("样式"), systemImage: "paintbrush") }
+                .help(L10n.tr("复制样式 ⌥⌘C · 粘贴样式 ⌥⌘V"))
+            Button { apply(.clear) } label: { Image(systemName: "textformat.alt") }.help(L10n.tr("清除格式"))
         }.font(.system(size: 12)).buttonStyle(.borderless).padding(9).fixedSize()
     }
     private func formatButton(_ text: String, help: String, active: Bool, action: @escaping () -> Void) -> some View {

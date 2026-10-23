@@ -25,3 +25,6 @@ xcuserdata/
 /build/
 /.build/
 *.xcresult
+
+# Local tooling used for build and rendering verification
+/.agents/tooling/

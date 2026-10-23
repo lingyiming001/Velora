@@ -12,7 +12,7 @@ enum ZIPPackage {
         for byte in data { value = crcTable[Int((value ^ UInt32(byte)) & 0xFF)] ^ (value >> 8) }
         return value ^ 0xFFFFFFFF
     }
-    static func encode(_ entries: [(String, Data)]) throws -> Data {
+    static func encode(_ entries: [(String, Data)], compressed: Bool = false) throws -> Data {
         guard entries.count <= 60000, entries.allSatisfy({ $0.0.utf8.count <= 65535 }),
               entries.reduce(0, { $0 + $1.1.count }) < Int(UInt32.max) else { throw AppError.message("Word 内容过大") }
         var output = Data(); var central = Data()
@@ -21,13 +21,15 @@ enum ZIPPackage {
         }
         for (name, bytes) in entries {
             let filename = Data(name.utf8); let offset = UInt32(output.count); let checksum = crc(bytes)
+            let packed = compressed && !bytes.isEmpty ? try deflate(bytes) : bytes
+            let method: UInt16 = compressed && !bytes.isEmpty ? 8 : 0
             append(UInt32(0x04034B50), to: &output); append(UInt16(20), to: &output); append(UInt16(0x800), to: &output)
-            append(UInt16(0), to: &output); append(UInt16(0), to: &output); append(UInt16(0x21), to: &output)
-            append(checksum, to: &output); append(UInt32(bytes.count), to: &output); append(UInt32(bytes.count), to: &output)
-            append(UInt16(filename.count), to: &output); append(UInt16(0), to: &output); output.append(filename); output.append(bytes)
+            append(method, to: &output); append(UInt16(0), to: &output); append(UInt16(0x21), to: &output)
+            append(checksum, to: &output); append(UInt32(packed.count), to: &output); append(UInt32(bytes.count), to: &output)
+            append(UInt16(filename.count), to: &output); append(UInt16(0), to: &output); output.append(filename); output.append(packed)
             append(UInt32(0x02014B50), to: &central); append(UInt16(20), to: &central); append(UInt16(20), to: &central)
-            append(UInt16(0x800), to: &central); append(UInt16(0), to: &central); append(UInt16(0), to: &central); append(UInt16(0x21), to: &central)
-            append(checksum, to: &central); append(UInt32(bytes.count), to: &central); append(UInt32(bytes.count), to: &central)
+            append(UInt16(0x800), to: &central); append(method, to: &central); append(UInt16(0), to: &central); append(UInt16(0x21), to: &central)
+            append(checksum, to: &central); append(UInt32(packed.count), to: &central); append(UInt32(bytes.count), to: &central)
             append(UInt16(filename.count), to: &central); append(UInt16(0), to: &central); append(UInt16(0), to: &central)
             append(UInt16(0), to: &central); append(UInt16(0), to: &central); append(UInt32(0), to: &central); append(offset, to: &central); central.append(filename)
         }
@@ -37,7 +39,27 @@ enum ZIPPackage {
         append(UInt32(central.count), to: &output); append(offset, to: &output); append(UInt16(0), to: &output)
         return output
     }
-    static func decode(_ data: Data) throws -> [String: Data] {
+    private static func deflate(_ data: Data) throws -> Data {
+        var stream = z_stream()
+        guard deflateInit2_(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -MAX_WBITS, 8,
+                            Z_DEFAULT_STRATEGY, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else {
+            throw AppError.message(L10n.text("无法压缩备份"))
+        }
+        defer { deflateEnd(&stream) }
+        var output = Data(count: Int(deflateBound(&stream, uLong(data.count))))
+        let capacity = output.count
+        let status = data.withUnsafeBytes { input in output.withUnsafeMutableBytes { buffer -> Int32 in
+            stream.next_in = UnsafeMutablePointer(mutating: input.bindMemory(to: Bytef.self).baseAddress)
+            stream.avail_in = uInt(data.count)
+            stream.next_out = buffer.bindMemory(to: Bytef.self).baseAddress
+            stream.avail_out = uInt(capacity)
+            return zlib.deflate(&stream, Z_FINISH)
+        } }
+        guard status == Z_STREAM_END else { throw AppError.message(L10n.text("无法压缩备份")) }
+        output.count = Int(stream.total_out)
+        return output
+    }
+    static func decode(_ data: Data, maximumSize: Int = DocumentTransfer.maximumFileSize) throws -> [String: Data] {
         func number(_ offset: Int, _ count: Int) throws -> Int {
             guard offset >= 0, offset + count <= data.count else { throw AppError.message("Word 压缩包损坏") }
             return (0..<count).reduce(0) { $0 | Int(data[offset + $1]) << ($1 * 8) }
@@ -59,7 +81,7 @@ enum ZIPPackage {
             let checksum = try number(offset + 16, 4); let compressed = try number(offset + 20, 4); let size = try number(offset + 24, 4)
             let nameLength = try number(offset + 28, 2); let extra = try number(offset + 30, 2); let comment = try number(offset + 32, 2)
             let local = try number(offset + 42, 4)
-            guard flags & 1 == 0, size <= DocumentTransfer.maximumFileSize, total + size <= DocumentTransfer.maximumFileSize,
+            guard flags & 1 == 0, size <= maximumSize, total + size <= maximumSize,
                   offset + 46 + nameLength + extra + comment <= data.count else { throw AppError.message("Word 已加密或解压后超过 100 MB") }
             let name = String(decoding: data[(offset + 46)..<(offset + 46 + nameLength)], as: UTF8.self)
             guard try number(local, 4) == 0x04034B50 else { throw AppError.message("Word 文件内容损坏") }

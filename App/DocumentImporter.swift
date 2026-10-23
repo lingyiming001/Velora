@@ -2,13 +2,15 @@ import Foundation
 
 @MainActor
 enum DocumentImporter {
-    static func loadSelection(_ urls: [URL]) throws -> TransferDocument {
+    static func loadSelection(_ urls: [URL]) async throws -> TransferDocument {
         guard !urls.isEmpty, urls.count <= 1000 else { throw AppError.message("一次最多导入 1,000 个文件") }
         var result: [TransferPage] = []; var payloadSize = 0
         for url in urls {
             let access = url.startAccessingSecurityScopedResource(); defer { if access { url.stopAccessingSecurityScopedResource() } }
             let isDirectory = (try url.resourceValues(forKeys: [.isDirectoryKey])).isDirectory == true
-            let document = try isDirectory ? directory(url) : DocumentTransfer.load(url)
+            let document: TransferDocument
+            if isDirectory { document = try await directory(url) }
+            else { document = try await DocumentTransfer.load(url) }
             payloadSize += document.pages.reduce(0) { $0 + $1.title.utf8.count + $1.blocks.reduce(0) { $0 + $1.text.utf8.count } }
             guard payloadSize <= DocumentTransfer.maximumFileSize else { throw AppError.message("本次导入的内容总计超过 100 MB") }
             result.append(contentsOf: remapped(document.pages))
@@ -24,7 +26,7 @@ enum DocumentImporter {
                          title: page.title, archived: page.archived, blocks: page.blocks)
         }
     }
-    static func directory(_ root: URL) throws -> TransferDocument {
+    static func directory(_ root: URL) async throws -> TransferDocument {
         guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey], options: [.skipsHiddenFiles]) else {
             throw AppError.message("无法读取文件夹")
         }
@@ -51,7 +53,7 @@ enum DocumentImporter {
         }
         for file in files.sorted(by: { $0.path < $1.path }) {
             let folder = ensureFolder(file.deletingLastPathComponent())
-            let document = try DocumentTransfer.load(file)
+            let document = try await DocumentTransfer.load(file)
             if file.deletingPathExtension().lastPathComponent.lowercased() == "index", document.pages.count == 1,
                let index = pages.firstIndex(where: { $0.id == folder }) {
                 pages[index].title = document.pages[0].title

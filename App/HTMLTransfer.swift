@@ -31,7 +31,20 @@ enum HTMLTransfer {
         guard let url = URL(string: value), ["https", "http", "mailto"].contains(url.scheme?.lowercased() ?? "") else { return nil }
         return url.absoluteString
     }
+    static func embeddedDocument(_ html: String) -> TransferDocument? {
+        guard let payload = DocumentTransfer.firstMatch(#"<script type="application/json" id="velora-source">([A-Za-z0-9+/=]+)</script>"#, html)?[1],
+              let hash = DocumentTransfer.firstMatch(#"<meta name="velora-body-sha256" content="([a-f0-9]+)">"#, html)?[1],
+              let body = DocumentTransfer.firstMatch(#"<body>([\s\S]*)</body>"#, html)?[1],
+              let css = DocumentTransfer.firstMatch(#"<style>([\s\S]*?)</style>"#, html)?[1],
+              DocumentRenderSession.digest(Data((body + css).utf8)) == hash,
+              let data = Data(base64Encoded: payload), data.count <= DocumentTransfer.maximumFileSize,
+              let original = try? JSONDecoder().decode(TransferDocument.self, from: data),
+              (try? original.orderedPages()) != nil else { return nil }
+        return original
+    }
+
     static func importDocument(_ input: String, title: String, directory: URL? = nil) throws -> TransferDocument {
+        if let original = embeddedDocument(input) { return original }
         let documentTitle = DocumentTransfer.firstMatch("(?i)<title[^>]*>(.*?)</title>", input).map { plain($0[1]) } ?? title
         var tokens: [String: TransferBlock] = [:]
         func token(_ block: TransferBlock) -> String {
@@ -89,6 +102,9 @@ enum HTMLTransfer {
             case .bullet: return "<ul><li>\(text)</li></ul>"
             case .numbered: return "<ol><li>\(text)</li></ol>"
             case .todo: return "<p>\(block.checked ? "☑" : "☐") \(text)</p>"
+            case .equation: return "<pre class=\"equation\">" + RichInlineContent.html(DocumentTransfer.equationSource(block.text), runs: []) + "</pre>"
+            case .markdown: return "<pre>" + RichInlineContent.html(block.text, runs: []) + "</pre>"
+            case .warning, .success: return "<blockquote>" + text + "</blockquote>"
             case .quote: return "<blockquote>\(text)</blockquote>"
             case .callout: return "<aside>\(text)</aside>"
             case .toggle: return "<details\(block.collapsed ? "" : " open")><summary>折叠内容</summary><p>\(text)</p></details>"
@@ -96,7 +112,7 @@ enum HTMLTransfer {
             case .code: return "<pre><code>\(escape(block.text))</code></pre>"
             case .table:
                 guard let data = block.text.data(using: .utf8), let rows = try? JSONDecoder().decode([[String]].self, from: data) else { return "<p>\(text)</p>" }
-                return "<table>" + rows.enumerated().map { index, cells in "<tr>" + cells.map { let tag = index == 0 ? "th" : "td"; return "<\(tag)>\(escape($0))</\(tag)>" }.joined() + "</tr>" }.joined() + "</table>"
+                return "<table>" + rows.enumerated().map { index, cells in "<tr>" + cells.map { let tag = index == 0 ? "th" : "td"; return "<\(tag)>\(escape(TableCellContent.visible($0, layout: block.tableLayout)))</\(tag)>" }.joined() + "</tr>" }.joined() + "</table>"
             case .image:
                 guard let source = try? ImageSource.validated(block.text) else { return "<p>[图片无法导出]</p>" }
                 return "<p><img src=\"\(escape(source))\" alt=\"图片\" /></p>"

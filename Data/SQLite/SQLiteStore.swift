@@ -2,6 +2,7 @@ import Foundation
 import SQLite3
 
 actor SQLiteStore {
+    static let currentSchemaVersion = 5
     private var db: OpaquePointer?
     private(set) var databaseURL: URL
 
@@ -75,6 +76,15 @@ actor SQLiteStore {
             } catch { try? Self.exec(db, "ROLLBACK"); throw error }
         }
 
+        if schemaVersion < 5 {
+            try Self.exec(db, "BEGIN IMMEDIATE")
+            do {
+                try Self.exec(db, "ALTER TABLE blocks ADD COLUMN table_layout TEXT NOT NULL DEFAULT '{}'")
+                try Self.exec(db, "PRAGMA user_version=5")
+                try Self.exec(db, "COMMIT")
+            } catch { try? Self.exec(db, "ROLLBACK"); throw error }
+        }
+
     }
 
     deinit { if let db { sqlite3_close(db) } }
@@ -130,7 +140,7 @@ actor SQLiteStore {
     }
 
     func blocks(in pageID: UUID) throws -> [Block] {
-        let stmt = try statement("SELECT id,kind,body,sort_order,checked,language,collapsed,formatting FROM blocks WHERE page_id=? ORDER BY sort_order,id")
+        let stmt = try statement("SELECT id,kind,body,sort_order,checked,language,collapsed,formatting,table_layout FROM blocks WHERE page_id=? ORDER BY sort_order,id")
         defer { sqlite3_finalize(stmt) }
         let key = pageID.uuidString
         _ = key.withCString { sqlite3_bind_text(stmt, 1, $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
@@ -141,7 +151,8 @@ actor SQLiteStore {
                                 text: text(stmt, 2), order: sqlite3_column_int64(stmt, 3),
                                 checked: sqlite3_column_int(stmt, 4) != 0,
                                 language: text(stmt, 5), collapsed: sqlite3_column_int(stmt, 6) != 0,
-                                formatting: (try? JSONDecoder().decode([TextStyleRun].self, from: Data(text(stmt, 7).utf8))) ?? []))
+                                formatting: (try? JSONDecoder().decode([TextStyleRun].self, from: Data(text(stmt, 7).utf8))) ?? [],
+                                tableLayout: (try? JSONDecoder().decode(TableLayout.self, from: Data(text(stmt, 8).utf8))) ?? TableLayout()))
         }
         return result
     }
@@ -150,7 +161,11 @@ actor SQLiteStore {
         if let parentID, !(try pages()).contains(where: { $0.id == parentID && !$0.archived }) {
             throw StoreError.missingPage
         }
-        let page = Page(id: UUID(), parentID: parentID, title: "未命名", order: Int64(Date().timeIntervalSince1970 * 1000), archived: false, updatedAt: Date())
+        // Sibling order must be deterministic even for pages created in the same millisecond.
+        let lastOrder = try pages().filter { !$0.archived && $0.parentID == parentID }.map(\.order).max() ?? 0
+        let nextOrder = lastOrder.addingReportingOverflow(1024)
+        guard !nextOrder.overflow else { throw StoreError.invalidMove }
+        let page = Page(id: UUID(), parentID: parentID, title: "未命名", order: nextOrder.partialValue, archived: false, updatedAt: Date())
         if let parentID {
             try run("INSERT INTO pages(id,parent_id,title,sort_order,archived,updated_at) VALUES(?,?,?,?,0,?)",
                     [page.id.uuidString, parentID.uuidString, page.title, String(page.order), String(page.updatedAt.timeIntervalSince1970)])
@@ -255,14 +270,69 @@ actor SQLiteStore {
         return block
     }
 
-    func updateBlock(_ id: UUID, text: String, formatting: [TextStyleRun] = []) throws {
+    /// Atomically replaces one editor block with imported semantic blocks.
+    func replaceBlock(_ id: UUID, pageID: UUID, with replacements: [TransferBlock]) throws -> [Block] {
+        let existing = try blocks(in: pageID)
+        guard let targetIndex = existing.firstIndex(where: { $0.id == id }) else {
+            throw StoreError.database("要替换的块不存在")
+        }
+        let inserted = replacements.enumerated().map { offset, item in
+            Block(id: UUID(), pageID: pageID, kind: item.kind, text: item.text,
+                  order: Int64(targetIndex + offset + 1) * 1024, checked: item.checked,
+                  language: item.language, collapsed: item.collapsed, formatting: item.formatting, tableLayout: item.tableLayout)
+        }
+        var ordered = existing
+        ordered.remove(at: targetIndex)
+        ordered.insert(contentsOf: inserted, at: targetIndex)
+        let insertedIDs = Set(inserted.map(\.id))
+        try transaction {
+            try run("DELETE FROM blocks WHERE id=?", [id.uuidString])
+            for (position, item) in ordered.enumerated() {
+                let order = String((position + 1) * 1024)
+                if insertedIDs.contains(item.id) {
+                    let formatting = String(decoding: try JSONEncoder().encode(item.formatting), as: UTF8.self)
+                    try run("INSERT INTO blocks(id,page_id,kind,body,sort_order,checked,language,collapsed,formatting,table_layout) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            [item.id.uuidString, item.pageID.uuidString, item.kind.rawValue, item.text, order,
+                             item.checked ? "1" : "0", item.language, item.collapsed ? "1" : "0", formatting, String(decoding: try JSONEncoder().encode(item.tableLayout), as: UTF8.self)])
+                } else {
+                    try run("UPDATE blocks SET sort_order=? WHERE id=?", [order, item.id.uuidString])
+                }
+            }
+        }
+        return inserted
+    }
+
+    func moveBlock(_ id: UUID, pageID: UUID, offset: Int) throws -> [Block] {
+        var items = try blocks(in: pageID)
+        guard let index = items.firstIndex(where: { $0.id == id }), [-1, 1].contains(offset),
+              items.indices.contains(index + offset) else { return items }
+        items.swapAt(index, index + offset)
+        try transaction {
+            for index in items.indices {
+                items[index].order = Int64(index + 1) * 1024
+                try run("UPDATE blocks SET sort_order=? WHERE id=?", [String(items[index].order), items[index].id.uuidString])
+            }
+        }
+        return items
+    }
+
+    func updateBlock(_ id: UUID, text: String, formatting: [TextStyleRun] = [], tableLayout: TableLayout? = nil) throws {
         let valid = formatting.filter { $0.validRange(in: text) != nil }
         let encoded = String(decoding: try JSONEncoder().encode(valid), as: UTF8.self)
-        try run("UPDATE blocks SET body=?,formatting=? WHERE id=?", [text, encoded, id.uuidString])
+        if let tableLayout {
+            let layout = String(decoding: try JSONEncoder().encode(tableLayout), as: UTF8.self)
+            try run("UPDATE blocks SET body=?,formatting=?,table_layout=? WHERE id=?", [text, encoded, layout, id.uuidString])
+        } else { try run("UPDATE blocks SET body=?,formatting=? WHERE id=?", [text, encoded, id.uuidString]) }
     }
 
     func deleteBlocks(_ ids: [UUID]) throws {
         try transaction { for id in ids { try run("DELETE FROM blocks WHERE id=?", [id.uuidString]) } }
+    }
+
+    func applyBlockCommand(_ id: UUID, kind: BlockKind, text: String, formatting: [TextStyleRun] = []) throws {
+        let encoded = String(decoding: try JSONEncoder().encode(formatting), as: UTF8.self)
+        try run("UPDATE blocks SET kind=?,body=?,formatting=?,checked=0,language='Plain Text',collapsed=0,table_layout='{}' WHERE id=?",
+                [kind.rawValue, text, encoded, id.uuidString])
     }
 
     func setBlockKind(_ id: UUID, kind: BlockKind) throws {
@@ -303,6 +373,8 @@ actor SQLiteStore {
             guard result == SQLITE_DONE, finish == SQLITE_OK else {
                 throw StoreError.database("备份未完成，请稍后重试")
             }
+            // The snapshot is portable by itself, including when the source uses WAL.
+            try Self.exec(output, "PRAGMA journal_mode=DELETE")
         } catch {
             try? FileManager.default.removeItem(at: destination)
             throw error
@@ -371,8 +443,8 @@ actor SQLiteStore {
                 try run("INSERT INTO pages(id,parent_id,title,sort_order,archived,updated_at,trash_batch) VALUES(?,NULLIF(?,''),?,?,?,?,NULLIF(?,''))",
                         [id, parent, page.title, String(Int64(Date().timeIntervalSince1970 * 1000) + Int64(index)), page.archived ? "1" : "0", String(Date().timeIntervalSince1970), batch])
                 for (position, block) in page.blocks.enumerated() {
-                    try run("INSERT INTO blocks(id,page_id,kind,body,sort_order,checked,language,collapsed,formatting) VALUES(?,?,?,?,?,?,?,?,?)",
-                            [UUID().uuidString, id, block.kind.rawValue, block.text, String(position), block.checked ? "1" : "0", block.language, block.collapsed ? "1" : "0", String(decoding: try JSONEncoder().encode(block.formatting), as: UTF8.self)])
+                    try run("INSERT INTO blocks(id,page_id,kind,body,sort_order,checked,language,collapsed,formatting,table_layout) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            [UUID().uuidString, id, block.kind.rawValue, block.text, String(position), block.checked ? "1" : "0", block.language, block.collapsed ? "1" : "0", String(decoding: try JSONEncoder().encode(block.formatting), as: UTF8.self), String(decoding: try JSONEncoder().encode(block.tableLayout), as: UTF8.self)])
                 }
             }
         }

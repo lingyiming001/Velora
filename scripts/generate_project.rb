@@ -8,6 +8,8 @@ root = File.expand_path('..', __dir__)
 project_path = File.join(root, 'Velora.xcodeproj')
 project = Xcodeproj::Project.new(project_path)
 project.root_object.attributes['LastUpgradeCheck'] = '2700'
+project.root_object.known_regions = ['en', 'zh-Hans']
+project.root_object.development_region = 'zh-Hans'
 target = project.new_target(:application, 'Velora', :osx, '14.0')
 # Mirrors source folders as Xcode groups while keeping one app target.
 def add_sources(project, target, root, top_level)
@@ -33,6 +35,14 @@ app_group = project.main_group.children.find { |group| group.display_name == 'Ap
 %w[Info.plist Velora.entitlements].each { |file| app_group.new_file(file) }
 assets = app_group.new_file('Assets.xcassets')
 target.resources_build_phase.add_file_reference(assets)
+localization = app_group.new_variant_group('Localizable.strings')
+%w[en zh-Hans].each do |code|
+  ref = localization.new_file("#{code}.lproj/Localizable.strings"); ref.name = code
+end
+target.resources_build_phase.add_file_reference(localization)
+render_assets = app_group.new_file('RenderAssets')
+render_assets.last_known_file_type = 'folder'
+target.resources_build_phase.add_file_reference(render_assets)
 
 
 tests = project.new_target(:unit_test_bundle, 'VeloraTests', :osx, '14.0')

@@ -12,12 +12,12 @@ struct WorkspaceManagerView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Text("管理工作空间").font(.title2.bold())
+                Text(L10n.tr("管理工作空间")).font(.title2.bold())
                 Spacer()
-                Button("新增工作空间", systemImage: "plus") { creating = true }
-                Button("完成") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(L10n.tr("新增工作空间"), systemImage: "plus") { creating = true }
+                Button(L10n.tr("完成")) { dismiss() }.keyboardShortcut(.cancelAction)
             }
-            Text("每个工作空间拥有独立的页面、内容和回收箱。").foregroundStyle(.secondary)
+            Text(L10n.tr("每个工作空间拥有独立的页面、内容和回收箱。")).foregroundStyle(.secondary)
             ScrollView {
                 LazyVStack(spacing: 12) {
                     ForEach(services.workspaces) { workspace in
@@ -29,26 +29,26 @@ struct WorkspaceManagerView: View {
                                     HStack {
                                         Text(workspace.name).font(.headline).lineLimit(1)
                                         if workspace.id == services.currentWorkspace?.id {
-                                            Text("当前").font(.caption).foregroundStyle(workspace.tint)
+                                            Text(L10n.tr("当前")).font(.caption).foregroundStyle(workspace.tint)
                                         }
                                     }
-                                    Text(workspace.summary.isEmpty ? "暂无简介" : workspace.summary)
+                                    Text(workspace.summary.isEmpty ? L10n.tr("暂无简介") : workspace.summary)
                                         .font(.caption).foregroundStyle(.secondary).lineLimit(2)
                                 }
                                 Spacer()
                                 if workspace.id != services.currentWorkspace?.id {
-                                    Button("切换") { perform { try await services.switchWorkspace(workspace.id) } }
+                                    Button(L10n.tr("切换")) { perform { try await services.switchWorkspace(workspace.id) } }
                                 }
-                                Button("编辑") { editing = workspace }
-                                Button("删除", role: .destructive) { deleting = workspace }
+                                Button(L10n.tr("编辑")) { editing = workspace }
+                                Button(L10n.tr("删除"), role: .destructive) { deleting = workspace }
                                     .disabled(services.workspaces.count <= 1)
                             }
                             Text(workspace.databasePath).font(.system(.caption2, design: .monospaced))
                                 .foregroundStyle(.secondary).textSelection(.enabled)
                             HStack {
-                                Text("创建于 " + workspace.createdAt.formatted(date: .abbreviated, time: .omitted)).font(.caption).foregroundStyle(.secondary)
+                                Text(L10n.tr("创建于 ") + workspace.createdAt.formatted(Date.FormatStyle(date: .abbreviated, time: .omitted).locale(L10n.language.locale))).font(.caption).foregroundStyle(.secondary)
                                 Spacer()
-                                Button("打开数据文件夹") {
+                                Button(L10n.tr("打开数据文件夹")) {
                                     NSWorkspace.shared.open(URL(fileURLWithPath: workspace.databasePath).deletingLastPathComponent())
                                 }.font(.caption)
                             }
@@ -57,22 +57,22 @@ struct WorkspaceManagerView: View {
                 }
             }
             if !error.isEmpty { Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled) }
-            if services.busy { ProgressView("正在保存并切换工作空间…").controlSize(.small) }
-            Text("至少保留一个工作空间。删除后从列表移除，本地数据库文件保留，可通过上方路径找到。").font(.caption).foregroundStyle(.secondary)
+            if services.busy { ProgressView(L10n.tr("正在保存并切换工作空间…")).controlSize(.small) }
+            Text(L10n.tr("至少保留一个工作空间。删除后从列表移除，本地数据库文件保留，可通过上方路径找到。")).font(.caption).foregroundStyle(.secondary)
         }
         .padding(24).frame(width: 720, height: 560)
         .disabled(services.busy)
         .interactiveDismissDisabled(services.busy)
         .sheet(isPresented: $creating) { WorkspaceProfileEditor(services: services, profile: nil) }
         .sheet(item: $editing) { WorkspaceProfileEditor(services: services, profile: $0) }
-        .alert("删除工作空间？", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })) {
-            Button("取消", role: .cancel) { deleting = nil }
-            Button("删除", role: .destructive) {
+        .alert(L10n.tr("删除工作空间？"), isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })) {
+            Button(L10n.tr("取消"), role: .cancel) { deleting = nil }
+            Button(L10n.tr("删除"), role: .destructive) {
                 if let workspace = deleting { perform { try await services.deleteWorkspace(workspace.id) } }
                 deleting = nil
             }
         } message: {
-            Text("「\(deleting?.name ?? "")」将从工作空间列表移除，本地数据文件保留。删除当前空间时会自动切换到其他空间。")
+            Text(L10n.tr("「\(deleting?.name ?? "")」将从工作空间列表移除，本地数据文件保留。删除当前空间时会自动切换到其他空间。"))
         }
     }
 
@@ -82,7 +82,7 @@ struct WorkspaceManagerView: View {
     }
 }
 
-private struct WorkspaceProfileEditor: View {
+struct WorkspaceProfileEditor: View {
     @ObservedObject var services: ApplicationServices
     let profile: WorkspaceProfile?
     @Environment(\.dismiss) private var dismiss
@@ -104,28 +104,28 @@ private struct WorkspaceProfileEditor: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text(profile == nil ? "新增工作空间" : "编辑工作空间").font(.title2.bold())
+            Text(profile == nil ? L10n.tr("新增工作空间") : L10n.tr("编辑工作空间")).font(.title2.bold())
             Form {
-                TextField("名称", text: $name, prompt: Text("例如：个人笔记、项目研发"))
-                TextField("简介", text: $summary, prompt: Text("工作空间的用途或说明"), axis: .vertical).lineLimit(3...5)
-                Picker("图标", selection: $symbol) {
+                TextField(L10n.tr("名称"), text: $name, prompt: Text(L10n.tr("例如：个人笔记、项目研发")))
+                TextField(L10n.tr("简介"), text: $summary, prompt: Text(L10n.tr("工作空间的用途或说明")), axis: .vertical).lineLimit(3...5)
+                Picker(L10n.tr("图标"), selection: $symbol) {
                     ForEach(WorkspaceProfile.symbols, id: \.self) { item in
                         Image(systemName: item).tag(item).accessibilityLabel(symbolLabel(item))
                     }
                 }.pickerStyle(.segmented)
-                Picker("颜色", selection: $color) {
-                    Text("鸢尾紫").tag("indigo"); Text("海洋蓝").tag("blue"); Text("森林绿").tag("green")
-                    Text("暖橙").tag("orange"); Text("粉色").tag("pink"); Text("紫色").tag("purple")
+                Picker(L10n.tr("颜色"), selection: $color) {
+                    Text(L10n.tr("鸢尾紫")).tag("indigo"); Text(L10n.tr("海洋蓝")).tag("blue"); Text(L10n.tr("森林绿")).tag("green")
+                    Text(L10n.tr("暖橙")).tag("orange"); Text(L10n.tr("粉色")).tag("pink"); Text(L10n.tr("紫色")).tag("purple")
                 }
             }
             if profile == nil {
-                Text("创建后自动切换到新空间。现有空间的内容会保留。").font(.caption).foregroundStyle(.secondary)
+                Text(L10n.tr("创建后自动切换到新空间。现有空间的内容会保留。")).font(.caption).foregroundStyle(.secondary)
             }
             if !error.isEmpty { Text(error).foregroundStyle(.red).font(.callout) }
             HStack {
                 Spacer()
-                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button(saving ? "正在保存…" : (profile == nil ? "创建并切换" : "保存")) { save() }
+                Button(L10n.tr("取消")) { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(saving ? L10n.tr("正在保存…") : (profile == nil ? L10n.tr("创建并切换") : L10n.tr("保存"))) { save() }
                     .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                     .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
@@ -134,7 +134,7 @@ private struct WorkspaceProfileEditor: View {
     }
 
     private func symbolLabel(_ value: String) -> String {
-        let labels = ["工作空间", "工作", "家庭", "书籍", "学习", "创意", "生活", "收藏"]
+        let labels = [L10n.tr("工作空间"), L10n.tr("工作"), L10n.tr("家庭"), L10n.tr("书籍"), L10n.tr("学习"), L10n.tr("创意"), L10n.tr("生活"), L10n.tr("收藏")]
         return labels[WorkspaceProfile.symbols.firstIndex(of: value) ?? 0]
     }
 
