@@ -78,7 +78,7 @@ struct MediaImageView: View {
 
 struct ImageSourcePicker: View {
     @Environment(\.dismiss) private var dismiss
-    @State private var mode = 0
+    @State private var mode = 1
     @State private var urlText: String
     @State private var localImage = ""
     @State private var filename = ""
@@ -88,12 +88,12 @@ struct ImageSourcePicker: View {
         self.onSelect = onSelect
         _urlText = State(initialValue: initialValue.hasPrefix("data:") ? "" : initialValue)
         _localImage = State(initialValue: initialValue.hasPrefix("data:") ? initialValue : "")
-        _mode = State(initialValue: initialValue.hasPrefix("data:") ? 1 : 0)
+        _mode = State(initialValue: initialValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || initialValue.hasPrefix("data:") ? 1 : 0)
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(L10n.tr("选择图片")).font(.title2.bold())
-            Picker(L10n.tr("来源"), selection: $mode) { Text(L10n.tr("图片 URL")).tag(0); Text(L10n.tr("本地文件")).tag(1) }.pickerStyle(.segmented)
+            Picker(L10n.tr("来源"), selection: $mode) { Text(L10n.tr("本地文件")).tag(1); Text(L10n.tr("图片 URL")).tag(0) }.pickerStyle(.segmented)
             if mode == 0 {
                 TextField("https://example.com/image.png", text: $urlText).textFieldStyle(.roundedBorder)
                 Text(L10n.tr("请输入图片文件的直接链接，推荐使用 HTTPS。")).font(.caption).foregroundStyle(.secondary)
@@ -121,5 +121,54 @@ struct ImageSourcePicker: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do { localImage = try ImageSource.load(url); filename = url.lastPathComponent; error = "" }
         catch { self.error = error.localizedDescription }
+    }
+}
+
+enum MediaSource {
+    static func url(_ source: String) -> URL? {
+        let value = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.hasPrefix("/") { return URL(fileURLWithPath: value) }
+        guard let parts = URLComponents(string: value), let scheme = parts.scheme?.lowercased(),
+              parts.user == nil, parts.password == nil, let url = parts.url else { return nil }
+        if scheme == "file" { return url.isFileURL && (url.host == nil || url.host == "" || url.host == "localhost") ? url : nil }
+        return ["https", "http"].contains(scheme) && !(parts.host ?? "").isEmpty ? url : nil
+    }
+}
+
+struct MediaSourcePicker: View {
+    let kind: BlockKind
+    let onSelect: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var source: String
+    @State private var error = ""
+    init(kind: BlockKind, source: String, onSelect: @escaping (String) -> Void) {
+        self.kind = kind; self.onSelect = onSelect; _source = State(initialValue: source)
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label(kind.label, systemImage: kind.symbol).font(.title2.weight(.semibold))
+            TextField(L10n.tr("链接或本地文件路径"), text: $source).textFieldStyle(.roundedBorder)
+            if kind != .bookmark {
+                Button(L10n.tr("选择本地文件…")) {
+                    let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+                    if kind == .video { panel.allowedContentTypes = [.movie] }
+                    else if kind == .audio { panel.allowedContentTypes = [.audio] }
+                    if panel.runModal() == .OK, let url = panel.url { source = url.absoluteString; error = "" }
+                }
+                Text(L10n.tr("本地媒体和文件以引用方式打开，移动原文件后需要重新选择。"))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if !error.isEmpty { Text(error).font(.callout).foregroundStyle(.red) }
+            HStack {
+                Spacer()
+                Button(L10n.tr("取消"), role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(L10n.tr("插入")) {
+                    guard let url = MediaSource.url(source), kind != .bookmark || !url.isFileURL else { error = L10n.tr("请输入有效链接或选择本地文件。"); return }
+                    if url.isFileURL && !FileManager.default.isReadableFile(atPath: url.path) { error = L10n.tr("文件不存在或无法读取，请重新选择。"); return }
+                    onSelect(url.absoluteString); dismiss()
+                }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    .disabled(source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }.padding(24).frame(width: 480)
     }
 }

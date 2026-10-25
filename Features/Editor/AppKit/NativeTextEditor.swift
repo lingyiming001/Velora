@@ -4,6 +4,7 @@ import SwiftUI
 struct NativeTextEditor: NSViewRepresentable {
     var text: String
     var font: NSFont
+    var lineSpacing: CGFloat = 0
     var formatting: [TextStyleRun] = []
     var onRichChange: ((String, [TextStyleRun]) -> Void)? = nil
     var onMarkdownHeading: ((String, [TextStyleRun], NSRange) -> Bool)? = nil
@@ -20,12 +21,31 @@ struct NativeTextEditor: NSViewRepresentable {
     var focusRequest: EditorFocusRequest? = nil
     var isFocusRequestCurrent: (UUID) -> Bool = { _ in true }
     var contentRevision: UInt64 = 0
+    var onReturnBlock: ((String, [TextStyleRun], NSRange) -> Bool)? = nil
     var onExitBlock: () -> Bool = { false }
+    var shiftReturnInsertsNewline = false
     var onBackspaceAtStart: () -> Bool = { false }
     var onCommand: (Selector, String) -> Bool = { _, _ in false }
     var onFocus: (Bool) -> Void = { _ in }
     var onHeightChange: (CGFloat) -> Void = { _ in }
     var onChange: (String) -> Void
+
+    // Code follows the code typography preference, including imported rich text.
+    private func attributedText(_ text: String, runs: [TextStyleRun]) -> NSAttributedString {
+        let runs = codeLanguage == nil ? runs : runs.map { run in
+            var run = run
+            run.style.fontSize = nil
+            run.style.fontFamily = nil
+            return run
+        }
+        let result = NSMutableAttributedString(attributedString: RichTextFormatting.attributed(text, runs: runs, base: font))
+        if lineSpacing > 0 {
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineSpacing = lineSpacing
+            result.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: result.length))
+        }
+        return result
+    }
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSScrollView()
@@ -55,10 +75,15 @@ struct NativeTextEditor: NSViewRepresentable {
         view.textContainer?.widthTracksTextView = true
         view.isVerticallyResizable = true
         view.isHorizontallyResizable = false
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = lineSpacing
+        view.defaultParagraphStyle = paragraph
+        view.typingAttributes = [.font: font, .paragraphStyle: paragraph]
         view.font = font
-        view.textStorage?.setAttributedString(RichTextFormatting.attributed(text, runs: formatting, base: font))
+        view.textStorage?.setAttributedString(attributedText(text, runs: formatting))
         context.coordinator.lastAppliedRuns = formatting
         context.coordinator.lastBaseFont = font
+        context.coordinator.lastLineSpacing = lineSpacing
         configureCallbacks(view, coordinator: context.coordinator)
         scrollView.documentView = view
         return scrollView
@@ -67,6 +92,14 @@ struct NativeTextEditor: NSViewRepresentable {
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let view = scrollView.documentView as? NSTextView else { return }
         context.coordinator.parent = self
+        if codeLanguage == nil {
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineSpacing = lineSpacing
+            view.defaultParagraphStyle = paragraph
+            var typing = view.typingAttributes
+            typing[.paragraphStyle] = paragraph
+            view.typingAttributes = typing
+        }
         if let codeView = view as? CodeTextView {
             codeView.showsLineNumbers = codeLanguage != nil && showCodeLineNumbers
             codeView.textContainerInset.width = codeLanguage != nil && showCodeLineNumbers ? 44 : codeLanguage != nil ? 18 : 0
@@ -93,11 +126,12 @@ struct NativeTextEditor: NSViewRepresentable {
             guard let coordinator, coordinator.isActive else { return }
             coordinator.parent.onFocus(focused)
         }
-        view.selectAllDocument = { [weak coordinator] in coordinator?.formatPopover.close(); return onSelectAllBlocks() }
+        view.selectAllDocument = { [weak coordinator] in coordinator?.formatPopover.close(); return codeLanguage == nil ? onSelectAllBlocks() : false }
         view.deleteDocumentSelection = { [weak coordinator] in
             let handled = onDeleteBlocks(); if handled { coordinator?.formatPopover.close() }; return handled
         }
         view.copySelectionAsText = codeLanguage != nil
+        view.pasteBaseFont = font
         view.pasteDocument = codeLanguage == nil ? { [weak view] plain, html, original, selection in
             guard let view else { return false }
             return onPasteDocument?(plain, html, original, RichTextFormatting.runs(view.attributedString(), base: font), selection) ?? false
@@ -110,6 +144,7 @@ struct NativeTextEditor: NSViewRepresentable {
             return onHeadingShortcut?(level, view.string, RichTextFormatting.runs(view.attributedString(), base: font), view.selectedRange()) ?? false
         }
         view.exitBlock = onExitBlock
+        view.shiftReturnInsertsNewline = shiftReturnInsertsNewline
         view.documentBoundary = onDocumentBoundary
         view.blockMouseDown = onBlockMouseDown
         view.formatSelection = { [weak coordinator, weak view] action in
@@ -134,6 +169,7 @@ struct NativeTextEditor: NSViewRepresentable {
         var parent: NativeTextEditor
         var lastAppliedRuns: [TextStyleRun] = []
         var lastBaseFont: NSFont?
+        var lastLineSpacing: CGFloat = 0
         private var lastModelText: String
         private var lastModelFormatting: [TextStyleRun]
         private var lastContentRevision: UInt64
@@ -173,22 +209,23 @@ struct NativeTextEditor: NSViewRepresentable {
             else if let acknowledgement { nativeEdits.removeFirst(acknowledgement + 1) }
             else if modelChanged { nativeEdits.removeAll() }
             let useModel = explicitReset || (modelChanged && !staleAcknowledgement)
-            let fontChanged = lastBaseFont != parent.font
+            let fontChanged = lastBaseFont != parent.font || lastLineSpacing != parent.lineSpacing
             if (useModel && (view.string != parent.text || lastAppliedRuns != parent.formatting)) || fontChanged {
                 let range = view.selectedRange()
                 let text = useModel ? parent.text : view.string
                 let runs = useModel ? parent.formatting : lastAppliedRuns
                 if fontChanged { view.font = parent.font }
-                view.textStorage?.setAttributedString(RichTextFormatting.attributed(text, runs: runs, base: parent.font))
+                view.textStorage?.setAttributedString(parent.attributedText(text, runs: runs))
                 let start = min(range.location, view.string.utf16.count)
                 view.setSelectedRange(NSRange(location: start, length: min(range.length, view.string.utf16.count - start)))
                 if fontChanged {
                     if let storage = view.textStorage, storage.length > 0 {
                         view.typingAttributes = storage.attributes(at: max(0, min(start - 1, storage.length - 1)), effectiveRange: nil)
-                    } else { view.typingAttributes = [.font: parent.font, .foregroundColor: NSColor.labelColor] }
+                    } else { view.typingAttributes = [.font: parent.font, .foregroundColor: NSColor.labelColor, .paragraphStyle: view.defaultParagraphStyle ?? NSParagraphStyle.default] }
                 }
                 lastAppliedRuns = runs
                 lastBaseFont = parent.font
+                lastLineSpacing = parent.lineSpacing
             }
             lastModelText = parent.text
             lastModelFormatting = parent.formatting
@@ -233,7 +270,10 @@ struct NativeTextEditor: NSViewRepresentable {
                textView.selectedRange().location == 0, textView.selectedRange().length == 0,
                !textView.hasMarkedText(), parent.onBackspaceAtStart() { return true }
             guard !textView.hasMarkedText() else { return false }
-            return parent.onCommand(commandSelector, textView.string)
+            if parent.onCommand(commandSelector, textView.string) { return true }
+            if commandSelector == #selector(NSResponder.insertNewline(_:)),
+               parent.onReturnBlock?(textView.string, RichTextFormatting.runs(textView.attributedString(), base: parent.font), textView.selectedRange()) == true { return true }
+            return false
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
@@ -386,6 +426,7 @@ struct NativeTextEditor: NSViewRepresentable {
             var width: CGFloat
             var inset: NSSize
             var language: String?
+            var lineSpacing: CGFloat
         }
         private var lastMeasurement: MeasurementInput?
 
@@ -393,7 +434,7 @@ struct NativeTextEditor: NSViewRepresentable {
             guard let container = view.textContainer, let layout = view.layoutManager else { return }
             let input = MeasurementInput(text: view.string, runs: lastAppliedRuns, font: parent.font,
                                          width: container.containerSize.width, inset: view.textContainerInset,
-                                         language: parent.codeLanguage)
+                                         language: parent.codeLanguage, lineSpacing: parent.lineSpacing)
             guard input != lastMeasurement, input.width > 0 else { return }
             lastMeasurement = input
             layout.ensureLayout(for: container)
@@ -590,6 +631,14 @@ final class CodeTextView: NSTextView {
     var pasteTransform: ((String?, String?) -> String)?
     var literalPasteInProgress = false
     var copySelectionAsText = false
+    var pasteBaseFont: NSFont?
+    override func writeSelection(to pasteboard: NSPasteboard, types: [NSPasteboard.PasteboardType]) -> Bool {
+        let written = super.writeSelection(to: pasteboard, types: types)
+        if written, !copySelectionAsText {
+            pasteboard.setString("1", forType: ClipboardDocument.richTextSelectionType)
+        }
+        return written
+    }
     override func copy(_ sender: Any?) {
         guard copySelectionAsText else { super.copy(sender); return }
         let range = selectedRange()
@@ -601,11 +650,20 @@ final class CodeTextView: NSTextView {
     }
     override func paste(_ sender: Any?) {
         let clipboard = NSPasteboard.general
+        if !hasMarkedText(), copySelectionAsText,
+           let plain = clipboard.string(forType: .string) ?? ClipboardDocument.attributedText(from: clipboard)?.string {
+            insertMatchingText(NSAttributedString(string: plain))
+            return
+        }
         if !hasMarkedText(), clipboard.data(forType: ClipboardDocument.textSelectionType) != nil,
            let plain = clipboard.string(forType: .string) {
             literalPasteInProgress = true
             defer { literalPasteInProgress = false }
-            insertText(plain, replacementRange: selectedRange())
+            insertMatchingText(NSAttributedString(string: plain))
+            return
+        }
+        if !hasMarkedText(), clipboard.data(forType: ClipboardDocument.richTextSelectionType) != nil {
+            super.paste(sender)
             return
         }
         if !hasMarkedText(), pasteDocument?(clipboard.string(forType: .string), clipboard.string(forType: .html), string, selectedRange()) == true { return }
@@ -616,15 +674,60 @@ final class CodeTextView: NSTextView {
                 return
             }
         }
+        if !hasMarkedText(), let source = ClipboardDocument.attributedText(from: clipboard) {
+            insertMatchingText(source)
+            return
+        }
         super.paste(sender)
+    }
+
+    private func insertMatchingText(_ source: NSAttributedString) {
+        let base = pasteBaseFont ?? font ?? .systemFont(ofSize: 17)
+        let paragraph = defaultParagraphStyle ?? NSParagraphStyle.default
+        let replacement = ClipboardDocument.matchingTypography(source, font: base, paragraph: paragraph)
+        insertText(replacement, replacementRange: selectedRange())
+    }
+
+    override func pasteAsRichText(_ sender: Any?) { paste(sender) }
+
+    override func pasteAsPlainText(_ sender: Any?) {
+        let clipboard = NSPasteboard.general
+        guard !hasMarkedText(),
+              let plain = clipboard.string(forType: .string) ?? ClipboardDocument.attributedText(from: clipboard)?.string else {
+            super.pasteAsPlainText(sender)
+            return
+        }
+        insertMatchingText(NSAttributedString(string: plain))
     }
 
     override func copyFont(_ sender: Any?) { formatSelection(.copyStyle) }
     override func pasteFont(_ sender: Any?) { formatSelection(.pasteStyle) }
     override func selectAll(_ sender: Any?) { if !selectAllDocument() { super.selectAll(sender) } }
-    override func mouseDown(with event: NSEvent) { if !blockMouseDown(event.modifierFlags) { super.mouseDown(with: event) } }
+    override func mouseDown(with event: NSEvent) {
+        guard !blockMouseDown(event.modifierFlags) else { return }
+        let originalWindow = window
+        super.mouseDown(with: event)
+        if let window = originalWindow {
+            DocumentRangeSelectionView.finishNativeTracking(in: window, at: window.mouseLocationOutsideOfEventStream)
+        }
+    }
     var headingShortcut: (Int) -> Bool = { _ in false }
     var exitBlock: () -> Bool = { false }
+    var shiftReturnInsertsNewline = false
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Command combinations normally travel here before NSTextView.keyDown.
+        guard window?.firstResponder === self else { return super.performKeyEquivalent(with: event) }
+        if handleHeadingShortcut(event) { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    private func handleHeadingShortcut(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.shift, .command, .option, .control])
+        guard modifiers == [.command, .option], !hasMarkedText(),
+              let level = [UInt16(18): 1, 19: 2, 20: 3, 83: 1, 84: 2, 85: 3][event.keyCode] else { return false }
+        return headingShortcut(level)
+    }
+
     override func keyDown(with event: NSEvent) {
         let modifiers = event.modifierFlags.intersection([.shift, .command, .option, .control])
         if modifiers == [.command, .option], !hasMarkedText(),
@@ -632,9 +735,14 @@ final class CodeTextView: NSTextView {
             formatSelection(key == "c" ? .copyStyle : .pasteStyle)
             return
         }
-        if modifiers == [.command, .option], !hasMarkedText(),
-           let level = [UInt16(18): 1, 19: 2, 20: 3][event.keyCode], headingShortcut(level) { return }
-        if [36, 76].contains(event.keyCode), modifiers == .shift, !hasMarkedText(), exitBlock() { return }
+        if handleHeadingShortcut(event) { return }
+        if [36, 76].contains(event.keyCode), modifiers == .shift, !hasMarkedText() {
+            if shiftReturnInsertsNewline {
+                insertText("\n", replacementRange: selectedRange())
+                return
+            }
+            if exitBlock() { return }
+        }
         let command = event.modifierFlags.contains(.command)
         if command, let key = event.charactersIgnoringModifiers?.lowercased() {
             if key == "a", selectAllDocument() { return }

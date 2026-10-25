@@ -1,4 +1,5 @@
 "%@ 行" = "%@ lines";
+"段落顺序已变化，请重试退格。" = "The paragraph order changed. Try Backspace again.";
 "%@ 页" = "%@ pages";
 "AI 功能" = "AI features";
 "AI 助手" = "AI assistant";
@@ -31,6 +32,7 @@
 "PDF 页面无法读取" = "Cannot read PDF page";
 "PDF 页面渲染失败" = "PDF page rendering failed";
 "Shift 范围选择 · ⌘A 全选 · Esc 取消" = "Shift to select a range · ⌘A select all · Esc cancel";
+"↩ 下方继续 · Shift 范围选择 · ⌘A 全选 · Esc 取消" = "↩ continue below · Shift select range · ⌘A select all · Esc cancel";
 "TXT 导出可读纯文本；图片和媒体以文字说明或链接表示。" = "TXT exports readable plain text. Images and media are represented by descriptions or links.";
 "Velora 助手" = "Velora assistant";
 "Velora 设置" = "Velora settings";
@@ -679,3 +681,41 @@
 "移动" = "Move";
 
 "搜索页面…" = "Search Pages…";
+
+"选择所有工作空间的统一存储文件夹。原位置副本保留，不覆盖已有数据库。" = "Choose a shared storage folder for all workspaces. Original copies are retained; existing databases are never overwritten.";
+
+"所有工作空间存储位置已切换，原位置副本保留。" = "Storage for all workspaces has moved. Original copies are retained.";
+
+"统一存储位置" = "Shared Storage Location";
+
+"所有工作空间统一存储于此。更改位置会迁移全部工作空间，保留原位置副本，不覆盖已有数据库。" = "All workspaces share this location. Changing it migrates all workspaces, retains original copies, and never overwrites existing databases.";
+
+"新工作空间" = "New Workspace";
+
+"重新尝试" = "Try Again";
+
+"打开其他工作空间" = "Open Another Workspace";
+
+"创建空白工作空间" = "Create Empty Workspace";
+
+"文件已删除？可以创建空白工作空间继续书写，原工作空间记录会保留。" = "Deleted the files? Create an empty workspace to keep writing. The original workspace records are retained.";
+
+"链接或本地文件路径" = "Link or local file path";
+
+"选择本地文件…" = "Choose Local File…";
+
+"本地媒体和文件以引用方式打开，移动原文件后需要重新选择。" = "Local media and files are referenced, not copied. Choose them again if the original files move.";
+
+"请输入有效链接或选择本地文件。" = "Enter a valid link or choose a local file.";
+
+"文件不存在或无法读取，请重新选择。" = "The file is missing or unreadable. Choose it again.";
+
+"选择媒体或文件…" = "Choose Media or File…";
+
+"更换来源…" = "Change Source…";
+
+"此来源无法直接播放，可在外部打开或更换为音视频文件链接。" = "This source cannot play directly. Open it externally or use a direct audio or video file link.";
+
+"打开文件" = "Open File";
+
+"块不存在，内容尚未保存。" = "This block is missing; its content has not been saved.";

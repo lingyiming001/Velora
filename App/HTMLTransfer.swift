@@ -93,14 +93,18 @@ enum HTMLTransfer {
     }
 
     static func page(_ page: TransferPage) -> String {
-        let body = page.blocks.map { block -> String in
+        let body = page.blocks.enumerated().map { index, block -> String in
             let text = RichInlineContent.html(block.text, runs: block.formatting)
+            if block.kind == .bullet || block.kind == .numbered {
+                let tag = block.kind == .bullet ? "ul" : "ol"
+                let startsList = index == 0 || page.blocks[index - 1].kind != block.kind
+                let endsList = index + 1 == page.blocks.count || page.blocks[index + 1].kind != block.kind
+                return (startsList ? "<\(tag)>" : "") + "<li>\(text)</li>" + (endsList ? "</\(tag)>" : "")
+            }
             switch block.kind {
             case .heading: return "<h1>\(text)</h1>"
             case .heading2: return "<h2>\(text)</h2>"
             case .heading3: return "<h3>\(text)</h3>"
-            case .bullet: return "<ul><li>\(text)</li></ul>"
-            case .numbered: return "<ol><li>\(text)</li></ol>"
             case .todo: return "<p>\(block.checked ? "☑" : "☐") \(text)</p>"
             case .equation: return "<pre class=\"equation\">" + RichInlineContent.html(DocumentTransfer.equationSource(block.text), runs: []) + "</pre>"
             case .markdown: return "<pre>" + RichInlineContent.html(block.text, runs: []) + "</pre>"

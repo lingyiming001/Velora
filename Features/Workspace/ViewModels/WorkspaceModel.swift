@@ -230,6 +230,99 @@ final class WorkspaceModel: ObservableObject {
         } else { addBlock(after: blocks[index]) }
     }
 
+    func continueAfterSelectedBlocks() {
+        guard let last = blocks.last(where: { selectedBlockIDs.contains($0.id) }) else { return }
+        clearBlockSelection()
+        exitBlock(last)
+    }
+
+    func returnFromSingleLineBlock(_ block: Block, text: String, formatting: [TextStyleRun], selection: NSRange) -> Bool {
+        guard block.kind.isHeading || [.bullet, .numbered, .todo].contains(block.kind) || block.kind.isMedia else { return false }
+        if block.kind.isMedia { exitBlock(block); return true }
+        guard let index = blocks.firstIndex(where: { $0.id == block.id }), selectedPageID == block.pageID,
+              selection.location <= text.utf16.count, selection.length <= text.utf16.count - selection.location else { return false }
+        if text.isEmpty { insertSlashCommand(.paragraph, in: blocks[index], text: ""); return true }
+        let original = blocks[index]
+        // Return at the start of a heading creates room above it. Splitting
+        // the heading here would turn all of its content into body text.
+        if original.kind.isHeading, selection.location == 0, selection.length == 0 {
+            let paragraph = Block(id: UUID(), pageID: original.pageID, kind: .paragraph,
+                text: "", order: original.order, checked: false)
+            blocks.insert(paragraph, at: index)
+            requestFocus(paragraph.id, offset: 0)
+            let previous = pendingConversions[original.id]
+            let operation = Task { [weak self] in
+                if let previous { await previous.value }
+                guard let self else { return }
+                defer {
+                    pendingConversions[paragraph.id] = nil
+                    saving = !latestText.isEmpty || !pendingConversions.isEmpty
+                }
+                do { try await store.splitTextBlock(original, inserting: paragraph, before: true) }
+                catch {
+                    blocks.removeAll { $0.id == paragraph.id }
+                    requestFocus(original.id, offset: 0)
+                    report(error)
+                }
+            }
+            pendingConversions[paragraph.id] = operation
+            saving = true
+            return true
+        }
+        let source = text as NSString
+        let end = NSMaxRange(selection)
+        func sliced(_ range: NSRange, body: Bool) -> [TextStyleRun] {
+            formatting.compactMap { run in
+                guard let valid = run.validRange(in: text) else { return nil }
+                let overlap = NSIntersectionRange(valid, range)
+                guard overlap.length > 0 else { return nil }
+                var style = run.style
+                if body { style.fontSize = nil; style.bold = nil }
+                return style.isEmpty ? nil : TextStyleRun(location: overlap.location - range.location, length: overlap.length, style: style)
+            }
+        }
+        var first = original
+        first.text = source.substring(to: selection.location)
+        first.formatting = sliced(NSRange(location: 0, length: selection.location), body: false)
+        var second = Block(id: UUID(), pageID: original.pageID, kind: original.kind.isHeading ? .paragraph : original.kind,
+            text: source.substring(from: end), order: original.order + 1, checked: false)
+        second.formatting = sliced(NSRange(location: end, length: source.length - end), body: original.kind.isHeading)
+        let previous = pendingConversions[original.id]
+        pendingWrites[original.id]?.cancel(); pendingWrites[original.id] = nil
+        latestText[original.id] = nil; latestFormatting[original.id] = nil; latestTableLayouts[original.id] = nil
+        let revision = (editorContentRevisions[original.id] ?? 0) &+ 1
+        editorContentRevisions[original.id] = revision
+        blocks[index] = first; blocks.insert(second, at: index + 1)
+        requestFocus(second.id, offset: 0)
+        let operation = Task { [weak self] in
+            if let previous { await previous.value }
+            guard let self else { return }
+            defer {
+                if editorContentRevisions[first.id] == revision { pendingConversions[first.id] = nil }
+                if editorContentRevisions[second.id] == nil { pendingConversions[second.id] = nil }
+                saving = !latestText.isEmpty || !pendingConversions.isEmpty
+            }
+            do { try await store.splitTextBlock(first, inserting: second) }
+            catch {
+                if let current = blocks.firstIndex(where: { $0.id == first.id }), blocks[current] == first {
+                    if editorContentRevisions[first.id] == revision { pendingConversions[first.id] = nil }
+                    var restored = original; restored.text = text; restored.formatting = formatting
+                    blocks[current] = restored
+                    editorContentRevisions[first.id] = revision &+ 1
+                    latestText[first.id] = text; latestFormatting[first.id] = formatting; latestTableLayouts[first.id] = restored.tableLayout
+                    scheduleWrite(first.id)
+                }
+                if blocks.first(where: { $0.id == second.id }) == second {
+                    blocks.removeAll { $0.id == second.id }; requestFocus(original.id, offset: selection.location)
+                }
+                report(error)
+            }
+        }
+        pendingConversions[first.id] = operation; pendingConversions[second.id] = operation
+        saving = true
+        return true
+    }
+
     func addBlock(_ kind: BlockKind = .paragraph, after previous: Block? = nil, text: String = "") {
         guard let id = selectedPageID else { return }
         Task {
@@ -274,7 +367,11 @@ final class WorkspaceModel: ObservableObject {
                 }
                 let combined = ClipboardDocument.replacing(original, formatting: formatting, selection: selection, with: source)
                 var imported: [TransferBlock]
-                if let copiedBlocks { imported = ClipboardDocument.inserting(copiedBlocks, into: original, formatting: formatting, selection: selection) }
+                if let copiedBlocks { imported = ClipboardDocument.inserting(copiedBlocks, into: original, formatting: formatting, selection: selection, destination: TransferBlock(current)) }
+                else if current.kind != .paragraph {
+                    let incoming = try DocumentTransfer.markdown(source, title: "", consumeLeadingTitle: false).pages[0].blocks
+                    imported = ClipboardDocument.inserting(incoming, into: original, formatting: formatting, selection: selection, destination: TransferBlock(current))
+                }
                 else { imported = try DocumentTransfer.markdown(combined, title: "", consumeLeadingTitle: false).pages[0].blocks }
                 if imported.isEmpty { imported = [TransferBlock(.paragraph)] }
                 pendingWrites[current.id]?.cancel(); pendingWrites[current.id] = nil
@@ -540,6 +637,14 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func selectAllBlocks() { selectedBlockIDs = Set(blocks.map(\.id)); blockSelectionAnchor = blocks.first?.id }
+    func selectBlockRange(from anchor: UUID, through endpoint: UUID) {
+        guard let start = blocks.firstIndex(where: { $0.id == anchor }),
+              let end = blocks.firstIndex(where: { $0.id == endpoint }) else { return }
+        let selected = Set(blocks[min(start, end)...max(start, end)].map(\.id))
+        blockSelectionAnchor = anchor
+        activeEditingBlockID = anchor
+        if selectedBlockIDs != selected { selectedBlockIDs = selected }
+    }
     func clearBlockSelection() { selectedBlockIDs = []; blockSelectionAnchor = nil }
 
     func copySelectedBlocks() {
@@ -582,18 +687,77 @@ final class WorkspaceModel: ObservableObject {
 
     /// Called only for Backspace at the beginning of an editor, outside IME composition.
     func backspaceAtStart(of block: Block) -> Bool {
-        guard let index = blocks.firstIndex(where: { $0.id == block.id }) else { return false }
+        guard selectedPageID == block.pageID, let index = blocks.firstIndex(where: { $0.id == block.id }) else { return false }
         let current = blocks[index]
-        if current.text.isEmpty && current.kind != .paragraph {
-            changeKind(.paragraph, of: current)
+        let prose: (BlockKind) -> Bool = { $0.isHeading || [.paragraph, .bullet, .numbered, .todo, .quote, .callout, .warning, .success, .toggle].contains($0) }
+        if current.kind != .paragraph, current.text.isEmpty || prose(current.kind) {
+            insertSlashCommand(.paragraph, in: current, text: current.text, formatting: current.formatting)
             return true
         }
-        guard index > 0 else { return false }
-        if current.text.isEmpty {
-            delete(current, focusPrevious: true)
+        guard current.kind == .paragraph, index > 0 else { return false }
+        let previous = blocks[index - 1]
+        guard prose(previous.kind), !previous.collapsed else {
+            // A text boundary must never concatenate text into a media URL,
+            // table payload or code source. Select the preceding block instead.
+            selectBlock(previous.id)
             return true
         }
-        return false
+        let offset = previous.text.utf16.count
+        var merged = previous
+        merged.text += current.text
+        merged.formatting += current.formatting.compactMap { run in
+            guard let range = run.validRange(in: current.text) else { return nil }
+            return TextStyleRun(location: offset + range.location, length: range.length, style: run.style)
+        }
+        let priorFirst = pendingConversions[previous.id], priorSecond = pendingConversions[current.id]
+        for id in [previous.id, current.id] {
+            pendingWrites[id]?.cancel(); pendingWrites[id] = nil
+            latestText[id] = nil; latestFormatting[id] = nil; latestTableLayouts[id] = nil
+        }
+        let revision = (editorContentRevisions[previous.id] ?? 0) &+ 1
+        let removedRevision = (editorContentRevisions[current.id] ?? 0) &+ 1
+        editorContentRevisions[previous.id] = revision
+        editorContentRevisions[current.id] = removedRevision
+        blocks[index - 1] = merged; blocks.remove(at: index)
+        clearBlockSelection()
+        requestFocus(previous.id, offset: offset)
+        let operation = Task { [weak self] in
+            if let priorFirst { await priorFirst.value }
+            if let priorSecond { await priorSecond.value }
+            guard let self else { return }
+            defer {
+                if editorContentRevisions[previous.id] == revision { pendingConversions[previous.id] = nil }
+                if editorContentRevisions[current.id] == removedRevision { pendingConversions[current.id] = nil }
+                saving = !latestText.isEmpty || !pendingConversions.isEmpty
+            }
+            do { try await store.mergeTextBlocks(merged, removing: current) }
+            catch {
+                pageCache[current.pageID] = nil
+                cachedPageOrder.removeAll { $0 == current.pageID }
+                if selectedPageID == current.pageID, let target = blocks.firstIndex(where: { $0.id == previous.id }) {
+                    if editorContentRevisions[previous.id] == revision, blocks[target] == merged {
+                        blocks[target] = previous
+                        editorContentRevisions[previous.id] = revision &+ 1
+                        pendingConversions[previous.id] = nil
+                        latestText[previous.id] = previous.text; latestFormatting[previous.id] = previous.formatting
+                        latestTableLayouts[previous.id] = previous.tableLayout
+                        scheduleWrite(previous.id)
+                    }
+                    if !blocks.contains(where: { $0.id == current.id }) { blocks.insert(current, at: target + 1) }
+                    if editorContentRevisions[current.id] == removedRevision {
+                        pendingConversions[current.id] = nil
+                        latestText[current.id] = current.text; latestFormatting[current.id] = current.formatting
+                        latestTableLayouts[current.id] = current.tableLayout
+                        scheduleWrite(current.id)
+                    }
+                    requestFocus(current.id, offset: 0)
+                }
+                report(error)
+            }
+        }
+        pendingConversions[previous.id] = operation; pendingConversions[current.id] = operation
+        saving = true
+        return true
     }
 
     func delete(_ block: Block, focusPrevious: Bool = false) {

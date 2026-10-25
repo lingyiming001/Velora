@@ -39,6 +39,9 @@ final class ApplicationServices: ObservableObject {
             let existing = FileManager.default.fileExists(atPath: self.catalogURL.path)
             let loaded = try WorkspaceCatalog.load(from: self.catalogURL,
                 legacyDatabaseURL: legacyDatabaseURL ?? legacyDirectory.appendingPathComponent("velora.sqlite"))
+            // Keep valid workspace metadata available to the recovery screen.
+            catalog = loaded
+            storagePath = loaded.storageRoot ?? self.catalogURL.deletingLastPathComponent().path
             if existing && !FileManager.default.fileExists(atPath: loaded.active.databasePath) {
                 throw AppError.message(L10n.tr("当前工作空间数据库不存在，请恢复文件：") + loaded.active.databasePath)
             }
@@ -47,7 +50,7 @@ final class ApplicationServices: ObservableObject {
             catalog = loaded
             store = database
             model = WorkspaceModel(store: database)
-            storagePath = URL(fileURLWithPath: loaded.active.databasePath).deletingLastPathComponent().path
+            storagePath = loaded.storageRoot ?? self.catalogURL.deletingLastPathComponent().path
         } catch {
             store = nil; model = nil; startupError = error.localizedDescription
         }
@@ -67,6 +70,65 @@ final class ApplicationServices: ObservableObject {
                 }
             }
         }
+    }
+
+    var canCreateStartupWorkspace: Bool { model == nil && catalog != nil && !busy }
+    var availableStartupWorkspaces: [WorkspaceProfile] {
+        guard model == nil else { return [] }
+        return workspaces.filter { FileManager.default.fileExists(atPath: $0.databasePath) }
+    }
+
+    func retryStartup(opening workspaceID: UUID? = nil) async throws {
+        guard model == nil, !busy else { return }
+        busy = true
+        defer { finishTransition() }
+        // Reload the catalog so restoring the files externally can be retried
+        // without restarting, and never implicitly create a missing database.
+        var updated = try WorkspaceCatalog.load(from: catalogURL,
+            legacyDatabaseURL: workspaceStorageRoot.appendingPathComponent("velora.sqlite"))
+        if let workspaceID {
+            guard updated.workspaces.contains(where: { $0.id == workspaceID }) else { throw AppError.message(L10n.tr("工作空间不存在")) }
+            updated.activeID = workspaceID
+        }
+        guard FileManager.default.fileExists(atPath: updated.active.databasePath) else {
+            throw AppError.message(L10n.tr("当前工作空间数据库不存在，请恢复文件：") + updated.active.databasePath)
+        }
+        let database = try SQLiteStore(databaseURL: URL(fileURLWithPath: updated.active.databasePath))
+        try activate(updated, database: database)
+    }
+
+    func createStartupWorkspace() async throws {
+        guard canCreateStartupWorkspace, var updated = catalog else { return }
+        busy = true
+        defer { finishTransition() }
+        let id = UUID()
+        let directory = workspaceStorageRoot.appendingPathComponent("Workspaces").appendingPathComponent(id.uuidString)
+        let path = directory.appendingPathComponent("velora.sqlite")
+        guard !FileManager.default.fileExists(atPath: directory.path) else { throw StoreError.database(L10n.tr("目标文件已存在，未覆盖")) }
+        var committed = false
+        defer { if !committed { try? FileManager.default.removeItem(at: directory) } }
+        // Missing workspaces remain recoverable as metadata; they must not block
+        // creating documents or later migration of the usable workspaces.
+        let missing = updated.workspaces.filter { !FileManager.default.fileExists(atPath: $0.databasePath) }
+        updated.workspaces.removeAll { item in missing.contains { $0.id == item.id } }
+        for item in missing where !updated.removedWorkspaces.contains(where: { $0.id == item.id }) {
+            updated.removedWorkspaces.append(item)
+        }
+        let base = L10n.tr("新工作空间")
+        var name = base, suffix = 2
+        while updated.workspaces.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
+            name = base + " \(suffix)"; suffix += 1
+        }
+        let profile = try updated.validated(WorkspaceProfile(id: id, name: name, summary: "", symbol: WorkspaceProfile.symbols[0],
+            color: "indigo", databasePath: path.path, createdAt: Date()))
+        let database = try SQLiteStore(databaseURL: path)
+        let page = try await database.createPage()
+        _ = try await database.createBlock(pageID: page.id, kind: .paragraph)
+        updated.workspaces.append(profile); updated.activeID = id
+        try activate(updated, database: database)
+        committed = true
+        await model?.refreshPages()
+        model?.select(page.id)
     }
 
     private func prepareTransition() async throws {
@@ -89,8 +151,9 @@ final class ApplicationServices: ObservableObject {
         model?.workspaceTransitioning = false
         store = database
         catalog = updated
+        startupError = nil
         model = WorkspaceModel(store: database)
-        storagePath = URL(fileURLWithPath: updated.active.databasePath).deletingLastPathComponent().path
+        storagePath = updated.storageRoot ?? catalogURL.deletingLastPathComponent().path
     }
 
     func switchWorkspace(_ id: UUID) async throws {
@@ -108,10 +171,14 @@ final class ApplicationServices: ObservableObject {
         status = L10n.tr("已切换到「\(target.name)」")
     }
 
+    private var workspaceStorageRoot: URL {
+        catalog?.storageRoot.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? catalogURL.deletingLastPathComponent()
+    }
+
     func createWorkspace(name: String, summary: String, symbol: String, color: String) async throws {
         guard var updated = catalog else { throw AppError.message(L10n.tr("工作空间尚未加载")) }
         let id = UUID()
-        let path = catalogURL.deletingLastPathComponent().appendingPathComponent("Workspaces", isDirectory: true)
+        let path = workspaceStorageRoot.appendingPathComponent("Workspaces", isDirectory: true)
             .appendingPathComponent(id.uuidString, isDirectory: true).appendingPathComponent("velora.sqlite")
         let profile = try updated.validated(WorkspaceProfile(id: id, name: name, summary: summary, symbol: symbol,
             color: color, databasePath: path.path, createdAt: Date()))
@@ -157,23 +224,60 @@ final class ApplicationServices: ObservableObject {
     }
 
     func chooseStorage() {
-        guard !busy, let directory = chooseDirectory(message: L10n.tr("选择当前工作空间的新存储文件夹。迁移数据库，保留原文件，不覆盖已有数据库。")) else { return }
+        guard !busy, let directory = chooseDirectory(message: L10n.tr("选择所有工作空间的统一存储文件夹。原位置副本保留，不覆盖已有数据库。")) else { return }
         Task {
-            guard !busy else { return }
-            defer { finishTransition() }
-            do {
-                try await prepareTransition()
-                guard let store, var updated = catalog,
-                      let index = updated.workspaces.firstIndex(where: { $0.id == updated.activeID }) else { return }
-                let target = directory.appendingPathComponent("velora.sqlite")
-                guard target.standardizedFileURL.path != updated.active.databasePath else { return }
-                try await store.snapshot(to: target)
-                let database = try SQLiteStore(databaseURL: target)
-                updated.workspaces[index].databasePath = target.path
-                try activate(updated, database: database)
-                status = L10n.tr("当前工作空间存储位置已切换，原位置副本保留。")
-            } catch { status = error.localizedDescription }
+            do { try await relocateStorage(to: directory) }
+            catch { status = error.localizedDescription }
         }
+    }
+
+    func relocateStorage(to directory: URL) async throws {
+        guard !busy, var updated = catalog else { throw AppError.message(L10n.tr("正在处理其他操作，请稍后重试")) }
+        let root = directory.standardizedFileURL.resolvingSymlinksInPath()
+        let profiles = updated.workspaces + updated.removedWorkspaces.filter { FileManager.default.fileExists(atPath: $0.databasePath) }
+        var targets: [UUID: URL] = [:]
+        for profile in profiles {
+            let source = URL(fileURLWithPath: profile.databasePath).standardizedFileURL.resolvingSymlinksInPath()
+            guard FileManager.default.fileExists(atPath: source.path) else { throw AppError.message(L10n.tr("工作空间数据库不存在：") + source.path) }
+            let target = root.appendingPathComponent("Workspaces").appendingPathComponent(profile.id.uuidString).appendingPathComponent("velora.sqlite")
+            if target != source && ["", "-wal", "-shm"].contains(where: { FileManager.default.fileExists(atPath: target.path + $0) }) {
+                throw StoreError.database(L10n.tr("目标文件已存在，未覆盖"))
+            }
+            targets[profile.id] = target
+        }
+        defer { finishTransition() }
+        try await prepareTransition()
+        var created: [URL] = []
+        var committed = false
+        defer {
+            if !committed {
+                for file in created {
+                    for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: file.path + suffix) }
+                }
+            }
+        }
+        for profile in profiles {
+            guard let target = targets[profile.id] else { continue }
+            let source = URL(fileURLWithPath: profile.databasePath).standardizedFileURL.resolvingSymlinksInPath()
+            if source != target {
+                let database: SQLiteStore
+                if profile.id == updated.activeID, let store { database = store }
+                else { database = try SQLiteStore(databaseURL: source) }
+                try await database.snapshot(to: target)
+                created.append(target)
+            }
+        }
+        for index in updated.workspaces.indices {
+            updated.workspaces[index].databasePath = targets[updated.workspaces[index].id]!.path
+        }
+        for index in updated.removedWorkspaces.indices {
+            if let target = targets[updated.removedWorkspaces[index].id] { updated.removedWorkspaces[index].databasePath = target.path }
+        }
+        updated.storageRoot = root.path
+        let database = try SQLiteStore(databaseURL: URL(fileURLWithPath: updated.active.databasePath))
+        try activate(updated, database: database)
+        committed = true
+        status = L10n.tr("所有工作空间存储位置已切换，原位置副本保留。")
     }
 
     func chooseBackup() {
@@ -240,7 +344,7 @@ final class ApplicationServices: ObservableObject {
         guard !busy, var updated = catalog else { throw AppError.message(L10n.text("正在处理其他操作，请稍后重试")) }
         defer { finishTransition() }
         try await prepareTransition()
-        let directory = catalogURL.deletingLastPathComponent().appendingPathComponent("Workspaces")
+        let directory = workspaceStorageRoot.appendingPathComponent("Workspaces")
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         let target = directory.appendingPathComponent("velora.sqlite")
         var committed = false

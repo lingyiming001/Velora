@@ -27,6 +27,7 @@ struct WorkspaceProfile: Codable, Identifiable, Equatable {
 struct WorkspaceCatalog: Codable {
     var workspaces: [WorkspaceProfile]
     var activeID: UUID
+    var storageRoot: String? = nil
     // Removing a workspace keeps its metadata and database available for recovery.
     var removedWorkspaces: [WorkspaceProfile] = []
 

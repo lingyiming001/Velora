@@ -43,6 +43,28 @@ enum SlashCommandMenu {
     }
 }
 
+/// Avoid the system _AVKit_SwiftUI VideoPlayer metadata path, which aborts
+/// on this macOS runtime. The native player also accepts an explicit size.
+struct NativeMediaPlayer: NSViewRepresentable {
+    let player: AVPlayer?
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.controlsStyle = .inline
+        view.player = player
+        return view
+    }
+    func updateNSView(_ view: AVPlayerView, context: Context) {
+        if view.player !== player { view.player = player }
+    }
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: AVPlayerView, context: Context) -> CGSize? {
+        CGSize(width: max(1, proposal.width ?? 320), height: max(1, proposal.height ?? 180))
+    }
+    static func dismantleNSView(_ view: AVPlayerView, coordinator: ()) {
+        view.player?.pause()
+        view.player = nil
+    }
+}
+
 private struct TableCellHeightKey: PreferenceKey {
     static let defaultValue: [Int: CGFloat] = [:]
     static func reduce(value: inout [Int: CGFloat], nextValue: () -> [Int: CGFloat]) {
@@ -56,6 +78,31 @@ private enum EditorLayout {
     static let contentInset = controlsWidth + controlsSpacing
 }
 
+private struct TableCellEditor: View {
+    let text: String
+    let placeholder: String
+    let header: Bool
+    let focusRequest: EditorFocusRequest?
+    let isFocusRequestCurrent: (UUID) -> Bool
+    let onChange: (String) -> Void
+    let onExit: () -> Void
+    @State private var height: CGFloat = 28
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            NativeTextEditor(text: text, font: .systemFont(ofSize: 13, weight: header ? .semibold : .regular),
+                             focusRequest: focusRequest, isFocusRequestCurrent: isFocusRequestCurrent,
+                             onExitBlock: { onExit(); return true },
+                             onHeightChange: { if abs(height - $0) > 1 { height = $0 } }, onChange: onChange)
+                .frame(height: max(28, height))
+            if text.isEmpty {
+                Text(placeholder).font(.system(size: 13, weight: header ? .semibold : .regular))
+                    .foregroundStyle(.tertiary).padding(.top, 4).allowsHitTesting(false)
+            }
+        }
+    }
+}
+
 struct PageEditorView: View {
     @ObservedObject var model: WorkspaceModel
     let page: Page
@@ -63,6 +110,8 @@ struct PageEditorView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        GeometryReader { viewport in
+        let documentWidth = max(1, min(widePage ? viewport.size.width : 820, viewport.size.width - 64))
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 6) {
@@ -71,12 +120,17 @@ struct PageEditorView: View {
                         .textFieldStyle(.plain)
                         .font(.system(size: 40, weight: .bold, design: .default))
                         .accessibilityLabel(L10n.tr("页面标题"))
+                        .onSubmit {
+                            if let first = model.blocks.first(where: { $0.kind.acceptsTextInput && !$0.collapsed }) {
+                                model.requestFocus(first.id, offset: 0)
+                            } else { model.addBlock() }
+                        }
                         .padding(.leading, EditorLayout.contentInset)
                         .padding(.bottom, 16)
 
                     ForEach(EditorRowSnapshot.make(blocks: model.blocks, selection: model.selectedBlockIDs,
                                                    focus: model.editorFocusRequest, revisions: model.editorContentRevisions)) { snapshot in
-                        EditorBlockRow(model: model, snapshot: snapshot, scrollTo: { id in
+                        EditorBlockRow(model: model, snapshot: snapshot, availableWidth: documentWidth, scrollTo: { id in
                             withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) { proxy.scrollTo(id, anchor: .top) }
                         }).equatable().id(snapshot.id)
                     }
@@ -92,9 +146,24 @@ struct PageEditorView: View {
                         .padding(.leading, EditorLayout.contentInset)
                     }
                 }
-                .background(DocumentScrollCapture())
+                .background {
+                    ZStack {
+                        DocumentScrollCapture()
+                        DocumentRangeSelectionCapture(documentID: page.id, begin: { id in
+                            model.clearBlockSelection(); model.activeEditingBlockID = id
+                        }, selectRange: { model.selectBlockRange(from: $0, through: $1) }, modifiedClick: { id, modifiers in
+                            if modifiers.contains(.command) {
+                                model.selectBlock(id, toggle: true); return true
+                            }
+                            if modifiers.contains(.shift), model.activeEditingBlockID != id || !model.selectedBlockIDs.isEmpty {
+                                model.selectBlock(id, extend: true); return true
+                            }
+                            return false
+                        })
+                    }
+                }
                 .overlay(alignment: .bottom) { Color.clear.frame(height: 1).id("document-bottom") }
-                .frame(maxWidth: widePage ? .infinity : 820, alignment: .leading)
+                .frame(width: documentWidth, alignment: .leading)
                 .padding(.horizontal, 32)
                 .padding(.top, 48)
                 .padding(.bottom, 180)
@@ -136,12 +205,13 @@ struct PageEditorView: View {
             }
             .background(DocumentKeyboardCapture(selected: !model.selectedBlockIDs.isEmpty,
                 selectAll: model.selectAllBlocks, delete: deleteSelection, copy: model.copySelectedBlocks, escape: model.clearBlockSelection,
+                insertAfter: model.continueAfterSelectedBlocks,
                 boundary: { model.jumpToDocumentBoundary(atStart: $0, extend: $1) }).frame(width: 0, height: 0))
             .safeAreaInset(edge: .bottom) {
                 if !model.selectedBlockIDs.isEmpty {
                     HStack {
                         Text(L10n.tr("已选中 \(model.selectedBlockIDs.count) 个块")).fontWeight(.medium)
-                        Text(L10n.tr("Shift 范围选择 · ⌘A 全选 · Esc 取消")).foregroundStyle(.secondary).font(.caption)
+                        Text(L10n.tr("↩ 下方继续 · Shift 范围选择 · ⌘A 全选 · Esc 取消")).foregroundStyle(.secondary).font(.caption)
                         Spacer()
                         Button(L10n.tr("复制所选内容")) { model.copySelectedBlocks() }
                         Button(L10n.tr("取消选择")) { model.clearBlockSelection() }
@@ -158,6 +228,7 @@ struct PageEditorView: View {
             }
             .onDisappear { Task { await model.flushAll() } }
         }
+        }
     }
     private func deleteSelection() {
         Task { do { try await model.deleteSelectedBlocks() } catch { model.errorMessage = error.localizedDescription } }
@@ -167,10 +238,11 @@ struct PageEditorView: View {
 private struct EditorBlockRow: View, Equatable {
     let model: WorkspaceModel
     let snapshot: EditorRowSnapshot
+    let availableWidth: CGFloat
     private var block: Block { snapshot.block }
 
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.model === rhs.model && lhs.snapshot == rhs.snapshot
+        lhs.model === rhs.model && lhs.snapshot == rhs.snapshot && lhs.availableWidth == rhs.availableWidth
     }
     var scrollTo: (UUID) -> Void
     @AppStorage("editorFontSize") private var editorFontSize = 17.0
@@ -184,6 +256,10 @@ private struct EditorBlockRow: View, Equatable {
     @State private var richPreviewError: String?
     @State private var copied = false
     @State private var selectingImage = false
+    @State private var selectingMedia = false
+    @State private var mediaError: String?
+    @State private var playerObservation: NSKeyValueObservation?
+    @State private var playbackSource: URL?
     @State private var customLanguage = ""
     @State private var showingLanguageEditor = false
     @State private var player: AVPlayer?
@@ -192,22 +268,21 @@ private struct EditorBlockRow: View, Equatable {
     @State private var height: CGFloat = 30
     @State private var dismissed = false
     @State private var selectedIndex = 0
-    @FocusState private var focusedTableCell: String?
     @State private var columnDrag: (index: Int, value: Double)?
     @State private var rowDrag: (index: Int, value: Double)?
     @State private var tableRowContentHeights: [Int: CGFloat] = [:]
 
     private var commands: [BlockKind] { SlashCommandMenu.matches(block.text) }
     private var showingCommands: Bool {
-        block.kind != .code && focused && !dismissed && block.text.hasPrefix("/") && !block.text.contains("\n")
+        block.kind == .paragraph && focused && !dismissed && block.text.hasPrefix("/") && !block.text.contains("\n")
     }
     private var showsBlockControls: Bool {
         let richPreview = block.kind == .equation || block.kind == .markdown || isMermaidCode
         let editingText = focused && block.kind.acceptsTextInput && !block.collapsed
             && (!richPreview || editingRichSource || !block.hasContent)
-        let editingTable = block.kind == .table && focusedTableCell != nil
-        return hovered || editingText || editingTable || snapshot.selected || showingCommands
-            || selectingImage || showingLanguageEditor || columnDrag != nil || rowDrag != nil
+        return hovered || editingText || snapshot.selected || showingCommands
+            || !block.kind.acceptsTextInput || block.collapsed
+            || selectingImage || selectingMedia || showingLanguageEditor || columnDrag != nil || rowDrag != nil
     }
 
     var body: some View {
@@ -226,7 +301,7 @@ private struct EditorBlockRow: View, Equatable {
             }
             .foregroundStyle(Color(red: 0.45, green: 0.47, blue: 0.56))
             .frame(width: EditorLayout.controlsWidth)
-            .padding(.top, block.kind == .code ? 12 : 1)
+            .padding(.top, block.kind == .code ? 12 : block.kind.isCallout ? 11 : 1)
             .opacity(showsBlockControls ? 1 : 0)
             .allowsHitTesting(showsBlockControls)
             .accessibilityHidden(!showsBlockControls)
@@ -277,7 +352,7 @@ private struct EditorBlockRow: View, Equatable {
                                 .font(.system(size: 17)).foregroundStyle(.tertiary)
                                 .padding(.top, 2).allowsHitTesting(false)
                         }
-                        NativeTextEditor(text: block.text, font: font, formatting: block.formatting,
+                        NativeTextEditor(text: block.text, font: font, lineSpacing: block.kind.isHeading ? 0 : 4, formatting: block.formatting,
                                          onRichChange: { text, runs in
                                              dismissed = false; selectedIndex = 0
                                              model.changeRichText(text, formatting: runs, in: block)
@@ -290,7 +365,9 @@ private struct EditorBlockRow: View, Equatable {
                                          onBlockMouseDown: handleBlockClick,
                                          onPasteDocument: pasteDocument,
                                          focusRequest: snapshot.focusRequest, isFocusRequestCurrent: { model.editorFocusRequest?.id == $0 }, contentRevision: snapshot.contentRevision,
+                                         onReturnBlock: { model.returnFromSingleLineBlock(block, text: $0, formatting: $1, selection: $2) },
                                          onExitBlock: { model.exitBlock(block); return true },
+                                         shiftReturnInsertsNewline: block.kind.isHeading || [.bullet, .numbered, .todo].contains(block.kind),
                                  onBackspaceAtStart: { model.backspaceAtStart(of: block) },
                                          onCommand: handleCommand,
                                          onFocus: { focused = $0 },
@@ -316,14 +393,21 @@ private struct EditorBlockRow: View, Equatable {
             }
             if block.kind.isMedia && block.kind != .image { mediaPreview }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, block.kind.isCallout ? 12 : 0)
+            .padding(.vertical, block.kind.isCallout ? 10 : 0)
+            .frame(width: max(1, availableWidth - EditorLayout.contentInset), alignment: .leading)
+            .background(block.kind.isCallout ? calloutColor.opacity(0.09) : .clear, in: RoundedRectangle(cornerRadius: 8))
+            .clipped()
         }
+        .frame(width: availableWidth, alignment: .leading)
         .background(snapshot.selected ? Color.accentColor.opacity(0.10) : .clear, in: RoundedRectangle(cornerRadius: 7))
         .overlay(RoundedRectangle(cornerRadius: 7).stroke(snapshot.selected ? Color.accentColor.opacity(0.4) : .clear))
         .padding(.top, block.kind.isHeading && !snapshot.first ? 16 : 0)
-        .padding(.vertical, block.kind == .code ? 0 : block.kind.isCallout ? 10 : 3)
-        .padding(.horizontal, block.kind.isCallout ? 12 : 0)
-        .background(block.kind.isCallout ? calloutColor.opacity(0.09) : .clear, in: RoundedRectangle(cornerRadius: 8))
+        .padding(.vertical, block.kind == .code ? 0 : 3)
+        .background(DocumentBlockSelectionAnchor(blockID: block.id))
+        .sheet(isPresented: $selectingMedia) {
+            MediaSourcePicker(kind: block.kind, source: block.text) { model.changeText($0, in: block) }
+        }
         .sheet(isPresented: $selectingImage) { ImageSourcePicker(initialValue: block.text) { model.changeText($0, in: block) } }
         .contentShape(Rectangle())
         .onHover { hovered = $0 }
@@ -332,7 +416,8 @@ private struct EditorBlockRow: View, Equatable {
 
     private func pasteDocument(_ plain: String?, _ html: String?, _ original: String, _ runs: [TextStyleRun], _ range: NSRange) -> Bool {
         let copiedBlocks = ClipboardDocument.blocks(from: .general)
-        guard block.kind == .paragraph, copiedBlocks != nil || ClipboardDocument.isStructured(plain, html: html) else { return false }
+        let proseKinds: Set<BlockKind> = [.paragraph, .heading, .heading2, .heading3, .bullet, .numbered, .todo, .toggle, .quote, .callout, .warning, .success]
+        guard proseKinds.contains(block.kind), copiedBlocks != nil || ClipboardDocument.isStructured(plain, html: html) else { return false }
         model.pasteDocument(plain: plain, html: html, original: original, formatting: runs, selection: range, in: block, copiedBlocks: copiedBlocks)
         return true
     }
@@ -421,41 +506,54 @@ private struct EditorBlockRow: View, Equatable {
         }
     }
 
-    private var mediaURL: URL? {
-        guard let url = URL(string: block.text.trimmingCharacters(in: .whitespacesAndNewlines)),
-              let scheme = url.scheme?.lowercased(), ["https", "http"].contains(scheme),
-              url.host != nil else { return nil }
-        return url
-    }
+    private var mediaURL: URL? { MediaSource.url(block.text) }
 
     @ViewBuilder private var mediaPreview: some View {
+        HStack {
+            Button(block.text.isEmpty ? L10n.tr("选择媒体或文件…") : L10n.tr("更换来源…")) { selectingMedia = true }
+            Spacer()
+        }.font(.caption).buttonStyle(.borderless)
         if let url = mediaURL {
-            switch block.kind {
-            case .video, .audio:
+            if url.isFileURL && !FileManager.default.isReadableFile(atPath: url.path) {
+                Label(L10n.tr("文件不存在或无法读取，请重新选择。"), systemImage: "exclamationmark.triangle")
+                    .font(.callout).foregroundStyle(.secondary)
+            } else if block.kind == .video || block.kind == .audio {
                 VStack(alignment: .leading, spacing: 8) {
-                    VideoPlayer(player: player).frame(height: block.kind == .audio ? 80 : 280)
-                    Link(L10n.tr("在浏览器打开"), destination: url).font(.caption)
+                    NativeMediaPlayer(player: player).frame(maxWidth: .infinity).frame(height: block.kind == .audio ? 80 : 280)
+                    if let mediaError { Text(mediaError).font(.caption).foregroundStyle(.secondary) }
+                    Button(url.isFileURL ? L10n.tr("打开文件") : L10n.tr("在浏览器打开")) { NSWorkspace.shared.open(url) }
+                        .font(.caption).buttonStyle(.borderless)
                 }
                 .task(id: url) {
-                    player?.pause()
-                    player = AVPlayer(url: url)
+                    playerObservation?.invalidate(); player?.pause(); mediaError = nil; playbackSource = url
+                    let item = AVPlayerItem(url: url)
+                    playerObservation = item.observe(\.status, options: [.new, .initial]) { item, _ in
+                        if item.status == .failed {
+                            Task { @MainActor in
+                                if playbackSource == url { mediaError = L10n.tr("此来源无法直接播放，可在外部打开或更换为音视频文件链接。") }
+                            }
+                        }
+                    }
+                    player = AVPlayer(playerItem: item)
                 }
-                .onDisappear { player?.pause() }
-            default:
-                Link(destination: url) {
+                .onDisappear { playerObservation?.invalidate(); playerObservation = nil; playbackSource = nil; player?.pause() }
+            } else {
+                Button { NSWorkspace.shared.open(url) } label: {
                     HStack(spacing: 12) {
                         Image(systemName: block.kind.symbol).font(.title2)
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(block.kind == .file ? url.lastPathComponent : url.host ?? L10n.tr("网页链接")).lineLimit(1)
-                            Text(url.absoluteString).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                        }
-                        Spacer()
+                            Text(url.isFileURL || block.kind == .file ? url.lastPathComponent : url.host ?? L10n.tr("网页链接"))
+                                .lineLimit(1).truncationMode(.middle)
+                            Text(url.isFileURL ? url.path : url.absoluteString).font(.caption).foregroundStyle(.secondary)
+                                .lineLimit(1).truncationMode(.middle)
+                        }.frame(maxWidth: .infinity, alignment: .leading)
                         Image(systemName: "arrow.up.right")
-                    }.padding(14).background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
-                }
+                    }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+                }.buttonStyle(.plain)
             }
         } else if !block.text.isEmpty && !showingCommands {
-            Text(L10n.tr("请输入有效的 http 或 https 链接")).font(.caption).foregroundStyle(.secondary)
+            Text(L10n.tr("请输入有效链接或选择本地文件。")).font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -480,7 +578,7 @@ private struct EditorBlockRow: View, Equatable {
         let requested: CGFloat
         if let rowDrag, rowDrag.index == index { requested = CGFloat(rowDrag.value) }
         else { requested = CGFloat(block.tableLayout.row(index)) }
-        return max(requested, contentRowHeight(index))
+        return requested
     }
     private func saveColumn(_ index: Int, width: Double) { model.resizeTable(column: index, size: width, in: block) }
     private func saveRow(_ index: Int, height: Double) { model.resizeTable(row: index, size: height, in: block) }
@@ -523,25 +621,26 @@ private struct EditorBlockRow: View, Equatable {
                     ForEach(cells.indices, id: \.self) { row in
                         GridRow {
                             ForEach(cells[row].indices, id: \.self) { column in
-                                TextField(row == 0 ? L10n.tr("列名") : L10n.tr("内容"), text: Binding(get: {
-                                    cells[row][column]
-                                }, set: { value in
+                                TableCellEditor(text: cells[row][column], placeholder: row == 0 ? L10n.tr("列名") : L10n.tr("内容"),
+                                                header: row == 0,
+                                                focusRequest: row == 0 && column == 0 ? snapshot.focusRequest : nil,
+                                                isFocusRequestCurrent: { model.editorFocusRequest?.id == $0 },
+                                                onChange: { value in
                                     var updated = cells
                                     updated[row][column] = value
                                     saveCells(updated)
-                                }), axis: .vertical)
-                                .focused($focusedTableCell, equals: "\(row):\(column)")
-                                .textFieldStyle(.plain).fontWeight(row == 0 ? .semibold : .regular)
-                                .lineLimit(nil)
+                                }, onExit: { model.exitBlock(block) })
                                 .frame(width: max(1, columnWidth(column) - 16), alignment: .leading)
                                 .fixedSize(horizontal: false, vertical: true)
+                                .padding(8)
+                                .frame(width: columnWidth(column), alignment: .leading)
+                                .frame(minHeight: rowHeight(row), maxHeight: .infinity, alignment: .topLeading)
                                 .background {
                                     GeometryReader { geometry in
                                         Color.clear.preference(key: TableCellHeightKey.self,
-                                            value: [row: ceil(geometry.size.height)])
+                                            value: [row: max(0, ceil(geometry.size.height) - 16)])
                                     }
                                 }
-                                .padding(8).frame(width: columnWidth(column), height: rowHeight(row), alignment: .topLeading)
                                 .background(row == 0 ? Color.primary.opacity(0.06) : Color(nsColor: .textBackgroundColor))
                                 .overlay(alignment: .trailing) { columnHandle(column) }
                                 .overlay(alignment: .bottom) { rowHandle(row) }
@@ -570,9 +669,6 @@ private struct EditorBlockRow: View, Equatable {
             Text(L10n.tr("拖动单元格右边缘调整列宽，下边缘调整行高"))
                 .font(.caption2).foregroundStyle(.tertiary)
         }.frame(maxWidth: .infinity, alignment: .leading)
-        .task(id: snapshot.focusRequest?.id) {
-            if snapshot.focusRequest?.blockID == block.id { focusedTableCell = "0:0" }
-        }
     }
 
     private var calloutColor: Color {
@@ -593,13 +689,16 @@ private struct EditorBlockRow: View, Equatable {
             }.buttonStyle(.borderless).font(.caption)
             if editingRichSource || !block.hasContent {
                 NativeTextEditor(text: block.text, font: .monospacedSystemFont(ofSize: codeFontSize, weight: .regular),
-                                 onSelectAllBlocks: { model.selectAllBlocks(); return true }, onDeleteBlocks: deleteBlocks,
+                                 onDeleteBlocks: deleteBlocks,
                                  onBlockMouseDown: handleBlockClick,
                                  codeLanguage: "Plain Text", sanitizePastedLaTeX: block.kind == .equation,
                                  showCodeLineNumbers: false, darkCode: colorScheme == .dark,
                                  focusRequest: snapshot.focusRequest, isFocusRequestCurrent: { model.editorFocusRequest?.id == $0 }, contentRevision: snapshot.contentRevision,
                                  onExitBlock: { model.exitBlock(block); return true },
-                                 onFocus: { focused = $0 }, onHeightChange: { if abs(height - $0) > 1 { height = $0 } }) {
+                                 onFocus: {
+                                     focused = $0
+                                     if $0 { editingRichSource = true }
+                                 }, onHeightChange: { if abs(height - $0) > 1 { height = $0 } }) {
                     model.changeText($0, in: block)
                 }
                 .frame(height: max(80, height))
@@ -647,7 +746,8 @@ private struct EditorBlockRow: View, Equatable {
                 Rectangle().fill(Color.primary.opacity(0.07)).frame(height: 1)
                 NativeTextEditor(text: block.text, font: .monospacedSystemFont(ofSize: codeFontSize, weight: .regular), formatting: block.formatting,
                                  onRichChange: { model.changeRichText($0, formatting: $1, in: block) },
-                                 onSelectAllBlocks: { model.selectAllBlocks(); return true }, onDeleteBlocks: deleteBlocks,
+                                 onHeadingShortcut: { model.convertToHeading($0, text: $1, formatting: $2, selection: $3, in: block) },
+                                 onDeleteBlocks: deleteBlocks,
                                  onDocumentBoundary: { model.jumpToDocumentBoundary(atStart: $0, extend: $1); return true },
                                  onBlockMouseDown: handleBlockClick,
                                  codeLanguage: block.language, showCodeLineNumbers: codeLineNumbers, darkCode: colorScheme == .dark,
@@ -682,8 +782,7 @@ private struct EditorBlockRow: View, Equatable {
         if block.kind == .pdfDocument, let data = EmbeddedPDF.data(block.text) {
             copied = pasteboard.setData(data, forType: .pdf)
             if let text = EmbeddedPDF.document(block.text)?.string { pasteboard.setString(text, forType: .string) }
-        } else if block.kind == .code { copied = ClipboardDocument.copyBlocks([TransferBlock(block)]) }
-        else { copied = pasteboard.setString(block.text, forType: .string) }
+        } else { copied = ClipboardDocument.copyBlocks([TransferBlock(block)]) }
     }
 
     private var codeHeader: some View {
@@ -829,10 +928,11 @@ private struct EditorBlockRow: View, Equatable {
         dismissed = true
         model.insertSlashCommand(kind, in: block)
         if kind == .image { selectingImage = true }
+        else if kind.isMedia { selectingMedia = true }
     }
 
     private func handleCommand(_ selector: Selector, _ source: String) -> Bool {
-        guard block.kind != .code, !dismissed, source.hasPrefix("/"), !source.contains("\n") else { return false }
+        guard block.kind == .paragraph, !dismissed, source.hasPrefix("/"), !source.contains("\n") else { return false }
         let commands = SlashCommandMenu.matches(source)
         switch NSStringFromSelector(selector) {
         case "cancelOperation:": dismissed = true

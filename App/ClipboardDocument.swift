@@ -4,7 +4,36 @@ import Foundation
 @MainActor
 enum ClipboardDocument {
     static let textSelectionType = NSPasteboard.PasteboardType("com.velora.text-selection")
+    static let richTextSelectionType = NSPasteboard.PasteboardType("com.velora.rich-text-selection")
     static let blocksType = NSPasteboard.PasteboardType("com.velora.blocks")
+
+    static func attributedText(from pasteboard: NSPasteboard) -> NSAttributedString? {
+        for (type, format) in [(NSPasteboard.PasteboardType.rtfd, NSAttributedString.DocumentType.rtfd),
+                               (.rtf, .rtf), (.html, .html)] {
+            guard let data = pasteboard.data(forType: type) else { continue }
+            if let text = try? NSAttributedString(data: data, options: [
+                .documentType: format, .characterEncoding: String.Encoding.utf8.rawValue
+            ], documentAttributes: nil) { return text }
+        }
+        return pasteboard.string(forType: .string).map { NSAttributedString(string: $0) }
+    }
+
+    /// External applications supply their own point sizes and paragraph metrics.
+    /// Keep inline meaning while using the destination block's typography.
+    static func matchingTypography(_ source: NSAttributedString, font: NSFont, paragraph: NSParagraphStyle) -> NSAttributedString {
+        let runs = RichTextFormatting.runs(source, base: font).compactMap { run -> TextStyleRun? in
+            var run = run
+            run.style.fontSize = nil
+            run.style.fontFamily = nil
+            // Plain source text must not remove the weight of a destination heading.
+            if run.style.bold == false { run.style.bold = nil }
+            if run.style.italic == false { run.style.italic = nil }
+            return run.style.isEmpty ? nil : run
+        }
+        let text = NSMutableAttributedString(attributedString: RichTextFormatting.attributed(source.string, runs: runs, base: font))
+        text.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: text.length))
+        return text
+    }
 
     static func blocks(from pasteboard: NSPasteboard) -> [TransferBlock]? {
         guard let data = pasteboard.data(forType: blocksType),
@@ -25,7 +54,7 @@ enum ClipboardDocument {
         return pasteboard.setString(text, forType: .string)
     }
 
-    static func inserting(_ blocks: [TransferBlock], into original: String, formatting: [TextStyleRun], selection: NSRange) -> [TransferBlock] {
+    static func inserting(_ blocks: [TransferBlock], into original: String, formatting: [TextStyleRun], selection: NSRange, destination: TransferBlock? = nil) -> [TransferBlock] {
         let ns = original as NSString
         let start = min(max(0, selection.location), ns.length)
         let end = start + min(max(0, selection.length), ns.length - start)
@@ -37,7 +66,10 @@ enum ClipboardDocument {
                 guard overlap.length > 0 else { return nil }
                 return TextStyleRun(location: overlap.location - range.location, length: overlap.length, style: run.style)
             }
-            return [TransferBlock(.paragraph, ns.substring(with: range), formatting: runs)]
+            var fragment = destination ?? TransferBlock(.paragraph)
+            fragment.text = ns.substring(with: range)
+            fragment.formatting = runs
+            return [fragment]
         }
         return paragraph(NSRange(location: 0, length: start)) + blocks
             + paragraph(NSRange(location: end, length: ns.length - end))

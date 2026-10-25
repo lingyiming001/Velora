@@ -122,13 +122,13 @@ struct SettingsView: View {
                 }
                 Button(L10n.tr("管理工作空间…")) { showingWorkspaces = true }.disabled(services.busy)
             }
-            Section(L10n.tr("当前工作空间存储")) {
+            Section(L10n.tr("统一存储位置")) {
                 pathRow(services.storagePath)
                 HStack {
                     Button(L10n.tr("更改位置…")) { services.chooseStorage() }.disabled(services.busy)
                     Button(L10n.tr("在 Finder 中显示")) { reveal(services.storagePath) }
                 }
-                Text(L10n.tr("切换时迁移完整数据库并立即生效，保留原位置副本；不会覆盖目标位置已有数据库。")).font(.caption).foregroundStyle(.secondary)
+                Text(L10n.tr("所有工作空间统一存储于此。更改位置会迁移全部工作空间，保留原位置副本，不覆盖已有数据库。")).font(.caption).foregroundStyle(.secondary)
             }
             Section(L10n.tr("备份")) {
                 pathRow(services.backupPath)

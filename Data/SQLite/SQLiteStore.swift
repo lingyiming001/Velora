@@ -253,6 +253,36 @@ actor SQLiteStore {
         }
     }
 
+    func splitTextBlock(_ first: Block, inserting second: Block, before: Bool = false) throws {
+        let existing = try blocks(in: first.pageID)
+        guard let index = existing.firstIndex(where: { $0.id == first.id }), second.pageID == first.pageID else { throw StoreError.missingPage }
+        try transaction {
+            try run("UPDATE blocks SET body=?,formatting=? WHERE id=?", [first.text,
+                String(decoding: try JSONEncoder().encode(first.formatting), as: UTF8.self), first.id.uuidString])
+            for (position, item) in existing.enumerated() {
+                let shifted = before ? position >= index : position > index
+                try run("UPDATE blocks SET sort_order=? WHERE id=?", [String((position + (shifted ? 2 : 1)) * 1024), item.id.uuidString])
+            }
+            try run("INSERT INTO blocks(id,page_id,kind,body,sort_order,checked,formatting) VALUES(?,?,?,?,?,0,?)",
+                [second.id.uuidString, second.pageID.uuidString, second.kind.rawValue, second.text, String((index + (before ? 1 : 2)) * 1024),
+                 String(decoding: try JSONEncoder().encode(second.formatting), as: UTF8.self)])
+        }
+    }
+
+    func mergeTextBlocks(_ first: Block, removing second: Block) throws {
+        let existing = try blocks(in: first.pageID)
+        guard first.pageID == second.pageID,
+              let index = existing.firstIndex(where: { $0.id == first.id }),
+              existing.indices.contains(index + 1), existing[index + 1].id == second.id else {
+            throw StoreError.database(L10n.tr("段落顺序已变化，请重试退格。"))
+        }
+        try transaction {
+            try run("UPDATE blocks SET body=?,formatting=? WHERE id=?", [first.text,
+                String(decoding: try JSONEncoder().encode(first.formatting), as: UTF8.self), first.id.uuidString])
+            try run("DELETE FROM blocks WHERE id=?", [second.id.uuidString])
+        }
+    }
+
     func createBlock(pageID: UUID, kind: BlockKind, after: Block? = nil) throws -> Block {
         let existing = try blocks(in: pageID)
         let insertionIndex = after.flatMap { previous in existing.firstIndex(where: { $0.id == previous.id }) }.map { $0 + 1 } ?? existing.count
@@ -323,6 +353,7 @@ actor SQLiteStore {
             let layout = String(decoding: try JSONEncoder().encode(tableLayout), as: UTF8.self)
             try run("UPDATE blocks SET body=?,formatting=?,table_layout=? WHERE id=?", [text, encoded, layout, id.uuidString])
         } else { try run("UPDATE blocks SET body=?,formatting=? WHERE id=?", [text, encoded, id.uuidString]) }
+        guard sqlite3_changes(db) > 0 else { throw StoreError.database(L10n.tr("块不存在，内容尚未保存。")) }
     }
 
     func deleteBlocks(_ ids: [UUID]) throws {

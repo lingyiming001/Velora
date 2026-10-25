@@ -4,6 +4,32 @@ import CryptoKit
 @testable import Velora
 
 final class SQLiteStoreTests: XCTestCase {
+    func testMergeTextBlocksRequiresAdjacentBlocksAndPreservesSavedFormatting() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/MergeText-" + UUID().uuidString)
+        let url = directory.appendingPathComponent("test.sqlite")
+        let store = try SQLiteStore(databaseURL: url)
+        let page = try await store.createPage()
+        let first = try await store.createBlock(pageID: page.id, kind: .paragraph)
+        let middle = try await store.createBlock(pageID: page.id, kind: .paragraph)
+        let last = try await store.createBlock(pageID: page.id, kind: .paragraph)
+        try await store.updateBlock(first.id, text: "首段")
+        var merged = first; merged.text = "首段下一段"
+        var style = InlineTextStyle(); style.bold = true
+        merged.formatting = [TextStyleRun(location: 2, length: 3, style: style)]
+        do { try await store.mergeTextBlocks(merged, removing: last); XCTFail("Non-adjacent merge must fail") }
+        catch { }
+        let unchanged = try await store.blocks(in: page.id)
+        XCTAssertEqual(unchanged.map(\.id), [first.id, middle.id, last.id])
+        XCTAssertEqual(unchanged.first?.text, "首段")
+        try await store.mergeTextBlocks(merged, removing: middle)
+        let reopened = try SQLiteStore(databaseURL: url)
+        let saved = try await reopened.blocks(in: page.id)
+        XCTAssertEqual(saved.map(\.id), [first.id, last.id])
+        XCTAssertEqual(saved.first?.text, merged.text)
+        XCTAssertEqual(saved.first?.formatting, merged.formatting)
+    }
+
     func testTableLayoutMigrationPreservesVersionFourData() async throws {
         let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent(".agents/test/TableMigration-" + UUID().uuidString)
@@ -70,6 +96,115 @@ final class SQLiteStoreTests: XCTestCase {
         XCTAssertEqual(blocks.last?.kind, .equation)
         let unchanged = try await reopened.moveBlock(last.id, pageID: page.id, offset: -1)
         XCTAssertEqual(unchanged.map(\.id), blocks.map(\.id))
+    }
+
+    @MainActor
+    func testSharedStorageMigratesAllWorkspacesAndFutureCreationUsesRoot() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/SharedStorage-" + UUID().uuidString)
+        let catalogURL = directory.appendingPathComponent("workspaces.json")
+        let services = ApplicationServices(catalogURL: catalogURL, legacyDatabaseURL: directory.appendingPathComponent("legacy.sqlite"), startBackgroundServices: false)
+        let first = try XCTUnwrap(services.currentWorkspace)
+        let firstStore = try XCTUnwrap(services.store)
+        let firstPage = try await firstStore.createPage()
+        try await firstStore.renamePage(firstPage.id, title: "原空间")
+        try await services.createWorkspace(name: "第二空间", summary: "", symbol: "book.fill", color: "blue")
+        let active = try XCTUnwrap(services.currentWorkspace)
+        let activeStore = try XCTUnwrap(services.store)
+        let page = try await activeStore.createPage()
+        let block = try await activeStore.createBlock(pageID: page.id, kind: .paragraph)
+        let model = try XCTUnwrap(services.model)
+        await model.refreshPages(); model.select(page.id)
+        for _ in 0..<100 where model.blocks.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
+        model.changeText("迁移前待保存内容", in: block)
+        let root = directory.appendingPathComponent("Unified")
+        try await services.relocateStorage(to: root)
+        XCTAssertEqual(services.storagePath, root.path)
+        XCTAssertEqual(services.currentWorkspace?.id, active.id)
+        XCTAssertFalse(services.busy)
+        for profile in services.workspaces {
+            XCTAssertTrue(profile.databasePath.hasPrefix(root.path + "/Workspaces/"))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: first.databasePath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: active.databasePath))
+        let activeContent = try await XCTUnwrap(services.store).blocks(in: page.id)
+        XCTAssertEqual(activeContent.first?.text, "迁移前待保存内容")
+        try await services.switchWorkspace(first.id)
+        let originalPages = try await XCTUnwrap(services.store).pages()
+        XCTAssertEqual(originalPages.first?.title, "原空间")
+        let restarted = ApplicationServices(catalogURL: catalogURL, legacyDatabaseURL: directory.appendingPathComponent("unused.sqlite"), startBackgroundServices: false)
+        XCTAssertEqual(restarted.storagePath, root.path)
+        try await restarted.createWorkspace(name: "第三空间", summary: "", symbol: "star.fill", color: "green")
+        XCTAssertTrue(try XCTUnwrap(restarted.currentWorkspace).databasePath.hasPrefix(root.path + "/Workspaces/"))
+        let archive = try await restarted.createBackup(in: directory.appendingPathComponent("Backups"))
+        try await restarted.restoreBackup(from: archive)
+        XCTAssertTrue(try XCTUnwrap(restarted.currentWorkspace).databasePath.hasPrefix(root.path + "/Workspaces/"))
+        let before = restarted.catalog
+        let conflict = directory.appendingPathComponent("Conflict")
+        let target = conflict.appendingPathComponent("Workspaces").appendingPathComponent(first.id.uuidString).appendingPathComponent("velora.sqlite")
+        try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("existing".utf8).write(to: target)
+        do { try await restarted.relocateStorage(to: conflict); XCTFail("Existing targets must not be overwritten") } catch { }
+        XCTAssertEqual(restarted.catalog?.storageRoot, before?.storageRoot)
+        XCTAssertEqual(restarted.catalog?.workspaces, before?.workspaces)
+        XCTAssertEqual(try Data(contentsOf: target), Data("existing".utf8))
+        XCTAssertFalse(restarted.busy)
+    }
+
+    @MainActor
+    func testSharedStorageCatalogFailureRollsBackStagedCopies() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/SharedStorageRollback-" + UUID().uuidString)
+        let catalogURL = directory.appendingPathComponent("workspaces.json")
+        let services = ApplicationServices(catalogURL: catalogURL, legacyDatabaseURL: directory.appendingPathComponent("legacy.sqlite"), startBackgroundServices: false)
+        let original = try XCTUnwrap(services.currentWorkspace)
+        let store = try XCTUnwrap(services.store)
+        let page = try await store.createPage()
+        let catalogBytes = try Data(contentsOf: catalogURL)
+        try FileManager.default.removeItem(at: catalogURL)
+        try FileManager.default.createDirectory(at: catalogURL, withIntermediateDirectories: true)
+        let root = directory.appendingPathComponent("FailedMigration")
+        do { try await services.relocateStorage(to: root); XCTFail("Catalog commit should fail") } catch { }
+        XCTAssertEqual(services.currentWorkspace, original)
+        XCTAssertFalse(services.busy)
+        XCTAssertNil(services.catalog?.storageRoot)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: original.databasePath))
+        let staged = root.appendingPathComponent("Workspaces").appendingPathComponent(original.id.uuidString).appendingPathComponent("velora.sqlite")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staged.path))
+        let pages = try await XCTUnwrap(services.store).pages()
+        XCTAssertEqual(pages.first?.id, page.id)
+        try FileManager.default.removeItem(at: catalogURL)
+        try catalogBytes.write(to: catalogURL)
+    }
+
+    func testWritingMissingBlockReportsUnsavedContent() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/MissingBlockWrite-" + UUID().uuidString)
+        let store = try SQLiteStore(databaseURL: directory.appendingPathComponent("fixture.sqlite"))
+        do { try await store.updateBlock(UUID(), text: "must not silently disappear"); XCTFail("Missing blocks must report a failed save") } catch { }
+    }
+
+    func testHeadingSplitWritesBothHalvesAtomicallyAndRollsBackConflict() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/BlockSplit-" + UUID().uuidString)
+        let store = try SQLiteStore(databaseURL: directory.appendingPathComponent("fixture.sqlite"))
+        let page = try await store.createPage()
+        var heading = try await store.createBlock(pageID: page.id, kind: .heading)
+        try await store.updateBlock(heading.id, text: "标题正文")
+        let following = try await store.createBlock(pageID: page.id, kind: .paragraph)
+        heading.text = "标题"
+        var body = Block(id: following.id, pageID: page.id, kind: .paragraph, text: "正文", order: 0, checked: false)
+        do { try await store.splitTextBlock(heading, inserting: body); XCTFail("Duplicate ID must roll back") } catch { }
+        let unchanged = try await store.blocks(in: page.id)
+        XCTAssertEqual(unchanged.first?.text, "标题正文")
+        XCTAssertEqual(unchanged.count, 2)
+        body = Block(id: UUID(), pageID: page.id, kind: .paragraph, text: "正文", order: 0, checked: false)
+        try await store.splitTextBlock(heading, inserting: body)
+        let reopened = try SQLiteStore(databaseURL: directory.appendingPathComponent("fixture.sqlite"))
+        let saved = try await reopened.blocks(in: page.id)
+        XCTAssertEqual(saved.map(\.id), [heading.id, body.id, following.id])
+        XCTAssertEqual(saved.prefix(2).map(\.text), ["标题", "正文"])
+        XCTAssertEqual(saved.prefix(2).map(\.kind), [.heading, .paragraph])
     }
 
     func testPageDragHierarchyReorderAndCycleProtection() async throws {
@@ -163,6 +298,98 @@ final class WorkspaceManagementTests: XCTestCase {
             legacyDatabaseURL: directory.appendingPathComponent("legacy/velora.sqlite"), startBackgroundServices: false)
         XCTAssertNil(services.startupError)
         return (directory, services)
+    }
+
+    func testMissingStartupDatabaseCanCreateNewDocumentsWithoutReplacingOldRecords() async throws {
+        let (directory, initial) = try fixture()
+        var catalog = try XCTUnwrap(initial.catalog)
+        let original = catalog.active
+        let missing = directory.appendingPathComponent("deleted/velora.sqlite")
+        catalog.workspaces[0].databasePath = missing.path
+        let retained = catalog.workspaces[0]
+        let root = directory.appendingPathComponent("Unified")
+        catalog.storageRoot = root.path
+        let catalogURL = directory.appendingPathComponent("workspaces.json")
+        try catalog.save(to: catalogURL)
+        let failed = ApplicationServices(catalogURL: catalogURL, startBackgroundServices: false)
+        XCTAssertNil(failed.model)
+        XCTAssertNotNil(failed.startupError)
+        XCTAssertTrue(failed.canCreateStartupWorkspace)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path))
+        try await failed.createStartupWorkspace()
+        XCTAssertNil(failed.startupError)
+        XCTAssertFalse(failed.busy)
+        XCTAssertNotEqual(failed.currentWorkspace?.id, original.id)
+        XCTAssertTrue(try XCTUnwrap(failed.currentWorkspace).databasePath.hasPrefix(root.path + "/Workspaces/"))
+        XCTAssertEqual(failed.catalog?.removedWorkspaces.first { $0.id == original.id }, retained)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path))
+        let model = try XCTUnwrap(failed.model)
+        XCTAssertNotNil(model.selectedPageID)
+        let store = try XCTUnwrap(failed.store)
+        let pages = try await store.pages()
+        XCTAssertEqual(pages.count, 1)
+        let blocks = try await store.blocks(in: XCTUnwrap(pages.first).id)
+        XCTAssertEqual(blocks.map(\.kind), [.paragraph])
+        XCTAssertEqual(blocks.first?.text, "")
+        let newPage = try await store.createPage()
+        _ = try await store.createBlock(pageID: newPage.id, kind: .paragraph)
+        let restarted = ApplicationServices(catalogURL: catalogURL, startBackgroundServices: false)
+        XCTAssertNil(restarted.startupError)
+        let reloaded = try await XCTUnwrap(restarted.store).pages()
+        XCTAssertEqual(reloaded.count, 2)
+    }
+
+    func testStartupRetryCanOpenAnotherWorkspaceOrRestoredDatabase() async throws {
+        let (directory, initial) = try fixture()
+        let original = try XCTUnwrap(initial.currentWorkspace)
+        try await initial.createWorkspace(name: "可用空间", summary: "", symbol: "book.fill", color: "blue")
+        let available = try XCTUnwrap(initial.currentWorkspace)
+        let availableStore = try XCTUnwrap(initial.store)
+        let page = try await availableStore.createPage()
+        var catalog = try XCTUnwrap(initial.catalog)
+        let missing = directory.appendingPathComponent("deleted/velora.sqlite")
+        let index = try XCTUnwrap(catalog.workspaces.firstIndex { $0.id == original.id })
+        catalog.workspaces[index].databasePath = missing.path
+        catalog.activeID = original.id
+        let catalogURL = directory.appendingPathComponent("workspaces.json")
+        try catalog.save(to: catalogURL)
+        let failed = ApplicationServices(catalogURL: catalogURL, startBackgroundServices: false)
+        XCTAssertEqual(failed.availableStartupWorkspaces.map(\.id), [available.id])
+        do { try await failed.retryStartup(); XCTFail("Retry must not silently recreate the missing file") } catch { }
+        XCTAssertNil(failed.model)
+        XCTAssertFalse(failed.busy)
+        try await failed.retryStartup(opening: available.id)
+        XCTAssertNil(failed.startupError)
+        XCTAssertEqual(failed.currentWorkspace?.id, available.id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path))
+        catalog.activeID = original.id
+        try catalog.save(to: catalogURL)
+        let restored = ApplicationServices(catalogURL: catalogURL, startBackgroundServices: false)
+        try await availableStore.snapshot(to: missing)
+        try await restored.retryStartup()
+        XCTAssertNil(restored.startupError)
+        XCTAssertEqual(restored.currentWorkspace?.id, original.id)
+        let pages = try await XCTUnwrap(restored.store).pages()
+        XCTAssertEqual(pages.first?.id, page.id)
+    }
+
+    func testStartupRecoveryCatalogFailureLeavesOriginalMetadataAndCleansFreshDatabase() async throws {
+        let (directory, initial) = try fixture()
+        var catalog = try XCTUnwrap(initial.catalog)
+        catalog.workspaces[0].databasePath = directory.appendingPathComponent("deleted.sqlite").path
+        let catalogURL = directory.appendingPathComponent("workspaces.json")
+        try catalog.save(to: catalogURL)
+        let failed = ApplicationServices(catalogURL: catalogURL, startBackgroundServices: false)
+        try FileManager.default.removeItem(at: catalogURL)
+        try FileManager.default.createDirectory(at: catalogURL, withIntermediateDirectories: true)
+        do { try await failed.createStartupWorkspace(); XCTFail("Catalog save must fail") } catch { }
+        XCTAssertNil(failed.model)
+        XCTAssertNotNil(failed.startupError)
+        XCTAssertEqual(failed.catalog?.workspaces, catalog.workspaces)
+        XCTAssertFalse(failed.busy)
+        let root = directory.appendingPathComponent("Workspaces")
+        let remaining = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
+        XCTAssertTrue(remaining.isEmpty)
     }
 
     func testCreateSwitchFlushEditAndRestart() async throws {
