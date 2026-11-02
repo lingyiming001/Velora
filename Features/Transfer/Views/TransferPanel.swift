@@ -4,7 +4,7 @@ import SwiftUI
 struct TransferPanel: View {
     @ObservedObject var services: ApplicationServices
     @Environment(\.dismiss) private var dismiss
-    @State private var mode = 0
+    @State private var mode = 1
     @State private var format: TransferFormat = .markdown
     @State private var wholeWorkspace = false
     @State private var includeChildren = true
@@ -80,6 +80,7 @@ struct TransferPanel: View {
         case .pdf: L10n.tr("PDF 使用与页面相同的渲染，保留公式排版、表格、代码和图片，并自动分页。")
         case .word: L10n.tr("Word 导出可编辑的标题、嵌套列表、表格和文字；数学公式使用 Word 原生方程，不再显示 LaTeX 源码。")
         case .html: L10n.tr("HTML 导出已排版的独立网页，内嵌字体与公式，不需要联网脚本；重新导入时保留原始块结构。")
+        case .epub: L10n.tr("EPUB 将页面编排为书籍章节，包含层级目录和离线图片。公式与 Mermaid 保留源码，音视频与附件保留网络链接。")
         case .text: L10n.tr("TXT 导出可读纯文本；图片和媒体以文字说明或链接表示。")
         }
     }

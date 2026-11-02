@@ -5,7 +5,7 @@ import Vision
 import UniformTypeIdentifiers
 
 enum TransferFormat: String, CaseIterable, Identifiable {
-    case markdown, text, html, json, pdf, word
+    case markdown, text, html, json, pdf, word, epub
     var id: String { rawValue }
     var label: String {
         switch self {
@@ -15,6 +15,7 @@ enum TransferFormat: String, CaseIterable, Identifiable {
         case .json: "Velora JSON"
         case .pdf: "PDF"
         case .word: "Word DOCX"
+        case .epub: "EPUB"
         }
     }
     var ext: String {
@@ -42,12 +43,14 @@ struct TransferBlock: Codable, Equatable {
     var collapsed = false
     var formatting: [TextStyleRun] = []
     var tableLayout = TableLayout()
-    init(_ kind: BlockKind, _ text: String = "", checked: Bool = false, language: String = "Plain Text", collapsed: Bool = false, formatting: [TextStyleRun] = [], tableLayout: TableLayout = TableLayout()) {
-        self.formatting = formatting; self.tableLayout = tableLayout
+    var imageWidth: Double? = nil
+    var listStart: Int? = nil
+    init(_ kind: BlockKind, _ text: String = "", checked: Bool = false, language: String = "Plain Text", collapsed: Bool = false, formatting: [TextStyleRun] = [], tableLayout: TableLayout = TableLayout(), imageWidth: Double? = nil, listStart: Int? = nil) {
+        self.formatting = formatting; self.tableLayout = tableLayout; self.imageWidth = ImageSizing.width(imageWidth); self.listStart = ListNumbering.start(listStart)
         self.kind = kind; self.text = text; self.checked = checked; self.language = language; self.collapsed = collapsed
     }
-    init(_ block: Block) { self.init(block.kind, block.text, checked: block.checked, language: block.language, collapsed: block.collapsed, formatting: block.formatting, tableLayout: block.tableLayout) }
-    enum CodingKeys: String, CodingKey { case kind, text, checked, language, collapsed, formatting, tableLayout }
+    init(_ block: Block) { self.init(block.kind, block.text, checked: block.checked, language: block.language, collapsed: block.collapsed, formatting: block.formatting, tableLayout: block.tableLayout, imageWidth: block.imageWidth, listStart: block.listStart) }
+    enum CodingKeys: String, CodingKey { case kind, text, checked, language, collapsed, formatting, tableLayout, imageWidth, listStart }
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         kind = try container.decode(BlockKind.self, forKey: .kind)
@@ -57,10 +60,12 @@ struct TransferBlock: Codable, Equatable {
         collapsed = try container.decodeIfPresent(Bool.self, forKey: .collapsed) ?? false
         formatting = try container.decodeIfPresent([TextStyleRun].self, forKey: .formatting) ?? []
         tableLayout = try container.decodeIfPresent(TableLayout.self, forKey: .tableLayout) ?? TableLayout()
+        imageWidth = ImageSizing.width(try container.decodeIfPresent(Double.self, forKey: .imageWidth))
+        listStart = ListNumbering.start(try container.decodeIfPresent(Int.self, forKey: .listStart))
     }
 }
 
-struct TransferPage: Codable, Identifiable {
+struct TransferPage: Codable, Identifiable, Equatable {
     var id = UUID()
     var parentID: UUID?
     var title: String
@@ -68,7 +73,7 @@ struct TransferPage: Codable, Identifiable {
     var blocks: [TransferBlock]
 }
 
-struct TransferDocument: Codable {
+struct TransferDocument: Codable, Equatable {
     var version = 1
     var name: String
     var pages: [TransferPage]
@@ -311,7 +316,8 @@ enum DocumentTransfer {
             if !plain.isEmpty {
                 let range = (combined.string as NSString).range(of: plain)
                 let clean = combined.attributedSubstring(from: range)
-                result.append(TransferBlock(blockKind, plain, formatting: RichTextFormatting.runs(clean, base: .systemFont(ofSize: base))))
+                result.append(TransferBlock(blockKind, plain, formatting: RichTextFormatting.runs(clean, base: .systemFont(ofSize: base)),
+                                            listStart: blockKind == .numbered ? firstMatch(#"^\s*([0-9]+)[.)]"#, first.text).flatMap { Int($0[1]) } : nil))
             }
             index = end
         }
@@ -367,6 +373,7 @@ enum DocumentTransfer {
     static func markdown(_ input: String, title: String, directory: URL? = nil, consumeLeadingTitle: Bool = true) throws -> TransferDocument {
         let lines = input.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n").components(separatedBy: "\n")
         var blocks: [TransferBlock] = []; var paragraph: [String] = []; var pageTitle = title; var index = 0; var consumedTitle = false
+        var orderedCounter = 0
         func flush() { if !paragraph.isEmpty { blocks.append(TransferBlock(.paragraph, paragraph.joined(separator: "\n"))); paragraph = [] } }
         while index < lines.count {
             let line = lines[index]; let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -429,7 +436,12 @@ enum DocumentTransfer {
                     if next.count >= fence.count && next.allSatisfy({ $0 == fence.first! }) { break }
                     code.append(lines[index]); index += 1
                 }
+                let codeText = code.joined(separator: "\n")
+                if match[2].trimmingCharacters(in: .whitespaces) == "velora-image-card", let card = ImageTextCard.decode(codeText) {
+                    blocks.append(TransferBlock(.imageCard, card.encoded))
+                } else {
                 blocks.append(TransferBlock(.code, code.joined(separator: "\n"), language: match[2].trimmingCharacters(in: .whitespaces).isEmpty ? "Plain Text" : match[2].trimmingCharacters(in: .whitespaces)))
+                }
             } else if let heading = firstMatch("^(#{1,6})\\s+(.+?)\\s*#*\\s*$", trimmed) {
                 flush()
                 if consumeLeadingTitle && blocks.isEmpty && !consumedTitle && heading[1] == "#" { pageTitle = heading[2]; consumedTitle = true }
@@ -438,8 +450,13 @@ enum DocumentTransfer {
                 flush(); blocks.append(TransferBlock(.todo, todo[2], checked: todo[1].lowercased() == "x"))
             } else if let bullet = firstMatch("^[-*+]\\s+(.+)$", trimmed) {
                 flush(); blocks.append(TransferBlock(.bullet, bullet[1]))
-            } else if let number = firstMatch("^[0-9]+[.)]\\s+(.+)$", trimmed) {
-                flush(); blocks.append(TransferBlock(.numbered, number[1]))
+            } else if let number = firstMatch("^([0-9]+)[.)]\\s+(.+)$", trimmed) {
+                flush()
+                let value = ListNumbering.start(Int(number[1])) ?? 1
+                let continues = blocks.last?.kind == .numbered && (value == 1 || value == orderedCounter + 1)
+                let start = continues || value == 1 ? nil : Optional(value)
+                orderedCounter = continues ? min(orderedCounter + 1, 1_000_000_000) : value
+                blocks.append(TransferBlock(.numbered, number[2], listStart: start))
             } else if trimmed == "---" || trimmed == "***" || trimmed == "___" {
                 flush(); blocks.append(TransferBlock(.divider))
             } else if trimmed.hasPrefix(">") {

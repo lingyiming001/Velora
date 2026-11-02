@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 struct WorkspaceActions {
     let newPage: () -> Void
     let search: () -> Void
+    let findInDocument: ((DocumentFindAction) -> Void)?
     let rename: (() -> Void)?
     let move: (() -> Void)?
     let expandAll: () -> Void
@@ -25,6 +26,14 @@ struct WorkspaceMenuCommands: Commands {
                 .keyboardShortcut("n").disabled(actions == nil)
         }
         CommandGroup(after: .textEditing) {
+            Button(L10n.tr("在文档中查找…")) { actions?.findInDocument?(.show) }
+                .keyboardShortcut("f").disabled(actions?.findInDocument == nil)
+            Button(L10n.tr("查找并替换…")) { actions?.findInDocument?(.replace) }
+                .keyboardShortcut("f", modifiers: [.command, .option]).disabled(actions?.findInDocument == nil)
+            Button(L10n.tr("下一个匹配项")) { actions?.findInDocument?(.next) }
+                .keyboardShortcut("g").disabled(actions?.findInDocument == nil)
+            Button(L10n.tr("上一个匹配项")) { actions?.findInDocument?(.previous) }
+                .keyboardShortcut("g", modifiers: [.command, .shift]).disabled(actions?.findInDocument == nil)
             Button(L10n.tr("搜索页面…")) { actions?.search() }
                 .keyboardShortcut("f", modifiers: [.command, .shift]).disabled(actions == nil)
         }
@@ -41,6 +50,31 @@ struct WorkspaceMenuCommands: Commands {
 }
 
 enum PageDropPlacement: Equatable { case before, child, after }
+
+/// Keep native List keyboard selection/accessibility, but draw the document's
+/// quiet rounded selection ourselves instead of the system blue row highlight.
+struct SidebarSelectionAppearance: NSViewRepresentable {
+    func makeNSView(context: Context) -> SidebarSelectionAppearanceView { SidebarSelectionAppearanceView() }
+    func updateNSView(_ view: SidebarSelectionAppearanceView, context: Context) { view.applyStyle() }
+}
+final class SidebarSelectionAppearanceView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applyStyle()
+        DispatchQueue.main.async { [weak self] in self?.applyStyle() }
+    }
+    func applyStyle() {
+        var parent = superview
+        while let view = parent {
+            if let table = view as? NSTableView {
+                if table.selectionHighlightStyle != .none { table.selectionHighlightStyle = .none }
+                return
+            }
+            parent = view.superview
+        }
+    }
+}
 struct PageDropIndicator: Equatable {
     let pageID: UUID
     let placement: PageDropPlacement
@@ -49,27 +83,78 @@ struct PageDropIndicator: Equatable {
 @MainActor
 final class PageDragState: ObservableObject {
     @Published private(set) var sourceID: UUID?
-    @Published var indicator: PageDropIndicator?
+    @Published private var currentIndicator: PageDropIndicator?
+    var indicator: PageDropIndicator? {
+        get { currentIndicator }
+        set { if newValue != currentIndicator { currentIndicator = newValue } }
+    }
+    private var session = UUID()
     private var timer: Timer?
 
     func begin(_ id: UUID, mouseIsDown: @escaping () -> Bool = { NSEvent.pressedMouseButtons & 1 != 0 }) {
         finish()
+        session = UUID()
         sourceID = id
         // SwiftUI onDrag has no cancellation callback. Observe release even
         // when the session ends outside every drop destination or with Escape.
         let timer = Timer(timeInterval: 0.08, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                if !mouseIsDown() { self?.finish() }
+                if !mouseIsDown() { self?.finishAfterTracking() }
             }
         }
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
+    func finishAfterTracking() {
+        timer?.invalidate(); timer = nil
+        let expected = session
+        RunLoop.main.perform(inModes: [.default]) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.session == expected else { return }
+                self.finish()
+            }
+        }
+    }
     func finish() {
         timer?.invalidate(); timer = nil
-        indicator = nil; sourceID = nil
+        indicator = nil
+        if sourceID != nil { sourceID = nil }
     }
     deinit { timer?.invalidate() }
+}
+
+/// Rebuilt only when page metadata changes, never for editor/autosave publications.
+struct SidebarPageIndex {
+    let children: [UUID?: [Page]]
+    let byID: [UUID: Page]
+    init(pages: [Page]) {
+        let active = pages.filter { !$0.archived }
+        children = Dictionary(grouping: active, by: \.parentID)
+        byID = Dictionary(uniqueKeysWithValues: active.map { ($0.id, $0) })
+    }
+    func rows(filter: String, collapsed: Set<UUID>) -> [(page: Page, depth: Int)] {
+        var matching: Set<UUID> = []
+        if !filter.isEmpty {
+            for page in byID.values where page.title.localizedCaseInsensitiveContains(filter) {
+                var current: UUID? = page.id
+                while let id = current, matching.insert(id).inserted { current = byID[id]?.parentID }
+            }
+        }
+        var rows: [(page: Page, depth: Int)] = []
+        var pending = (children[nil] ?? []).reversed().map { (page: $0, depth: 0) }
+        var visited: Set<UUID> = []
+        while let item = pending.popLast() {
+            guard visited.insert(item.page.id).inserted,
+                  filter.isEmpty || matching.contains(item.page.id) else { continue }
+            rows.append(item)
+            if !collapsed.contains(item.page.id) || !filter.isEmpty {
+                for child in (children[item.page.id] ?? []).reversed() {
+                    pending.append((child, item.depth + 1))
+                }
+            }
+        }
+        return rows
+    }
 }
 
 @MainActor
@@ -83,6 +168,19 @@ final class SidebarExpansionState: ObservableObject {
         self.defaults = defaults
         key = "sidebar.collapsedPages." + workspaceID
         collapsed = Set((defaults.stringArray(forKey: key) ?? []).compactMap(UUID.init(uuidString:)))
+    }
+    private var cachedRevision: UUID?
+    private var cachedFilter = ""
+    private var cachedCollapsed: Set<UUID> = []
+    private var cachedRows: [(page: Page, depth: Int)] = []
+    private(set) var treeBuildCount = 0
+    func visibleRows(index: SidebarPageIndex, revision: UUID, filter: String) -> [(page: Page, depth: Int)] {
+        if cachedRevision != revision || cachedFilter != filter || cachedCollapsed != collapsed {
+            cachedRows = index.rows(filter: filter, collapsed: collapsed)
+            cachedRevision = revision; cachedFilter = filter; cachedCollapsed = collapsed
+            treeBuildCount += 1
+        }
+        return cachedRows
     }
     func expandAll() { collapsed = [] }
     func collapseAll(_ pages: [Page]) {
@@ -128,7 +226,6 @@ private struct PageRowDropDelegate: DropDelegate {
     }
     func dropExited(info: DropInfo) { if indicator?.pageID == pageID { indicator = nil } }
     func performDrop(info: DropInfo) -> Bool {
-        defer { indicator = nil }
         guard validateDrop(info: info), let sourceID else { return false }
         return perform(sourceID, pageID, placement(info))
     }
@@ -171,29 +268,7 @@ struct WorkspaceView: View {
     }
 
     private var tree: [(page: Page, depth: Int)] {
-        let active = model.pages.filter { !$0.archived }
-        let children = Dictionary(grouping: active, by: \.parentID)
-        let byID = Dictionary(uniqueKeysWithValues: active.map { ($0.id, $0) })
-        var matching: Set<UUID> = []
-        if !filter.isEmpty {
-            for page in active where page.title.localizedCaseInsensitiveContains(filter) {
-                var current: UUID? = page.id
-                while let id = current, matching.insert(id).inserted { current = byID[id]?.parentID }
-            }
-        }
-        var rows: [(Page, Int)] = []
-        var visited: Set<UUID> = []
-        func append(_ parent: UUID?, depth: Int) {
-            for page in children[parent] ?? [] where !visited.contains(page.id) {
-                visited.insert(page.id)
-                let matches = filter.isEmpty || matching.contains(page.id)
-                guard matches else { continue }
-                rows.append((page, depth))
-                if !expansion.collapsed.contains(page.id) || !filter.isEmpty { append(page.id, depth: depth + 1) }
-            }
-        }
-        append(nil, depth: 0)
-        return rows
+        expansion.visibleRows(index: model.sidebarPageIndex, revision: model.sidebarPageRevision, filter: filter)
     }
 
     var body: some View {
@@ -212,21 +287,20 @@ struct WorkspaceView: View {
                 actions: { Button(L10n.tr("新建页面")) { model.createPage() }.buttonStyle(.borderedProminent) }
             }
         }
+        .disabled(services.busy)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button { showingTransfer = true } label: { Label(L10n.tr("导入与导出"), systemImage: "arrow.up.arrow.down.square") }
-                    .disabled(model.automationBusy)
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Button { showingAssistant = true } label: { Label(L10n.tr("助手与语音"), systemImage: "sparkles") }
-                    .keyboardShortcut("j", modifiers: .command)
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Button { showingSearch = true } label: { Label(L10n.tr("搜索"), systemImage: "magnifyingglass") }
-                    .help(L10n.tr("搜索页面…") + " ⇧⌘F")
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Button { showingTrash = false; model.createPage() } label: { Label(L10n.tr("新建页面"), systemImage: "plus") }
+                HStack(spacing: 4) {
+                    Button { showingAssistant = true } label: { Label("AI", systemImage: "sparkles") }
+                        .frame(width: 28, height: 28).accessibilityLabel("AI").help("AI · ⌘J")
+                        .keyboardShortcut("j", modifiers: .command)
+                    Button { showingTransfer = true } label: { Label(L10n.tr("导出"), systemImage: "square.and.arrow.up") }
+                        .frame(width: 28, height: 28).accessibilityLabel(L10n.tr("导出")).help(L10n.tr("导出"))
+                        .disabled(model.automationBusy)
+                }
+                .labelStyle(.iconOnly).buttonStyle(.plain).controlSize(.small)
+                .font(.system(size: 14, weight: .medium)).foregroundStyle(.secondary).tint(.primary)
+                .padding(.horizontal, 4)
             }
         }
         .focusedSceneValue(\.workspaceActions, menuActions)
@@ -236,7 +310,7 @@ struct WorkspaceView: View {
         .sheet(isPresented: $showingAssistant) { AssistantPanel(services: services) }
         .sheet(isPresented: $showingSearch) { SearchPanel(model: model, isPresented: $showingSearch) }
         .sheet(item: $movingPage) { page in
-            MovePagePanel(model: model, page: page, onMove: { target in
+            MovePagePanel(model: model, services: services, page: page, onMove: { target in
                 if let target {
                     expansion.collapsed.remove(target)
                     expansion.reveal(target, in: model.pages)
@@ -281,8 +355,10 @@ struct WorkspaceView: View {
               !showingTransfer, !showingAssistant, !showingSearch, !showingWorkspaces, !creatingWorkspace,
               movingPage == nil, renamingPage == nil, deletingPage == nil, !confirmingEmpty else { return nil }
         let selected = showingTrash ? nil : model.pages.first { $0.id == model.selectedPageID && !$0.archived }
+        let findAction: ((DocumentFindAction) -> Void)? = selected == nil ? nil : { action in model.performDocumentFind(action) }
         return WorkspaceActions(newPage: { showingTrash = false; model.createPage() },
             search: { showingSearch = true },
+            findInDocument: findAction,
             rename: selected.map { page in { newTitle = page.title; renamingPage = page } },
             move: selected.map { page in { movingPage = page } },
             expandAll: expansion.expandAll, collapseAll: { expansion.collapseAll(model.pages) })
@@ -329,6 +405,7 @@ struct WorkspaceView: View {
                 Section {
                     ForEach(tree, id: \.page.id) { item in
                         pageRow(item.page, depth: item.depth).tag(item.page.id)
+                            .listRowInsets(EdgeInsets(top: 2, leading: -14, bottom: 2, trailing: -6))
                     }
                 } header: {
                     HStack {
@@ -345,6 +422,7 @@ struct WorkspaceView: View {
                 }
                 if tree.isEmpty { Text(filter.isEmpty ? L10n.tr("暂无页面") : L10n.tr("没有匹配页面")).foregroundStyle(.tertiary) }
             }.listStyle(.sidebar)
+            .transaction { $0.animation = nil }
             if pageDrag.sourceID != nil {
             Label(rootTargeted ? L10n.tr("松开以移到顶层") : L10n.tr("拖到这里移出到顶层"), systemImage: "arrow.up.to.line")
                 .font(.caption).foregroundStyle(rootTargeted ? Color.accentColor : .secondary)
@@ -356,7 +434,7 @@ struct WorkspaceView: View {
                           let id = UUID(uuidString: String(raw.dropFirst(12))),
                           let page = model.pages.first(where: { $0.id == id && !$0.archived }) else { return false }
                     guard pageDrag.sourceID == id else { return false }
-                    pageDrag.finish()
+                    pageDrag.finishAfterTracking()
                     model.move(page, to: nil)
                     return true
                 } isTargeted: { rootTargeted = $0 }
@@ -397,7 +475,8 @@ struct WorkspaceView: View {
     }
 
     private func pageRow(_ page: Page, depth: Int) -> some View {
-        let hasChildren = model.pages.contains { !$0.archived && $0.parentID == page.id }
+        let hasChildren = model.sidebarPageIndex.children[page.id]?.isEmpty == false
+        let active = model.selectedPageID == page.id && !showingTrash
         return HStack(spacing: 6) {
             Button {
                 if expansion.collapsed.contains(page.id) { expansion.collapsed.remove(page.id) } else { expansion.collapsed.insert(page.id) }
@@ -419,20 +498,30 @@ struct WorkspaceView: View {
             .buttonStyle(.plain)
             .accessibilityLabel(page.title.isEmpty ? L10n.tr("未命名") : page.title)
             .accessibilityAddTraits(model.selectedPageID == page.id && !showingTrash ? .isSelected : [])
-            if page.parentID != nil {
+            if page.parentID != nil && active {
                 Button {
                     let parent = model.pages.first(where: { $0.id == page.parentID })
                     model.move(page, to: parent?.parentID)
                 } label: { Image(systemName: "arrow.turn.up.left").font(.system(size: 10)) }
                 .buttonStyle(.plain).help(L10n.tr("移出一级"))
             }
+            if active {
             Menu { pageActions(page) } label: { Image(systemName: "ellipsis").frame(width: 28, height: 28).contentShape(Rectangle()) }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help(L10n.tr("页面操作"))
                 .accessibilityLabel(L10n.tr("页面操作"))
+            } else { Color.clear.frame(width: 28, height: 28).accessibilityHidden(true) }
         }
-        .padding(.leading, CGFloat(min(depth, 12)) * 14)
-        .padding(.vertical, 3).contentShape(Rectangle())
+        .padding(.leading, 14 + CGFloat(min(depth, 12)) * 14)
+        .padding(.trailing, 6)
+        .padding(.vertical, 1).contentShape(Rectangle())
         .frame(minHeight: 32)
+        .background {
+            if active {
+                RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.055))
+                    .shadow(color: .black.opacity(0.025), radius: 3, y: 1)
+            }
+        }
+        .background(SidebarSelectionAppearance().frame(width: 0, height: 0))
         .background(pageDrag.indicator?.pageID == page.id && pageDrag.indicator?.placement == .child ? Color.accentColor.opacity(0.14) : .clear, in: RoundedRectangle(cornerRadius: 6))
         .overlay {
             if pageDrag.indicator?.pageID == page.id && pageDrag.indicator?.placement == .child {
@@ -458,14 +547,16 @@ struct WorkspaceView: View {
     }
 
     private func performPageDrop(_ sourceID: UUID, _ targetID: UUID, _ placement: PageDropPlacement) -> Bool {
-        defer { pageDrag.finish() }
+        defer { pageDrag.finishAfterTracking() }
         guard sourceID != targetID,
               let source = model.pages.first(where: { $0.id == sourceID && !$0.archived }),
               let target = model.pages.first(where: { $0.id == targetID && !$0.archived }),
               !model.isDescendant(target.id, of: source.id) else { return false }
         switch placement {
         case .child:
-            expansion.collapsed.remove(target.id)
+            RunLoop.main.perform(inModes: [.default]) {
+                MainActor.assumeIsolated { expansion.collapsed.remove(target.id) }
+            }
             model.move(source, to: target.id)
         case .before:
             model.move(source, to: target.parentID, before: target.id)
@@ -481,6 +572,10 @@ struct WorkspaceView: View {
     @ViewBuilder private func pageActions(_ page: Page) -> some View {
         Button(L10n.tr("重命名…")) { newTitle = page.title; renamingPage = page }
         Button(L10n.tr("新建子页面")) { expansion.collapsed.remove(page.id); model.createPage(parentID: page.id) }
+        Button(L10n.tr("复制页面")) {
+            Task { do { try await model.duplicatePage(page) } catch { model.errorMessage = error.localizedDescription } }
+        }
+        .disabled(model.automationBusy)
         Divider()
         Button(L10n.tr("上移")) { model.move(page, by: -1) }
             .disabled(model.pages.first(where: { !$0.archived && $0.parentID == page.parentID })?.id == page.id)
@@ -534,11 +629,15 @@ struct WorkspaceView: View {
 
 struct MovePagePanel: View {
     @ObservedObject var model: WorkspaceModel
+    @ObservedObject var services: ApplicationServices
     let page: Page
     var onMove: (UUID?) -> Void = { _ in }
     @Environment(\.dismiss) private var dismiss
     @State private var query = ""
     @State private var destination: UUID?
+    @State private var targetWorkspace: UUID?
+    @State private var moving = false
+    @State private var moveError: String?
     @FocusState private var searchFocused: Bool
     // A stable local selection token represents the workspace root.
     private static let rootID = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
@@ -548,6 +647,9 @@ struct MovePagePanel: View {
             && (query.isEmpty || $0.title.localizedCaseInsensitiveContains(query)) }
     }
     private var canMove: Bool {
+        if let targetWorkspace, targetWorkspace != services.currentWorkspace?.id {
+            return services.workspaces.contains { $0.id == targetWorkspace } && !moving
+        }
         guard let destination else { return false }
         if destination == Self.rootID { return page.parentID != nil }
         return destination != page.parentID && targets.contains { $0.id == destination }
@@ -568,6 +670,12 @@ struct MovePagePanel: View {
                 .font(.title3.weight(.semibold)).lineLimit(2)
             Text(L10n.tr("选择目标页面，当前页面及其子页面会一起移动。"))
                 .font(.callout).foregroundStyle(.secondary)
+            Picker(L10n.tr("目标工作空间"), selection: $targetWorkspace) {
+                ForEach(services.workspaces) { workspace in
+                    Text(workspace.name).tag(Optional(workspace.id))
+                }
+            }.disabled(moving)
+            if targetWorkspace == services.currentWorkspace?.id {
             TextField(L10n.tr("搜索目标页面"), text: $query).textFieldStyle(.roundedBorder).focused($searchFocused)
             List(selection: $destination) {
                 Label(L10n.tr("工作区顶层"), systemImage: "square.stack")
@@ -582,10 +690,27 @@ struct MovePagePanel: View {
                     }.padding(.vertical, 5).tag(target.id)
                 }
             }.listStyle(.inset).clipShape(RoundedRectangle(cornerRadius: 10))
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                    Label(L10n.tr("移到目标工作空间顶层"), systemImage: "square.stack.3d.up")
+                    Text(L10n.tr("子页面、内容和格式将一起保留。目标保存成功后，源文档移入当前工作空间的回收箱，可恢复。移动后仍停留在当前工作空间。"))
+                        .font(.callout).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 8)
+            }
+            if let moveError { Text(moveError).font(.callout).foregroundStyle(.red).textSelection(.enabled) }
             HStack {
+                if moving { ProgressView().controlSize(.small); Text(L10n.tr("正在移动…")).font(.caption) }
                 Spacer()
-                Button(L10n.tr("取消"), role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(L10n.tr("取消"), role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction).disabled(moving)
                 Button(L10n.tr("移动")) {
+                    if let targetWorkspace, targetWorkspace != services.currentWorkspace?.id {
+                        moving = true; moveError = nil
+                        Task {
+                            do { try await services.movePage(page.id, toWorkspace: targetWorkspace); dismiss() }
+                            catch { moveError = error.localizedDescription; moving = false }
+                        }
+                        return
+                    }
                     guard canMove, let destination else { return }
                     let parent = destination == Self.rootID ? nil : destination
                     onMove(parent)
@@ -593,9 +718,10 @@ struct MovePagePanel: View {
                     dismiss()
                 }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(!canMove)
             }
-        }.padding(24).frame(width: 480, height: 470)
+        }.padding(24).frame(width: 500, height: 550)
+        .interactiveDismissDisabled(moving)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear { destination = page.parentID ?? Self.rootID; searchFocused = true }
+        .onAppear { targetWorkspace = services.currentWorkspace?.id; destination = page.parentID ?? Self.rootID; searchFocused = true }
         .onChange(of: query) { _, _ in destination = nil }
     }
 }

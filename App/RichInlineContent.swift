@@ -1,6 +1,38 @@
 import Foundation
 
 enum RichInlineContent {
+    /// Literal UTF-16 replacement. New text inherits the first matched
+    /// character's inline style; text outside the matches keeps its own style.
+    static func replacing(_ text: String, runs: [TextStyleRun], ranges: [NSRange], with replacement: String) -> (text: String, runs: [TextStyleRun]) {
+        var text = text, runs = runs
+        for range in ranges.sorted(by: { $0.location > $1.location }) {
+            let source = text as NSString
+            guard range.location >= 0, range.length > 0, range.location <= source.length,
+                  range.length <= source.length - range.location else { continue }
+            let insertedLength = replacement.utf16.count
+            let delta = insertedLength - range.length
+            let inherited = runs.last { $0.location <= range.location && $0.location + $0.length > range.location }?.style
+            var adjusted: [TextStyleRun] = []
+            for run in runs {
+                guard let valid = run.validRange(in: text) else { continue }
+                let leftEnd = min(NSMaxRange(valid), range.location)
+                if valid.location < leftEnd {
+                    adjusted.append(TextStyleRun(location: valid.location, length: leftEnd - valid.location, style: run.style))
+                }
+                let rightStart = max(valid.location, NSMaxRange(range))
+                if rightStart < NSMaxRange(valid) {
+                    adjusted.append(TextStyleRun(location: rightStart + delta, length: NSMaxRange(valid) - rightStart, style: run.style))
+                }
+            }
+            if let inherited, !inherited.isEmpty, insertedLength > 0 {
+                adjusted.append(TextStyleRun(location: range.location, length: insertedLength, style: inherited))
+            }
+            text = source.replacingCharacters(in: range, with: replacement)
+            runs = adjusted.sorted { $0.location < $1.location }
+        }
+        return (text, runs)
+    }
+
     struct Segment { let text: String; let style: InlineTextStyle }
     static func segments(_ text: String, runs: [TextStyleRun]) -> [Segment] {
         let ns = text as NSString
@@ -16,6 +48,7 @@ enum RichInlineContent {
         segments(text, runs: runs).map { segment in
             var value = HTMLTransfer.escape(segment.text).replacingOccurrences(of: "\n", with: "<br />")
             let style = segment.style
+            if style.code { value = "<code>" + value + "</code>" }
             if style.bold == true { value = "<strong>" + value + "</strong>" }
             if style.italic == true { value = "<em>" + value + "</em>" }
             if style.underline { value = "<u>" + value + "</u>" }

@@ -69,7 +69,7 @@ enum AssistantService {
             ["id": $0.id.uuidString, "title": $0.title, "parent_id": $0.parentID?.uuidString ?? ""]
         }
         var context: [String: Any] = ["pages": pageData, "current_page_id": model.selectedPageID?.uuidString ?? ""]
-        if defaults.bool(forKey: "aiShareContent") { context["current_page_text"] = String(model.blocks.map { $0.kind == .image ? "[图片]" : $0.text }.joined(separator: "\n").prefix(30000)) }
+        if defaults.bool(forKey: "aiShareContent") { context["current_page_text"] = String(model.blocks.map { [.image, .imageCard].contains($0.kind) ? "[图片]" : $0.text }.joined(separator: "\n").prefix(30000)) }
         let snapshot = String(decoding: try JSONSerialization.data(withJSONObject: context), as: UTF8.self)
         let tools = String(decoding: try JSONSerialization.data(withJSONObject: WorkspaceModel.automationTools), as: UTF8.self)
         let system = """

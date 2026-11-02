@@ -93,15 +93,21 @@ enum HTMLTransfer {
     }
 
     static func page(_ page: TransferPage) -> String {
+        let numbers = ListNumbering.numbers(page.blocks)
         let body = page.blocks.enumerated().map { index, block -> String in
             let text = RichInlineContent.html(block.text, runs: block.formatting)
             if block.kind == .bullet || block.kind == .numbered {
                 let tag = block.kind == .bullet ? "ul" : "ol"
                 let startsList = index == 0 || page.blocks[index - 1].kind != block.kind
                 let endsList = index + 1 == page.blocks.count || page.blocks[index + 1].kind != block.kind
-                return (startsList ? "<\(tag)>" : "") + "<li>\(text)</li>" + (endsList ? "</\(tag)>" : "")
+                let expected = startsList ? 1 : numbers[index - 1] + 1
+                let value = block.kind == .numbered && numbers[index] != expected ? " value=\"\(numbers[index])\"" : ""
+                return (startsList ? "<\(tag)>" : "") + "<li\(value)>\(text)</li>" + (endsList ? "</\(tag)>" : "")
             }
             switch block.kind {
+            case .imageCard:
+                guard let card = ImageTextCard.decode(block.text) else { return "<p>[图文卡片无法读取]</p>" }
+                return "<section class=\"velora-image-card\"><img src=\"" + escape(card.image) + "\" alt=\"图片\" width=\"76\" height=\"76\"/><div><h3>" + escape(card.title) + "</h3><p>" + escape(card.body) + "</p><p>" + escape(card.caption) + "</p></div></section>"
             case .heading: return "<h1>\(text)</h1>"
             case .heading2: return "<h2>\(text)</h2>"
             case .heading3: return "<h3>\(text)</h3>"

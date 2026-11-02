@@ -719,3 +719,121 @@
 "打开文件" = "Open File";
 
 "块不存在，内容尚未保存。" = "This block is missing; its content has not been saved.";
+"删除所在行" = "Delete this row";
+"删除所在列" = "Delete this column";
+"删除行" = "Delete row";
+"删除列" = "Delete column";
+"删除第 %d 行" = "Delete row %d";
+"删除第 %d 列" = "Delete column %d";
+"在文档中查找…" = "Find in Document…";
+"在本文档中查找" = "Find in this document";
+"下一个匹配项" = "Next match";
+"上一个匹配项" = "Previous match";
+"无匹配项" = "No matches";
+"查找结果" = "Find results";
+"关闭查找" = "Close find";
+"查找并替换…" = "Find and Replace…";
+"显示或隐藏替换" = "Show or hide replace";
+"替换为（留空则删除匹配文本）" = "Replace with (leave empty to delete matches)";
+"替换为" = "Replace with";
+"替换" = "Replace";
+"全部替换" = "Replace All";
+"撤销替换" = "Undo Replacement";
+"已替换 %d 处" = "Replaced %d occurrences";
+"添加行和列" = "Add row and column";
+"常用语言" = "Common languages";
+"网页与样式" = "Web and styles";
+"数据与配置" = "Data and configuration";
+"脚本与其他" = "Scripting and other";
+"目标工作空间" = "Destination workspace";
+"移到目标工作空间顶层" = "Move to the destination workspace root";
+"子页面、内容和格式将一起保留。目标保存成功后，源文档移入当前工作空间的回收箱，可恢复。移动后仍停留在当前工作空间。" = "Subpages, content and formatting are preserved. Once saved in the destination, the source goes to this workspace's trash and can be restored. You will stay in the current workspace.";
+"正在移动…" = "Moving…";
+"请选择其他有效的工作空间和文档" = "Choose another valid workspace and document.";
+"源和目标不能使用同一个数据库" = "Source and destination cannot use the same database.";
+"移动期间源文档已变化，源文档已保留" = "The source changed during the move and has been kept.";
+"目标工作空间已保存副本，但源文档未移走，请检查后重试：" = "A copy was saved in the destination, but the source was not moved. Check before retrying: ";
+"文档及子页面已移动到「%@」，源副本可从回收箱恢复" = "Document and subpages moved to “%@”. The source copy can be restored from Trash.";
+"第 %d 行操作" = "Row %d actions";
+"第 %d 列操作" = "Column %d actions";
+
+"在下方插入…" = "Insert below…";
+
+"创建块副本" = "Duplicate block";
+
+"创建所选块副本" = "Duplicate selected blocks";
+
+"存在未保存内容，创建副本已停止" = "Unsaved changes remain. Duplication stopped.";
+
+"转换为" = "Turn into";
+
+"复制页面" = "Duplicate page";
+
+"%@ 副本" = "%@ copy";
+
+"图片预览" = "Image preview";
+
+"缩放比例" = "Zoom level";
+
+"缩小" = "Zoom out";
+
+"放大" = "Zoom in";
+
+"适合窗口" = "Fit to window";
+
+"放大查看" = "View larger";
+
+"恢复默认大小" = "Reset image size";
+
+"拖动调整图片大小" = "Drag to resize image";
+
+"图片宽度" = "Image width";
+
+"接续前一编号" = "Continue previous numbering";
+
+"从 1 重新编号" = "Restart numbering at 1";
+
+"保存到本地…" = "Save to computer…";
+
+"保存到本地" = "Save to computer";
+
+"正在准备媒体文件…" = "Preparing media file…";
+
+"已保存到本地" = "Saved to computer";
+
+"保存媒体失败：" = "Could not save media: ";
+
+"请选择本地保存位置" = "Choose a local save location";
+
+"下载失败（HTTP %d）" = "Download failed (HTTP %d)";
+
+"此链接返回的是网页，请使用图片或音视频文件的直接链接" = "This link returns a web page. Use a direct image, audio, or video file link.";
+
+"播放列表不能保存为完整音视频，请使用原始媒体文件链接" = "A playlist cannot be saved as a complete media file. Use the original media file link.";
+
+"此块没有可保存的媒体文件" = "This block has no media file to save.";
+
+"媒体数据无效，无法保存" = "Invalid media data. Unable to save.";
+
+"媒体数据类型不匹配，无法保存" = "The media data type does not match. Unable to save.";
+
+"媒体链接无效，无法保存" = "Invalid media link. Unable to save.";
+
+"下载的文件为空，未保存" = "The downloaded file is empty and was not saved.";
+
+"EPUB 将页面编排为书籍章节，包含层级目录和离线图片。公式与 Mermaid 保留源码，音视频与附件保留网络链接。" = "EPUB turns pages into book chapters with a hierarchical table of contents and offline images. Equations and Mermaid retain their source; media and attachments retain web links.";
+
+"复制 stdio 配置" = "Copy stdio Configuration";
+"支持追加 Markdown、HTML、纯文本和导入本机文件。仅支持 stdio 的客户端可复制 stdio 配置，需安装 Python 3 并保持 Velora 运行。" = "Append Markdown, HTML or plain text, or import local files. For stdio-only clients, copy the stdio configuration. Python 3 is required and Velora must remain running.";
+
+"转为文档内本地图片" = "Embed Image in Document";
+
+"将本页网络图片转为本地" = "Embed All Web Images on This Page";
+
+"图文卡片" = "Image and Text Card";
+"与下方文字合并为图文卡片" = "Merge with Following Text as Card";
+"卡片标题" = "Card Title";
+"卡片说明" = "Card Description";
+"卡片关键词" = "Card Keywords";
+
+"复制标题" = "Copy Title";

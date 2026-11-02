@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import AVKit
 import XCTest
 import WebKit
@@ -7,6 +8,372 @@ import SwiftUI
 
 @MainActor
 final class EditorInteractionTests: XCTestCase {
+    func testMCPTokenUsesPrivateFileAndRemainsStableUntilRotated() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let url = directory.appendingPathComponent("mcp-token")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let first = try MCPTokenStore.loadOrCreate(at: url)
+        XCTAssertEqual(first.count, 72)
+        XCTAssertEqual(try MCPTokenStore.loadOrCreate(at: url), first)
+        let permissions = try XCTUnwrap((try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions]) as? NSNumber)
+        XCTAssertEqual(permissions.intValue & 0o777, 0o600)
+
+        let rotated = try MCPTokenStore.rotate(at: url)
+        XCTAssertNotEqual(rotated, first)
+        XCTAssertEqual(try MCPTokenStore.loadOrCreate(at: url), rotated)
+    }
+
+    func testLongDocumentTitleCanSelectCopyWithoutBodySelectionStealingFocus() async throws {
+        let (window, model, directory) = try await slashPopupFixture(command: "正文内容")
+        defer { window.close(); try? FileManager.default.removeItem(at: directory) }
+        let title = "《批判性思维工具》— Richard Paul / Linda Elder：" + String(repeating: "完整长标题复制验证", count: 9)
+        model.renameSelectedPage(title)
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        var titleField: NSTextField?
+        for _ in 0..<200 {
+            window.contentView?.layoutSubtreeIfNeeded()
+            titleField = window.contentView.flatMap { descendants($0).compactMap { $0 as? NSTextField }.first { $0.stringValue == title } }
+            if titleField != nil { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let field = try XCTUnwrap(titleField)
+        model.selectAllBlocks()
+        for _ in 0..<20 { try await Task.sleep(for: .milliseconds(5)) }
+        field.selectText(nil)
+        for _ in 0..<100 where !model.selectedBlockIDs.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertTrue(model.selectedBlockIDs.isEmpty)
+        let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+        editor.selectAll(nil)
+        XCTAssertFalse(DocumentSelectionView.copySelection(in: window))
+        editor.copy(nil)
+        XCTAssertEqual(NSPasteboard.general.string(forType: .string), title)
+        XCTAssertNil(ClipboardDocument.blocks(from: .general))
+        XCTAssertEqual(model.selectedPage?.title, title)
+        XCTAssertGreaterThan(field.frame.height, 50, "Long title should wrap instead of clipping its ending")
+        // Native field editors retain copy ownership even if a block selection
+        // update has not yet reached SwiftUI's focus-state callback.
+        let owner = try XCTUnwrap(window.contentView.flatMap { descendants($0).compactMap { $0 as? DocumentSelectionView }.first })
+        owner.selectionActive = true
+        var bodyCopies = 0; owner.copy = { bodyCopies += 1 }
+        XCTAssertFalse(DocumentSelectionView.copySelection(in: window))
+        XCTAssertEqual(bodyCopies, 0)
+        owner.selectionActive = false
+        XCTAssertTrue(ClipboardDocument.copyTitle(title))
+        XCTAssertEqual(NSPasteboard.general.string(forType: .string), title)
+    }
+
+    func testRawPythonCodeButtonPasteKeepsNativeCodeLinesAndLanguage() async throws {
+        let (window, model, directory) = try await slashPopupFixture(command: "")
+        defer { window.close(); try? FileManager.default.removeItem(at: directory) }
+        let source = "from dotenv import load_dotenv\nfrom langchain_openai import ChatOpenAI\n\nload_dotenv()\nmodel = ChatOpenAI(\n    model=\"gpt-4o-mini\",\n    temperature=0\n)\nprint(model)"
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        let editor = try XCTUnwrap(window.contentView.flatMap { descendants($0).compactMap { $0 as? CodeTextView }.first { $0.string.isEmpty } })
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(source, forType: .string)
+        editor.paste(nil)
+        for _ in 0..<200 where model.blocks.first?.kind != .code { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(model.blocks.count, 1)
+        XCTAssertEqual(model.blocks[0].kind, .code)
+        XCTAssertEqual(model.blocks[0].language.lowercased(), "python")
+        XCTAssertEqual(model.blocks[0].text, source)
+        await model.flushAll()
+        let store = try SQLiteStore(databaseURL: directory.appendingPathComponent("fixture.sqlite"))
+        let saved = try await store.blocks(in: XCTUnwrap(model.selectedPageID))
+        XCTAssertEqual(saved[0].text, source)
+        XCTAssertEqual(saved[0].language.lowercased(), "python")
+    }
+
+    func testImageTextCardPasteIsCompactEditableAndPersistsNativeLayout() async throws {
+        let (window, model, directory) = try await slashPopupFixture(command: "")
+        defer { window.close(); try? FileManager.default.removeItem(at: directory) }
+        let image = NSImage(size: NSSize(width: 160, height: 90))
+        image.lockFocus(); NSColor.white.setFill(); NSRect(x: 0, y: 0, width: 160, height: 90).fill()
+        ("LangChain" as NSString).draw(at: NSPoint(x: 12, y: 30), withAttributes: [.font: NSFont.boldSystemFont(ofSize: 22), .foregroundColor: NSColor.systemTeal]); image.unlockFocus()
+        let bitmap = NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation))!
+        let source = "data:image/png;base64," + bitmap.representation(using: .png, properties: [:])!.base64EncodedString()
+        let html = "<p>这是初学者经常混淆的三个概念。</p><div><img src='" + source + "'/><div><p><strong>LangChain</strong></p><p>主要用于构建 LLM 应用和 Agent，提供模型、工具、Middleware 等开发接口。</p><p>关键词：应用开发、模型集成、Agent</p></div></div>"
+        model.pasteDocument(plain: nil, html: html, original: "", formatting: [], selection: NSRange(location: 0, length: 0), in: try XCTUnwrap(model.blocks.first))
+        for _ in 0..<200 where model.blocks.count != 2 { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(model.blocks.map(\.kind), [.paragraph, .imageCard])
+        let card = try XCTUnwrap(ImageTextCard.decode(model.blocks[1].text))
+        XCTAssertEqual(card.title, "LangChain"); XCTAssertTrue(card.image.hasPrefix("data:"))
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        for _ in 0..<100 { window.contentView?.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(5)) }
+        let root = try XCTUnwrap(window.contentView)
+        let fields = descendants(root).compactMap { $0 as? NSTextField }
+        XCTAssertTrue(fields.contains { $0.stringValue == "LangChain" })
+        let titleField = try XCTUnwrap(fields.first { $0.stringValue == "LangChain" })
+        let keyword = try XCTUnwrap(fields.first { $0.stringValue.contains("关键词：") })
+        XCTAssertLessThan(abs(titleField.convert(titleField.bounds, to: root).midY - keyword.convert(keyword.bounds, to: root).midY), 140)
+        let screenshot = try XCTUnwrap(root.bitmapImageRepForCachingDisplay(in: root.bounds))
+        root.cacheDisplay(in: root.bounds, to: screenshot)
+        try screenshot.representation(using: .png, properties: [:])?.write(to: directory.deletingLastPathComponent().appendingPathComponent("image-text-card-native.png"))
+        await model.flushAll()
+        let reopened = try SQLiteStore(databaseURL: directory.appendingPathComponent("fixture.sqlite"))
+        let saved = try await reopened.blocks(in: XCTUnwrap(model.selectedPageID))
+        XCTAssertEqual(ImageTextCard.decode(saved[1].text), card)
+    }
+
+    func testMCPStructuredAppendAndFileImportPreserveExistingBlocks() async throws {
+        let (directory, store, model, original) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let pageID = original[0].pageID
+        model.changeText("尚未保存的正文", in: model.blocks[0])
+        let output = try await model.executeTool("append_document", arguments: ["page_id": pageID.uuidString, "format": "markdown", "content": "## 新标题\n\n1. Token\n\n说明\n\n2. Prompt\n\n```swift\nlet value = 2\n```"]) as! [String: Any]
+        XCTAssertEqual(output["appended_blocks"] as? Int, 5)
+        var loaded = try await store.blocks(in: pageID)
+        XCTAssertEqual(Array(loaded.prefix(original.count)).map(\.id), original.map(\.id))
+        XCTAssertEqual(loaded[0].text, "尚未保存的正文")
+        XCTAssertEqual(Array(loaded.suffix(5)).map(\.kind), [.heading2, .numbered, .paragraph, .numbered, .code])
+        XCTAssertEqual(loaded[loaded.count - 2].listStart, 2)
+        _ = try await model.executeTool("append_document", arguments: ["page_id": pageID.uuidString, "format": "html", "content": "<h2>来自网页</h2><p><strong>加粗</strong></p>"])
+        loaded = try await store.blocks(in: pageID)
+        XCTAssertTrue(loaded.last!.formatting.contains { $0.style.bold == true })
+        let file = directory.appendingPathComponent("import.md")
+        try "### 文件标题\n\n文件正文".write(to: file, atomically: true, encoding: .utf8)
+        _ = try await model.executeTool("import_file", arguments: ["page_id": pageID.uuidString, "path": file.path])
+        loaded = try await store.blocks(in: pageID)
+        XCTAssertEqual(loaded.last?.text, "文件正文")
+        _ = try await model.executeTool("import_document", arguments: ["title": "外部新页", "format": "text", "content": "# 原样文字"])
+        let imported = try await store.pages().first { $0.title == "外部新页" }
+        XCTAssertNotNil(imported)
+        let newBlocks = try await store.blocks(in: imported!.id)
+        XCTAssertEqual(newBlocks.first?.kind, .paragraph)
+        XCTAssertEqual(newBlocks.first?.text, "# 原样文字")
+        let before = loaded
+        do { _ = try await model.executeTool("append_document", arguments: ["page_id": pageID.uuidString, "format": "bad", "content": "无效"]); XCTFail("Must reject") } catch { }
+        let after = try await store.blocks(in: pageID)
+        XCTAssertEqual(before, after)
+    }
+
+    func testMCPHTTPAndStdioClientsCanAppendAndReadBack() async throws {
+        let (directory, store, model, original) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let suite = "Velora-MCP-Test-" + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(true, forKey: "mcpEnabled"); defaults.set(false, forKey: "mcpAllowWrites")
+        let port = UInt16.random(in: 30000...50000), token = UUID().uuidString
+        let server = try LocalMCPServer(port: port, token: token, model: model, defaults: defaults)
+        var ready = false
+        server.onStatus = { if $0.contains("127.0.0.1") { ready = true } }
+        server.start(); defer { server.stop() }
+        for _ in 0..<100 where !ready { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(ready)
+        func request(_ method: String, _ params: [String: Any] = [:], bearer: String? = nil) async throws -> (Int, [String: Any]) {
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/mcp")!)
+            request.httpMethod = "POST"
+            request.setValue("Bearer " + (bearer ?? token), forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
+            request.httpBody = try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": 1, "method": method, "params": params])
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return ((response as! HTTPURLResponse).statusCode, (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:])
+        }
+        let unauthorized = try await request("tools/list", bearer: "wrong")
+        XCTAssertEqual(unauthorized.0, 401)
+        let initialization = try await request("initialize", ["protocolVersion": "2025-11-25", "capabilities": [:], "clientInfo": ["name": "test", "version": "1"]])
+        XCTAssertEqual(initialization.0, 200)
+        let readOnly = try await request("tools/list")
+        let tools = (readOnly.1["result"] as! [String: Any])["tools"] as! [[String: Any]]
+        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["list_pages", "read_page"])
+        let arguments = ["page_id": original[0].pageID.uuidString, "format": "markdown", "content": "## HTTP写入\n\n正文"]
+        let denied = try await request("tools/call", ["name": "append_document", "arguments": arguments])
+        XCTAssertEqual((denied.1["result"] as? [String: Any])?["isError"] as? Bool, true)
+        let unchanged = try await store.blocks(in: original[0].pageID)
+        XCTAssertEqual(unchanged.count, original.count)
+        defaults.set(true, forKey: "mcpAllowWrites")
+        let appended = try await request("tools/call", ["name": "append_document", "arguments": arguments])
+        XCTAssertEqual((appended.1["result"] as? [String: Any])?["isError"] as? Bool, false)
+        let process = Process(), input = Pipe(), output = Pipe()
+        let bridge = try XCTUnwrap(Bundle.main.url(forResource: "velora_mcp_bridge", withExtension: "py"))
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["python3", bridge.path]
+        var environment = ProcessInfo.processInfo.environment
+        environment["VELORA_MCP_TOKEN"] = token; environment["VELORA_MCP_PORT"] = String(port)
+        process.environment = environment; process.standardInput = input; process.standardOutput = output
+        try process.run()
+        let messages: [[String: Any]] = [
+            ["jsonrpc": "2.0", "id": 1, "method": "initialize", "params": ["protocolVersion": "2025-11-25", "capabilities": [:], "clientInfo": ["name": "stdio-test", "version": "1"]]],
+            ["jsonrpc": "2.0", "method": "notifications/initialized"],
+            ["jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": ["name": "append_document", "arguments": ["page_id": original[0].pageID.uuidString, "content": "stdio 导入正文", "format": "text"]]],
+            ["jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": ["name": "read_page", "arguments": ["page_id": original[0].pageID.uuidString]]]
+        ]
+        for message in messages {
+            input.fileHandleForWriting.write(try JSONSerialization.data(withJSONObject: message)); input.fileHandleForWriting.write(Data([10]))
+        }
+        try input.fileHandleForWriting.close()
+        let bytes = await Task.detached { output.fileHandleForReading.readDataToEndOfFile() }.value
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+        let replies = try String(decoding: bytes, as: UTF8.self).split(separator: "\n").map { try JSONSerialization.jsonObject(with: Data($0.utf8)) as! [String: Any] }
+        XCTAssertEqual(replies.count, 3)
+        XCTAssertTrue(replies.allSatisfy { $0["error"] == nil })
+        XCTAssertFalse(String(decoding: bytes, as: UTF8.self).contains(token))
+        let loaded = try await store.blocks(in: original[0].pageID)
+        XCTAssertEqual(loaded.last?.text, "stdio 导入正文")
+        XCTAssertEqual(loaded.count, original.count + 3)
+    }
+
+    func testMultiBlockCopyAndCutWinOverStaleNativeTextSelection() async throws {
+        let (directory, _, model, original) = try await fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 400), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
+        window.contentView = root
+        let owner = DocumentSelectionView(frame: .zero)
+        let text = CodeTextView(frame: NSRect(x: 0, y: 0, width: 500, height: 200))
+        root.addSubview(owner); root.addSubview(text)
+        owner.copy = model.copySelectedBlocks
+        var deleted = 0; owner.delete = { deleted += 1 }
+        model.selectBlock(original[0].id)
+        model.selectBlock(original[4].id, extend: true)
+        owner.selectionActive = true
+        text.string = "这里只选中一小段"
+        text.setSelectedRange(NSRange(location: 0, length: 2))
+        window.makeFirstResponder(text)
+        text.copy(nil)
+        let copied = try XCTUnwrap(ClipboardDocument.blocks(from: .general))
+        XCTAssertEqual(copied.count, 5)
+        XCTAssertEqual(copied.map(\.kind), original.map(\.kind))
+        XCTAssertEqual(copied.map(\.text), model.blocks.map(\.text))
+        let pasted = ClipboardDocument.inserting(copied, into: "", formatting: [], selection: NSRange(location: 0, length: 0))
+        XCTAssertEqual(pasted, copied, "Pasting must retain every copied block")
+        let separate = NSWindow(contentRect: .zero, styleMask: [], backing: .buffered, defer: false)
+        separate.isReleasedWhenClosed = false
+        XCTAssertFalse(DocumentSelectionView.copySelection(in: separate), "Selection cannot leak to another window")
+        separate.close()
+        text.cut(nil)
+        XCTAssertEqual(deleted, 1)
+        XCTAssertEqual(ClipboardDocument.blocks(from: .general)?.count, 5)
+        XCTAssertEqual(text.string, "这里只选中一小段")
+        // Ordinary native selection must still copy normally after clearing blocks.
+        owner.selectionActive = false
+        text.copy(nil)
+        XCTAssertNil(ClipboardDocument.blocks(from: .general))
+        XCTAssertEqual(NSPasteboard.general.string(forType: .string), "这里")
+    }
+
+    func testDockReopenRaisesHiddenWorkspaceWithoutCreatingAnotherWindow() {
+        let delegate = VeloraApplicationDelegate()
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 300), styleMask: [.titled, .miniaturizable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        var opened = 0
+        delegate.openWorkspaceWindow = { opened += 1 }
+        delegate.registerWorkspaceWindow(window)
+        window.orderOut(nil)
+        XCTAssertFalse(window.isVisible)
+        XCTAssertFalse(delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: false))
+        XCTAssertTrue(window.isVisible)
+        XCTAssertEqual(opened, 0)
+        window.miniaturize(nil)
+        XCTAssertFalse(delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: true))
+        XCTAssertFalse(window.isMiniaturized)
+        XCTAssertTrue(window.isVisible)
+        XCTAssertEqual(opened, 0)
+    }
+
+    func testDockReopenAfterWorkspaceCloseRequestsSceneOnlyOnce() {
+        let delegate = VeloraApplicationDelegate()
+        let window = NSWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        delegate.registerWorkspaceWindow(window)
+        window.close()
+        XCTAssertNil(delegate.workspaceWindow)
+        var opened = 0
+        delegate.openWorkspaceWindow = { opened += 1 }
+        XCTAssertFalse(delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: true))
+        XCTAssertFalse(delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: false))
+        XCTAssertEqual(opened, 1, "A settings window must not prevent reopening the workspace or cause duplicate scenes")
+        delegate.registerWorkspaceWindow(window)
+        XCTAssertFalse(delegate.reopening)
+    }
+
+    func testTextUndoIsIsolatedBetweenBlocksAndSurvivesClearingAnotherEditor() async throws {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 500, height: 300))
+        let first = CodeTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
+        let second = CodeTextView(frame: NSRect(x: 0, y: 120, width: 200, height: 100))
+        first.allowsUndo = true; second.allowsUndo = true
+        host.addSubview(first); host.addSubview(second); window.contentView = host
+        let firstUndo = try XCTUnwrap(first.undoManager)
+        let secondUndo = try XCTUnwrap(second.undoManager)
+        XCTAssertFalse(firstUndo === secondUndo)
+        XCTAssertFalse(firstUndo === window.undoManager)
+        first.insertText("第一块", replacementRange: NSRange(location: 0, length: 0))
+        first.breakUndoCoalescing()
+        second.insertText("第二块", replacementRange: NSRange(location: 0, length: 0))
+        second.breakUndoCoalescing()
+        XCTAssertTrue(firstUndo.canUndo); XCTAssertTrue(secondUndo.canUndo)
+        first.clearEditingUndoHistory(); first.removeFromSuperview()
+        XCTAssertFalse(firstUndo.canUndo)
+        secondUndo.undo()
+        XCTAssertEqual(second.string, "")
+        XCTAssertEqual(first.string, "第一块")
+        secondUndo.redo()
+        XCTAssertEqual(second.string, "第二块")
+        window.makeKeyAndOrderFront(nil)
+        XCTAssertTrue(window.makeFirstResponder(second))
+        // Test hosts cannot reliably acquire NSApp.keyWindow. Dispatch the same
+        // menu selectors to the known responder instead of depending on global focus.
+        XCTAssertTrue(NSApp.sendAction(Selector(("undo:")), to: second, from: nil))
+        XCTAssertEqual(second.string, "", "The editor's undo action must use its own manager")
+        XCTAssertTrue(NSApp.sendAction(Selector(("redo:")), to: second, from: nil))
+        XCTAssertEqual(second.string, "第二块")
+        let item = NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        XCTAssertTrue(second.validateUserInterfaceItem(item))
+        second.isEditable = false
+        XCTAssertFalse(second.validateUserInterfaceItem(item))
+        second.undo(nil)
+        XCTAssertEqual(second.string, "第二块")
+    }
+
+    func testDismantledNativeEditorClearsUndoAndRedoTargets() async throws {
+        let (window, model, directory) = try await slashPopupFixture()
+        defer { window.close(); try? FileManager.default.removeItem(at: directory) }
+        let editor = try XCTUnwrap(window.firstResponder as? CodeTextView)
+        editor.insertText("撤销测试", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+        editor.breakUndoCoalescing()
+        let undo = try XCTUnwrap(editor.undoManager)
+        XCTAssertTrue(undo.canUndo)
+        let scroll = try XCTUnwrap(editor.enclosingScrollView)
+        let native = NativeTextEditor(text: editor.string, font: .systemFont(ofSize: 16), onChange: { _ in })
+        NativeTextEditor.dismantleNSView(scroll, coordinator: native.makeCoordinator())
+        XCTAssertFalse(undo.canUndo); XCTAssertFalse(undo.canRedo)
+        undo.undo(); undo.redo()
+        await model.flushAll()
+    }
+
+    func testExternalTextReplacementInvalidatesNativeUndoRanges() throws {
+        let font = NSFont.systemFont(ofSize: 16)
+        let native = NativeTextEditor(text: "", font: font, onChange: { _ in })
+        let coordinator = native.makeCoordinator()
+        coordinator.lastBaseFont = font
+        let view = CodeTextView(frame: NSRect(x: 0, y: 0, width: 300, height: 100))
+        view.allowsUndo = true; view.font = font
+        view.insertText("很长的旧内容😀", replacementRange: NSRange(location: 0, length: 0))
+        view.breakUndoCoalescing()
+        coordinator.textDidChange(Notification(name: NSText.didChangeNotification, object: view))
+        let undo = try XCTUnwrap(view.undoManager)
+        XCTAssertTrue(undo.canUndo)
+        coordinator.parent.text = view.string
+        coordinator.synchronize(view)
+        XCTAssertTrue(undo.canUndo, "A native-edit acknowledgement must preserve undo")
+        coordinator.parent.text = "短"
+        coordinator.parent.contentRevision += 1
+        coordinator.synchronize(view)
+        XCTAssertEqual(view.string, "短")
+        XCTAssertFalse(undo.canUndo)
+        XCTAssertFalse(undo.canRedo)
+        undo.undo()
+        XCTAssertEqual(view.string, "短")
+    }
+
     override func record(_ issue: XCTIssue) {
         FileHandle.standardError.write(Data(("EDITOR TEST ISSUE: " + issue.compactDescription + "\n").utf8))
         super.record(issue)
@@ -25,6 +392,39 @@ final class EditorInteractionTests: XCTestCase {
         view.string = "a\r\nb"
         view.updateGutterIndex()
         XCTAssertEqual(view.gutterLineStarts, [0, 3])
+    }
+
+    func testSidebarSelectionKeepsNativeSelectionWithQuietCustomHighlight() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/SidebarFocus-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let services = ApplicationServices(catalogURL: directory.appendingPathComponent("catalog.json"),
+            legacyDatabaseURL: directory.appendingPathComponent("fixture.sqlite"), startBackgroundServices: false)
+        let store = try XCTUnwrap(services.store), model = try XCTUnwrap(services.model)
+        let first = try await store.createPage(), second = try await store.createPage()
+        try await store.renamePage(first.id, title: "当前文档")
+        try await store.renamePage(second.id, title: "其他文档")
+        await model.refreshPages(); model.select(first.id)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 650), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        let host = NSHostingView(rootView: WorkspaceView(services: services, model: model))
+        window.contentView = host; window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        try await Task.sleep(for: .milliseconds(300))
+        host.layoutSubtreeIfNeeded()
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        let table = try XCTUnwrap(descendants(host).compactMap { $0 as? NSTableView }.first)
+        XCTAssertEqual(table.selectionHighlightStyle, .none)
+        XCTAssertEqual(table.numberOfSelectedRows, 1)
+        model.select(second.id)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(model.selectedPageID, second.id)
+        XCTAssertEqual(table.numberOfSelectedRows, 1)
+        let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+        host.cacheDisplay(in: host.bounds, to: bitmap)
+        let output = directory.deletingLastPathComponent().appendingPathComponent("sidebar-current-document.png")
+        try bitmap.representation(using: .png, properties: [:])?.write(to: output)
+        await model.flushAll()
     }
 
     func testSettingsAndMovePanelIsolatedLayout() async throws {
@@ -55,7 +455,7 @@ final class EditorInteractionTests: XCTestCase {
 
         }
         try await capture(SettingsView(services: services), size: NSSize(width: 920, height: 680), name: "settings-polish.png")
-        try await capture(MovePagePanel(model: model, page: page), size: NSSize(width: 528, height: 518), name: "move-polish.png")
+        try await capture(MovePagePanel(model: model, services: services, page: page), size: NSSize(width: 548, height: 598), name: "move-polish.png")
         var recoveryCatalog = try XCTUnwrap(services.catalog)
         recoveryCatalog.workspaces[0].databasePath = directory.appendingPathComponent("deleted/velora.sqlite").path
         let recoveryURL = directory.appendingPathComponent("recovery.json")
@@ -252,7 +652,7 @@ final class EditorInteractionTests: XCTestCase {
         XCTAssertEqual(saved.count, original.count + 1)
     }
 
-    func testHostedParagraphReturnKeepsLineBreakAndShiftReturnExitsBlock() async throws {
+    func testHostedParagraphShiftReturnSoftBreakAndReturnSplitsBlock() async throws {
         let (window, model, directory) = try await slashPopupFixture(command: "第一段")
         defer { window.close() }
         let text = try XCTUnwrap(window.firstResponder as? CodeTextView)
@@ -263,20 +663,23 @@ final class EditorInteractionTests: XCTestCase {
             text.keyDown(with: event)
         }
         text.setSelectedRange(NSRange(location: text.string.utf16.count, length: 0))
-        try pressReturn([])
+        try pressReturn(.shift)
         XCTAssertEqual(model.blocks.map(\.text), ["第一段\n"])
         text.insertText("第二行", replacementRange: text.selectedRange())
-        try pressReturn(.shift)
-        for _ in 0..<200 where model.blocks.count < 2 { try await Task.sleep(for: .milliseconds(5)) }
+        try pressReturn([])
+        for _ in 0..<200 where (window.firstResponder as? CodeTextView) === text { try await Task.sleep(for: .milliseconds(5)) }
         XCTAssertEqual(model.blocks.map(\.kind), [.paragraph, .paragraph])
         XCTAssertEqual(model.blocks.map(\.text), ["第一段\n第二行", ""])
+        let next = try XCTUnwrap(window.firstResponder as? CodeTextView)
+        XCTAssertFalse(next === text)
+        next.insertText("新段落", replacementRange: next.selectedRange())
         await model.flushAll()
         let reopened = try SQLiteStore(databaseURL: directory.appendingPathComponent("fixture.sqlite"))
         let saved = try await reopened.blocks(in: try XCTUnwrap(model.selectedPageID))
-        XCTAssertEqual(saved.map(\.text), ["第一段\n第二行", ""])
+        XCTAssertEqual(saved.map(\.text), ["第一段\n第二行", "新段落"])
     }
 
-    func testStyledAnswerLabelReturnAtStartKeepsNativeLineBreak() async throws {
+    func testStyledParagraphReturnAtStartCreatesBlankBlockAndRetainsFormatting() async throws {
         let (window, model, directory) = try await slashPopupFixture(command: "标准答案：")
         defer { window.close() }
         let editor = try XCTUnwrap(window.firstResponder as? CodeTextView)
@@ -289,35 +692,36 @@ final class EditorInteractionTests: XCTestCase {
             charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
         editor.keyDown(with: enter)
         try await Task.sleep(for: .milliseconds(100))
-        XCTAssertEqual(model.blocks.map(\.text), ["\n标准答案："])
-        XCTAssertEqual(editor.selectedRange(), NSRange(location: 1, length: 0))
+        XCTAssertEqual(model.blocks.map(\.text), ["", "标准答案："])
+        XCTAssertEqual(model.editorFocusRequest?.blockID, model.blocks[1].id)
+        XCTAssertEqual((window.firstResponder as? CodeTextView)?.selectedRange(), NSRange(location: 0, length: 0))
         await model.flushAll()
         let reopened = try SQLiteStore(databaseURL: directory.appendingPathComponent("fixture.sqlite"))
         let saved = try await reopened.blocks(in: try XCTUnwrap(model.selectedPageID))
-        XCTAssertEqual(saved.map(\.text), ["\n标准答案："])
-        XCTAssertTrue(saved.first?.formatting.contains { $0.style.bold == true } == true)
+        XCTAssertEqual(saved.map(\.text), ["", "标准答案："])
+        XCTAssertTrue(saved.last?.formatting.contains { $0.style.bold == true } == true)
     }
 
-    func testHostedChineseAndEmptyParagraphReturnStayInSameBlock() async throws {
-        let (window, model, directory) = try await slashPopupFixture(command: "中文正文第一句。第二句。")
-        defer { window.close() }
-        let editor = try XCTUnwrap(window.firstResponder as? CodeTextView)
-        let enter = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
-            timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: "\r",
-            charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
-        editor.setSelectedRange(NSRange(location: "中文正文第一句。".utf16.count, length: 0))
-        editor.keyDown(with: enter)
-        XCTAssertEqual(model.blocks.count, 1)
-        XCTAssertEqual(model.blocks[0].text, "中文正文第一句。\n第二句。")
-        editor.setSelectedRange(NSRange(location: 0, length: editor.string.utf16.count))
-        editor.insertText("", replacementRange: editor.selectedRange())
-        editor.keyDown(with: enter)
-        XCTAssertEqual(model.blocks.count, 1)
-        XCTAssertEqual(model.blocks[0].text, "\n")
+    func testParagraphReturnSplitsUnicodeSelectionAndEmptyParagraph() async throws {
+        let (_, store, model, _) = try await fixture()
+        let block = model.blocks[0]
+        let source = "中文😀待替换第二句。"
+        var style = InlineTextStyle(); style.italic = true
+        let runs = [TextStyleRun(location: 0, length: source.utf16.count, style: style)]
+        model.changeRichText(source, formatting: runs, in: block)
+        XCTAssertTrue(model.returnFromSingleLineBlock(block, text: source, formatting: runs,
+            selection: (source as NSString).range(of: "待替换")))
+        XCTAssertEqual(Array(model.blocks.prefix(2)).map(\.text), ["中文😀", "第二句。"])
+        XCTAssertEqual(model.blocks[0].formatting.first?.length, "中文😀".utf16.count)
+        XCTAssertEqual(model.blocks[1].formatting.first?.location, 0)
+        let second = model.blocks[1]
+        model.changeText("", in: second)
+        XCTAssertTrue(model.returnFromSingleLineBlock(second, text: "", formatting: [], selection: NSRange(location: 0, length: 0)))
+        XCTAssertEqual(Array(model.blocks.prefix(3)).map(\.text), ["中文😀", "", ""])
+        XCTAssertEqual(model.editorFocusRequest?.blockID, model.blocks[2].id)
         await model.flushAll()
-        let reopened = try SQLiteStore(databaseURL: directory.appendingPathComponent("fixture.sqlite"))
-        let saved = try await reopened.blocks(in: try XCTUnwrap(model.selectedPageID))
-        XCTAssertEqual(saved.map(\.text), ["\n"])
+        let saved = try await store.blocks(in: block.pageID)
+        XCTAssertEqual(saved.map(\.text), model.blocks.map(\.text))
     }
 
     func testSelectedBlockReturnContinuesAfterLastSelectedBlock() async throws {
@@ -356,7 +760,7 @@ final class EditorInteractionTests: XCTestCase {
         for _ in 0..<200 where model.blocks.count != BlockKind.allCases.count { try await Task.sleep(for: .milliseconds(5)) }
         XCTAssertEqual(model.blocks.count, BlockKind.allCases.count)
         let original = model.blocks
-        let splitKinds: Set<BlockKind> = [.heading, .heading2, .heading3, .bullet, .numbered, .todo]
+        let splitKinds: Set<BlockKind> = [.paragraph, .heading, .heading2, .heading3, .bullet, .numbered, .todo]
         let mediaKinds: Set<BlockKind> = [.image, .video, .audio, .file, .bookmark]
         for block in original {
             let expected = splitKinds.contains(block.kind) || mediaKinds.contains(block.kind)
@@ -418,7 +822,7 @@ final class EditorInteractionTests: XCTestCase {
         }
     }
 
-    func testQuoteCalloutAndToggleKeepNativeMultilineReturn() async throws {
+    func testQuoteCalloutAndToggleReturnOnEmptyLineExitsAfterMultilineInput() async throws {
         let (window, model, _) = try await slashPopupFixture(command: "")
         defer { window.close() }
         for kind in [BlockKind.quote, .callout, .warning, .success, .toggle] {
@@ -438,8 +842,41 @@ final class EditorInteractionTests: XCTestCase {
                 charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
             source.keyDown(with: enter)
             XCTAssertEqual(model.blocks.first?.text, "首行\n", kind.rawValue)
+            source.keyDown(with: enter)
+            for _ in 0..<200 where (window.firstResponder as? CodeTextView) === source {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertEqual(model.blocks.first?.text, "首行", kind.rawValue)
+            XCTAssertEqual(model.blocks[1].kind, .paragraph)
+            XCTAssertEqual((window.firstResponder as? CodeTextView)?.string, "")
         }
         await model.flushAll()
+    }
+
+    func testMultilineProseEmptyLineReturnExitsWithoutLeavingTrailingNewline() async throws {
+        let (_, store, model, _) = try await fixture()
+        for kind in [BlockKind.quote, .callout, .warning, .success, .toggle] {
+            let source = model.blocks[0]
+            model.insertSlashCommand(kind, in: source, text: "首行😀\n")
+            await model.flushAll()
+            let current = model.blocks[0]
+            // A cursor within the body and an active selection must not exit.
+            XCTAssertFalse(model.returnFromSingleLineBlock(current, text: current.text, formatting: [], selection: NSRange(location: 1, length: 0)))
+            XCTAssertFalse(model.returnFromSingleLineBlock(current, text: current.text, formatting: [], selection: NSRange(location: 0, length: 1)))
+            let before = model.blocks.count
+            XCTAssertTrue(model.returnFromSingleLineBlock(current, text: current.text, formatting: [], selection: NSRange(location: current.text.utf16.count, length: 0)))
+            for _ in 0..<200 where model.blocks.count == before && model.blocks[1].kind != .paragraph { try await Task.sleep(for: .milliseconds(5)) }
+            XCTAssertEqual(model.blocks[0].text, "首行😀", kind.rawValue)
+            XCTAssertEqual(model.blocks[1].kind, .paragraph)
+            XCTAssertEqual(model.editorFocusRequest?.blockID, model.blocks[1].id)
+            let count = model.blocks.count
+            // Reuse the existing blank body block on subsequent exits.
+            XCTAssertTrue(model.returnFromSingleLineBlock(model.blocks[0], text: "", formatting: [], selection: NSRange(location: 0, length: 0)))
+            XCTAssertEqual(model.blocks.count, count)
+            await model.flushAll()
+            let saved = try await store.blocks(in: current.pageID)
+            XCTAssertEqual(saved.map(\.text), model.blocks.map(\.text))
+        }
     }
 
     func testSingleLineBlockReturnRulesPreserveMultilineCodeAndExitEmptyList() async throws {
@@ -559,6 +996,56 @@ final class EditorInteractionTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(200))
         root.layoutSubtreeIfNeeded()
         try capture("image-width.png")
+        await model.flushAll()
+    }
+
+    func testDragIndicatorPublishesOnlyChangesAndCleanupCannotEndNewSession() async throws {
+        let state = PageDragState()
+        let source = UUID(), target = UUID()
+        state.begin(source, mouseIsDown: { true })
+        var publications = 0
+        let observation = state.objectWillChange.sink { publications += 1 }
+        let indicator = PageDropIndicator(pageID: target, placement: .before)
+        for _ in 0..<500 { state.indicator = indicator }
+        XCTAssertEqual(publications, 1, "Hovering one drop zone must not rebuild the List for every event")
+        state.finishAfterTracking()
+        XCTAssertEqual(state.sourceID, source, "Drop callback must retain its row until native tracking returns")
+        state.begin(target, mouseIsDown: { true })
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(state.sourceID, target, "Queued cleanup belongs to the previous drag session")
+        state.finish()
+        observation.cancel()
+    }
+
+    func testPageMoveWaitsForTrackingAndPreservesLiveEditorAndCache() async throws {
+        let (_, store, model, _) = try await fixture()
+        let first = try XCTUnwrap(model.selectedPage)
+        let second = try await store.createPage()
+        _ = try await store.createBlock(pageID: second.id, kind: .paragraph)
+        await model.refreshPages()
+        let originalIDs = model.blocks.map(\.id)
+        model.changeText("拖动前尚未保存的正文", in: model.blocks[0])
+        let originalOrder = model.pages.map(\.id)
+        model.move(second, by: -1)
+        func pumpNativeTracking() { _ = RunLoop.main.run(mode: .eventTracking, before: Date().addingTimeInterval(0.02)) }
+        pumpNativeTracking()
+        XCTAssertEqual(model.pages.map(\.id), originalOrder)
+        for _ in 0..<300 where model.pages.first?.id != second.id || model.automationBusy {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(model.pages.map(\.id), [second.id, first.id])
+        XCTAssertEqual(model.selectedPageID, first.id)
+        XCTAssertEqual(model.blocks.map(\.id), originalIDs)
+        XCTAssertEqual(model.blocks.first?.text, "拖动前尚未保存的正文")
+        let saved = try await store.blocks(in: first.id)
+        XCTAssertEqual(saved.first?.text, model.blocks.first?.text)
+        // Cache the selected page, then reorder while another page is open.
+        model.select(second.id)
+        for _ in 0..<200 where model.blocks.first?.pageID != second.id { try await Task.sleep(for: .milliseconds(5)) }
+        model.move(first, by: -1)
+        for _ in 0..<300 where model.pages.first?.id != first.id || model.automationBusy { try await Task.sleep(for: .milliseconds(5)) }
+        model.select(first.id)
+        XCTAssertEqual(model.blocks.map(\.id), originalIDs, "A structural reorder must keep visited-page cache")
         await model.flushAll()
     }
 
@@ -727,6 +1214,98 @@ final class EditorInteractionTests: XCTestCase {
         let saved = try await store.blocks(in: target.pageID)
         XCTAssertEqual(saved[1].text, code.text)
         XCTAssertEqual(saved[1].language, "Swift")
+    }
+
+    func testDuplicatePageIncludesPendingEditsAndOpensIndependentCopy() async throws {
+        let (_, store, model, _) = try await fixture()
+        let source = try XCTUnwrap(model.selectedPage)
+        let block = model.blocks[0]
+        model.changeText("复制时尚未自动保存的正文😀", in: block)
+        try await model.duplicatePage(source)
+        let copyID = try XCTUnwrap(model.selectedPageID)
+        XCTAssertNotEqual(copyID, source.id)
+        for _ in 0..<200 where model.blocks.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(model.blocks.first?.text, "复制时尚未自动保存的正文😀")
+        XCTAssertNotEqual(model.blocks.first?.id, block.id)
+        XCTAssertFalse(model.automationBusy)
+        let saved = try await store.blocks(in: source.id)
+        XCTAssertEqual(saved.first?.text, model.blocks.first?.text)
+        let count = model.pages.count
+        var stale = source
+        stale = Page(id: UUID(), parentID: stale.parentID, title: stale.title, order: stale.order, archived: false, updatedAt: Date())
+        do { try await model.duplicatePage(stale); XCTFail("Stale page must fail") } catch { }
+        XCTAssertEqual(model.pages.count, count)
+        XCTAssertFalse(model.automationBusy)
+    }
+
+    func testCreatePageImmediatelyProvidesCommittedInputAndRetainsPreviousPageCache() async throws {
+        let (_, store, model, _) = try await fixture()
+        let previousID = try XCTUnwrap(model.selectedPageID)
+        let previousBlocks = model.blocks
+        model.changeText("新建前尚未保存的正文", in: previousBlocks[0])
+        model.createPage(parentID: previousID)
+        for _ in 0..<200 where model.selectedPageID == previousID { try await Task.sleep(for: .milliseconds(5)) }
+        let newID = try XCTUnwrap(model.selectedPageID)
+        XCTAssertNotEqual(newID, previousID)
+        XCTAssertEqual(model.selectedPage?.parentID, previousID)
+        XCTAssertEqual(model.blocks.count, 1)
+        XCTAssertEqual(model.blocks[0].kind, .paragraph)
+        XCTAssertEqual(model.editorFocusRequest?.blockID, model.blocks[0].id)
+        let saved = try await store.blocks(in: newID)
+        XCTAssertEqual(saved, model.blocks)
+        model.select(previousID)
+        XCTAssertEqual(model.blocks.map(\.id), previousBlocks.map(\.id), "New page creation must keep the previous page's immediate cache")
+        XCTAssertEqual(model.blocks.first?.text, "新建前尚未保存的正文")
+        await model.flushAll()
+        let stored = try await store.blocks(in: previousID)
+        XCTAssertEqual(stored.first?.text, "新建前尚未保存的正文")
+    }
+
+    func testSidebarTreeCacheReusesLargeHierarchyAndInvalidatesForRealInputs() throws {
+        let suite = "Velora.SidebarCache." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let state = SidebarExpansionState(workspaceID: "test", defaults: defaults)
+        let root = Page(id: UUID(), title: "根页面", order: 0, archived: false, updatedAt: Date())
+        var pages = [root]
+        for index in 0..<2000 {
+            pages.append(Page(id: UUID(), parentID: root.id, title: "页面 \(index)", order: Int64(index), archived: false, updatedAt: Date()))
+        }
+        var index = SidebarPageIndex(pages: pages)
+        var revision = UUID()
+        for _ in 0..<200 {
+            let rows = state.visibleRows(index: index, revision: revision, filter: "")
+            XCTAssertEqual(rows.count, 2001)
+            XCTAssertEqual(rows.last?.page.id, pages.last?.id)
+        }
+        XCTAssertEqual(state.treeBuildCount, 1, "Editor and autosave updates must reuse the tree")
+        state.collapsed = [root.id]
+        XCTAssertEqual(state.visibleRows(index: index, revision: revision, filter: "").count, 1)
+        XCTAssertEqual(state.treeBuildCount, 2)
+        let filtered = state.visibleRows(index: index, revision: revision, filter: "页面 1999")
+        XCTAssertEqual(filtered.map(\.page.id), [root.id, pages.last!.id])
+        XCTAssertEqual(filtered.map(\.depth), [0, 1])
+        XCTAssertEqual(state.treeBuildCount, 3)
+        pages[pages.count - 1].archived = true
+        index = SidebarPageIndex(pages: pages); revision = UUID()
+        XCTAssertTrue(state.visibleRows(index: index, revision: revision, filter: "页面 1999").isEmpty)
+        XCTAssertNil(index.children[pages.last!.id])
+        XCTAssertEqual(state.treeBuildCount, 4)
+    }
+
+    func testSidebarIndexRevisionDoesNotChangeWhileTypingOrSwitchingPages() async throws {
+        let (_, _, model, original) = try await fixture()
+        let revision = model.sidebarPageRevision
+        model.changeText("正文输入不应重建页面树", in: model.blocks[0])
+        await model.flushAll()
+        XCTAssertEqual(model.sidebarPageRevision, revision)
+        XCTAssertNotNil(model.sidebarPageIndex.byID[original[0].pageID])
+        model.select(nil)
+        XCTAssertEqual(model.sidebarPageRevision, revision)
+        await model.refreshPages()
+        // Saving text updates page metadata in storage; the refreshed title/tree
+        // index must accurately reflect the newly loaded page snapshot.
+        XCTAssertEqual(model.sidebarPageIndex.byID[original[0].pageID], model.pages.first { $0.id == original[0].pageID })
     }
 
     func testSidebarExpansionPersistsPerWorkspaceAndBulkActionsRespectHierarchy() throws {
@@ -1060,6 +1639,181 @@ final class EditorInteractionTests: XCTestCase {
         return (window, model, directory)
     }
 
+    func testLiteralReplacementPreservesUTF16AndSurroundingInlineStyles() {
+        var bold = InlineTextStyle(); bold.bold = true
+        var italic = InlineTextStyle(); italic.italic = true
+        let value = RichInlineContent.replacing("前😀目标后目标尾", runs: [
+            TextStyleRun(location: 3, length: 2, style: bold), TextStyleRun(location: 5, length: 4, style: italic)
+        ], ranges: [NSRange(location: 3, length: 2), NSRange(location: 6, length: 2)], with: "ABCD")
+        XCTAssertEqual(value.text, "前😀ABCD后ABCD尾")
+        XCTAssertEqual(RichInlineContent.segments(value.text, runs: value.runs).map(\.text).joined(), value.text)
+        XCTAssertTrue(value.runs.contains { $0.location == 3 && $0.length == 4 && $0.style.bold == true })
+        for position in 7..<13 { XCTAssertTrue(value.runs.contains { $0.location <= position && $0.location + $0.length > position && $0.style.italic == true }) }
+        let deleted = RichInlineContent.replacing("😀abc尾", runs: [TextStyleRun(location: 2, length: 4, style: bold)],
+            ranges: [NSRange(location: 2, length: 3)], with: "")
+        XCTAssertEqual(deleted.text, "😀尾")
+        XCTAssertEqual(deleted.runs, [TextStyleRun(location: 2, length: 1, style: bold)])
+    }
+
+    func testReplaceAllPreservesBlockKindsTableLayoutPersistsAndCanUndo() async throws {
+        let (_, store, model, original) = try await fixture()
+        model.renameSelectedPage("目标页")
+        model.changeText("目标😀目标", in: original[0])
+        model.changeText("\t目标\n", in: original[1])
+        model.insertSlashCommand(.table, in: original[4])
+        await model.flushAll()
+        let table = try XCTUnwrap(model.blocks.last)
+        model.changeText(#"[["`目标`","列名"],["目标","`保留`"]]"#, in: table)
+        model.changeTableLayout(TableLayout(columnWidths: [120, 230], rowHeights: [44, 80]), in: table)
+        let before = model.blocks
+        model.performDocumentFind(.replace)
+        model.documentFindQuery = "目标"; model.documentReplacement = "`新|😀`"
+        XCTAssertEqual(model.documentFindMatches.count, 6)
+        model.replaceDocumentMatches(all: true)
+        XCTAssertEqual(model.documentReplacementCount, 6)
+        XCTAssertTrue(model.documentFindMatches.isEmpty)
+        XCTAssertEqual(model.blocks.map(\.kind), before.map(\.kind))
+        XCTAssertEqual(model.blocks[1].text, "\t`新|😀`\n")
+        let changedTable = try XCTUnwrap(model.blocks.last)
+        let cells = try JSONDecoder().decode([[String]].self, from: Data(changedTable.text.utf8))
+        XCTAssertEqual(cells, [["`新|😀`", "列名"], ["`新|😀`", "保留"]])
+        XCTAssertTrue(changedTable.tableLayout.cellsArePlain)
+        XCTAssertEqual(changedTable.tableLayout.columnWidths, [120, 230])
+        XCTAssertEqual(changedTable.tableLayout.rowHeights, [44, 80])
+        XCTAssertEqual(model.selectedPage?.title, "`新|😀`页")
+        XCTAssertTrue(model.canUndoDocumentReplacement)
+        await model.flushAll()
+        let saved = try await store.blocks(in: table.pageID)
+        XCTAssertEqual(saved, model.blocks)
+        model.undoDocumentReplacement()
+        XCTAssertEqual(model.blocks, before)
+        XCTAssertEqual(model.selectedPage?.title, "目标页")
+        XCTAssertFalse(model.canUndoDocumentReplacement)
+        await model.flushAll()
+        let restored = try await store.blocks(in: table.pageID)
+        XCTAssertEqual(restored, before)
+        let pages = try await store.pages()
+        XCTAssertEqual(pages.first { $0.id == table.pageID }?.title, "目标页")
+    }
+
+    func testReplaceCurrentSkipsInsertedMatchesAndUndoDoesNotOverwriteLaterEdits() async throws {
+        let (_, _, model, original) = try await fixture()
+        model.changeText("x x", in: original[0])
+        model.performDocumentFind(.replace)
+        model.documentFindQuery = "x"; model.documentReplacement = "xx"
+        model.replaceDocumentMatches(all: false)
+        XCTAssertEqual(model.blocks[0].text, "xx x")
+        XCTAssertEqual(model.currentDocumentFindMatch?.range.location, 3)
+        model.documentReplacement = ""
+        model.replaceDocumentMatches(all: false)
+        XCTAssertEqual(model.blocks[0].text, "xx ")
+        XCTAssertEqual(model.currentDocumentFindMatch?.range.location, 0)
+        model.changeText("用户后续修改", in: original[0])
+        XCTAssertFalse(model.canUndoDocumentReplacement)
+        model.undoDocumentReplacement()
+        XCTAssertEqual(model.blocks[0].text, "用户后续修改")
+        model.documentFindQuery = ""
+        model.replaceDocumentMatches(all: true)
+        XCTAssertEqual(model.documentReplacementCount, 0)
+        await model.flushAll()
+    }
+
+    func testHostedReplaceShortcutUpdatesNativeTextWithoutInterpretingMarkdown() async throws {
+        let (window, model, directory) = try await slashPopupFixture()
+        defer { window.close(); try? FileManager.default.removeItem(at: directory) }
+        let editor = try XCTUnwrap(window.firstResponder as? CodeTextView)
+        editor.insertText("目标 目标", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+        let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command, .option],
+            timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: "f", charactersIgnoringModifiers: "f", isARepeat: false, keyCode: 3))
+        XCTAssertTrue(editor.performKeyEquivalent(with: event))
+        XCTAssertTrue(model.documentReplacePresented)
+        model.documentFindQuery = "目标"; model.documentReplacement = "# **字面量**"
+        model.replaceDocumentMatches(all: true)
+        for _ in 0..<100 where editor.string != "# **字面量** # **字面量**" { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(editor.string, "# **字面量** # **字面量**")
+        XCTAssertEqual(model.blocks[0].kind, .paragraph)
+        model.undoDocumentReplacement()
+        for _ in 0..<100 where editor.string != "目标 目标" { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(editor.string, "目标 目标")
+        await model.flushAll()
+    }
+
+    func testDocumentFindUsesUTF16RangesAndSearchesVisibleTableCells() async throws {
+        let (_, _, model, original) = try await fixture()
+        var text = original[0]; text.text = "😀Café CAFÉ café"
+        var table = original[1]; table.kind = .table
+        table.text = #"[["`café`","literal"],["Café","other"]]"#
+        var image = original[3]; image.text = "https://example.com/cafe.png"
+        let hits = DocumentFindMatch.search("cafe", title: "Cafe", blocks: [text, table, image])
+        XCTAssertEqual(hits.count, 6)
+        XCTAssertNil(hits[0].blockID)
+        XCTAssertEqual(hits[1].range, NSRange(location: 2, length: 4))
+        XCTAssertEqual(hits[4].row, 0); XCTAssertEqual(hits[4].column, 0)
+        XCTAssertEqual(hits[4].range, NSRange(location: 0, length: 4), "Search visible text, not legacy code delimiters")
+        XCTAssertEqual(hits[5].row, 1)
+        XCTAssertTrue(DocumentFindMatch.search("", title: "", blocks: model.blocks).isEmpty)
+    }
+
+    func testDocumentFindWrapsUpdatesLiveAndResetsWhenSwitchingPage() async throws {
+        let (_, store, model, original) = try await fixture()
+        model.changeText("目标😀目标", in: original[0])
+        model.documentFindQuery = "目标"
+        model.performDocumentFind(.show)
+        XCTAssertEqual(model.documentFindMatches.count, 2)
+        XCTAssertEqual(model.documentFindIndex, 0)
+        model.performDocumentFind(.previous); XCTAssertEqual(model.documentFindIndex, 1)
+        model.performDocumentFind(.next); XCTAssertEqual(model.documentFindIndex, 0)
+        model.changeText("已删除", in: original[0])
+        XCTAssertTrue(model.documentFindMatches.isEmpty)
+        model.changeText("新目标", in: original[0])
+        XCTAssertEqual(model.currentDocumentFindMatch?.range, NSRange(location: 1, length: 2))
+        model.closeDocumentFind(); XCTAssertTrue(model.documentFindMatches.isEmpty)
+        model.performDocumentFind(.show); XCTAssertEqual(model.documentFindMatches.count, 1)
+        let other = try await store.createPage()
+        model.select(other.id)
+        XCTAssertFalse(model.documentFindPresented); XCTAssertTrue(model.documentFindMatches.isEmpty)
+        await model.flushAll()
+    }
+
+    func testHostedDocumentFindShortcutHighlightsWithoutChangingContentOrFocus() async throws {
+        let (window, model, directory) = try await slashPopupFixture()
+        defer { window.close(); try? FileManager.default.removeItem(at: directory) }
+        let editor = try XCTUnwrap(window.firstResponder as? CodeTextView)
+        editor.insertText("开😀目标 目标", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+        let caret = editor.selectedRange()
+        let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
+            timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: "f", charactersIgnoringModifiers: "f", isARepeat: false, keyCode: 3))
+        XCTAssertTrue(editor.performKeyEquivalent(with: event))
+        XCTAssertTrue(model.documentFindPresented)
+        model.documentFindQuery = "目标"
+        for _ in 0..<100 where window.firstResponder === editor { try await Task.sleep(for: .milliseconds(5)) }
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(model.documentFindMatches.count, 2)
+        XCTAssertNotNil(editor.layoutManager?.temporaryAttribute(.backgroundColor, atCharacterIndex: 3, effectiveRange: nil))
+        XCTAssertEqual(editor.selectedRange(), caret)
+        XCTAssertFalse(window.firstResponder === editor, "Find must leave typing focus in the find field")
+        func captureFindBar(_ name: String) throws {
+            let root = try XCTUnwrap(window.contentView)
+            root.layoutSubtreeIfNeeded()
+            let bitmap = try XCTUnwrap(root.bitmapImageRepForCachingDisplay(in: root.bounds))
+            root.cacheDisplay(in: root.bounds, to: bitmap)
+            try bitmap.representation(using: .png, properties: [:])?.write(to: directory.deletingLastPathComponent().appendingPathComponent(name))
+        }
+        try captureFindBar("findbar-compact-native.png")
+        model.documentReplacePresented = true
+        try await Task.sleep(for: .milliseconds(80))
+        try captureFindBar("findbar-compact-replace-native.png")
+        model.documentReplacePresented = false
+        model.performDocumentFind(.next)
+        XCTAssertEqual(model.documentFindIndex, 1)
+        model.closeDocumentFind()
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertNil(editor.layoutManager?.temporaryAttribute(.backgroundColor, atCharacterIndex: 3, effectiveRange: nil))
+        XCTAssertEqual(editor.string, "开😀目标 目标")
+        XCTAssertFalse(model.blocks[0].formatting.contains { $0.style.highlight != nil })
+        await model.flushAll()
+    }
+
     func testHostedListBlockPastePreservesKindsFormattingAndNumbering() async throws {
         for kind in [BlockKind.paragraph, .bullet, .numbered] {
             let (window, model, directory) = try await slashPopupFixture()
@@ -1265,6 +2019,162 @@ final class EditorInteractionTests: XCTestCase {
         XCTAssertEqual(saved[0].text, "let value = 1")
     }
 
+    func testCopyingOnlyLaterListItemRetainsItsDisplayedNumber() async throws {
+        let (_, _, model, _) = try await fixture()
+        model.insertSlashCommand(.numbered, in: model.blocks[0], text: "first")
+        model.insertSlashCommand(.numbered, in: model.blocks[1], text: "second")
+        await model.flushAll()
+        let second = model.blocks[1]
+        let copied = model.clipboardBlocks([second.id])
+        XCTAssertEqual(copied.first?.listStart, 2)
+        XCTAssertEqual(ListNumbering.numbers(copied), [2])
+        let together = model.clipboardBlocks([model.blocks[0].id, second.id])
+        XCTAssertEqual(together.map(\.listStart), [nil, nil])
+        XCTAssertEqual(ListNumbering.numbers(together), [1, 2])
+    }
+
+    func testContinueListNumberingRepairsOldContentAndReturnContinuesExplicitStart() async throws {
+        let (_, store, model, _) = try await fixture()
+        model.insertSlashCommand(.numbered, in: model.blocks[0], text: "Token")
+        await model.flushAll()
+        let count = model.blocks.count
+        model.addBlock(.numbered, after: model.blocks.last, text: "Prompt")
+        for _ in 0..<200 where model.blocks.count == count { try await Task.sleep(for: .milliseconds(5)) }
+        let prompt = try XCTUnwrap(model.blocks.last)
+        XCTAssertEqual(EditorRowSnapshot.make(blocks: model.blocks, selection: [], focus: nil).last?.number, 1)
+        try await model.continueListNumbering(in: prompt)
+        XCTAssertEqual(EditorRowSnapshot.make(blocks: model.blocks, selection: [], focus: nil).last?.number, 2)
+        try await model.setListStart(7, in: prompt)
+        XCTAssertTrue(model.returnFromSingleLineBlock(prompt, text: "Prompt", formatting: [], selection: NSRange(location: 6, length: 0)))
+        let rows = EditorRowSnapshot.make(blocks: model.blocks, selection: [], focus: nil)
+        XCTAssertEqual(rows.suffix(2).map(\.number), [7, 8])
+        await model.flushAll()
+        let saved = try await store.blocks(in: prompt.pageID)
+        XCTAssertEqual(saved.suffix(2).map(\.listStart), [7, nil])
+    }
+
+    func testHostedChatGPTBadgePasteKeepsOneEditorAndVisibleInlineCodeBackground() async throws {
+        let (window, model, directory) = try await slashPopupFixture(command: "")
+        defer { window.close() }
+        let title = "23. MySQL 索引为什么会失效？什么是最左前缀原则？"
+        let html = "<h3>" + title + "</h3><p><code>难度 ★★★★☆</code></p><blockquote><strong>重要程度：★★★★★</strong></blockquote><h3>一、标准答案</h3>"
+        model.pasteDocument(plain: title + "\n难度 ★★★★☆ 重要程度：★★★★★\n一、标准答案", html: html,
+            original: "", formatting: [], selection: NSRange(location: 0, length: 0), in: try XCTUnwrap(model.blocks.first))
+        for _ in 0..<200 where model.blocks.count != 3 { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(model.blocks.map(\.kind), [.heading3, .paragraph, .heading3])
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        var row: CodeTextView?
+        for _ in 0..<200 {
+            window.contentView?.layoutSubtreeIfNeeded()
+            row = window.contentView.flatMap { descendants($0).compactMap { $0 as? CodeTextView }.first { $0.string.contains("难度") && $0.string.contains("重要程度") } }
+            if row != nil { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let editor = try XCTUnwrap(row)
+        let range = (editor.string as NSString).range(of: "难度")
+        XCTAssertNotNil(editor.textStorage?.attribute(.backgroundColor, at: range.location, effectiveRange: nil))
+        let root = try XCTUnwrap(window.contentView)
+        let bitmap = try XCTUnwrap(root.bitmapImageRepForCachingDisplay(in: root.bounds))
+        root.cacheDisplay(in: root.bounds, to: bitmap)
+        try bitmap.representation(using: .png, properties: [:])?.write(to: directory.deletingLastPathComponent().appendingPathComponent("chatgpt-inline-badge-native.png"))
+        await model.flushAll()
+        let store = try SQLiteStore(databaseURL: directory.appendingPathComponent("fixture.sqlite"))
+        let saved = try await store.blocks(in: XCTUnwrap(model.selectedPageID))
+        XCTAssertEqual(saved.map(\.kind), [.heading3, .paragraph, .heading3])
+    }
+
+    func testImageResizeUsesNativeDragAndPersistsCustomWidthAndReset() async throws {
+        let (window, model, directory) = try await slashPopupFixture(command: "")
+        defer { window.close() }
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 200, pixelsHigh: 100, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
+        NSColor.white.setFill(); NSRect(x: 0, y: 0, width: 200, height: 100).fill()
+        NSColor.systemBlue.setFill(); NSRect(x: 0, y: 0, width: 100, height: 100).fill()
+        NSGraphicsContext.restoreGraphicsState()
+        let source = try ImageSource.embedded(XCTUnwrap(bitmap.representation(using: .png, properties: [:])))
+        model.insertSlashCommand(.image, in: try XCTUnwrap(model.blocks.first), text: source)
+        await model.flushAll()
+        let block = try XCTUnwrap(model.blocks.first)
+        model.selectBlock(block.id)
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        var grip: TableResizeGripView?
+        for _ in 0..<200 {
+            window.contentView?.layoutSubtreeIfNeeded()
+            grip = window.contentView.flatMap { descendants($0).compactMap { $0 as? TableResizeGripView }.first { $0.identifier?.rawValue == "image-column-0" && $0.bounds.height > 0 } }
+            if grip != nil { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        // Wait for image decode and its actual fitted bounds, not the placeholder.
+        try await Task.sleep(for: .milliseconds(100))
+        let handle = try XCTUnwrap(grip)
+        let raw = handle.convert(NSPoint(x: handle.bounds.midX, y: handle.bounds.midY), to: nil)
+        let origin = NSPoint(x: raw.x.rounded(), y: raw.y.rounded())
+        let end = NSPoint(x: origin.x + 120, y: origin.y)
+        func event(_ type: NSEvent.EventType, _ point: NSPoint) throws -> NSEvent {
+            try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
+        }
+        NSApp.postEvent(try event(.leftMouseUp, end), atStart: true)
+        NSApp.postEvent(try event(.leftMouseDragged, end), atStart: true)
+        window.sendEvent(try event(.leftMouseDown, origin))
+        for _ in 0..<200 where model.blocks.first?.imageWidth == nil { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(try XCTUnwrap(model.blocks.first?.imageWidth), 320, accuracy: 2)
+        let reopened = try SQLiteStore(databaseURL: directory.appendingPathComponent("fixture.sqlite"))
+        let saved = try await reopened.blocks(in: block.pageID)
+        XCTAssertEqual(saved.first?.imageWidth, model.blocks.first?.imageWidth)
+        XCTAssertEqual(saved.first?.text, source)
+        func capture(_ host: NSView, name: String) throws {
+            host.layoutSubtreeIfNeeded()
+            let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+            host.cacheDisplay(in: host.bounds, to: bitmap)
+            let output = directory.deletingLastPathComponent().appendingPathComponent(name)
+            try bitmap.representation(using: .png, properties: [:])?.write(to: output)
+        }
+        try capture(XCTUnwrap(window.contentView), name: "image-resize-native.png")
+        let previewWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 640), styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        previewWindow.isReleasedWhenClosed = false
+        previewWindow.contentView = NSHostingView(rootView: ImageZoomPreview(source: source))
+        previewWindow.orderFront(nil)
+        try await Task.sleep(for: .milliseconds(150))
+        try capture(XCTUnwrap(previewWindow.contentView), name: "image-preview-native.png")
+        previewWindow.close()
+        try await model.resizeImage(nil, in: block)
+        XCTAssertNil(model.blocks.first?.imageWidth)
+    }
+
+    func testInlineImageStaysCompactWithoutUpscalingOrDistortingAspectRatio() async throws {
+        let output = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".agents/test")
+        for size in [NSSize(width: 200, height: 400), NSSize(width: 800, height: 200), NSSize(width: 400, height: 1600)] {
+            let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width), pixelsHigh: Int(size.height), bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
+            NSColor.white.setFill(); NSRect(origin: .zero, size: size).fill()
+            NSColor.systemBlue.setFill(); NSRect(x: 0, y: 0, width: size.width, height: size.height / 2).fill()
+            NSGraphicsContext.restoreGraphicsState()
+            let source = try ImageSource.embedded(XCTUnwrap(bitmap.representation(using: .png, properties: [:])))
+            let host = NSHostingView(rootView: MediaImageView(source: source).frame(width: 560).fixedSize(horizontal: false, vertical: true))
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 1200), styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.contentView = host; window.orderFront(nil)
+            let scale = min(1, 560 / size.width, 420 / size.height)
+            let expected = size.height * scale
+            for _ in 0..<200 {
+                host.layoutSubtreeIfNeeded()
+                if abs(host.fittingSize.height - expected) < 2 { break }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertEqual(host.fittingSize.width, 560, accuracy: 1)
+            XCTAssertEqual(host.fittingSize.height, expected, accuracy: 2, "Image should keep its natural size or shrink to fit the compact bounds")
+            host.setFrameSize(host.fittingSize)
+            if let capture = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+                host.cacheDisplay(in: host.bounds, to: capture)
+                try capture.representation(using: .png, properties: [:])?.write(to: output.appendingPathComponent(size.height > size.width ? "image-inline-portrait.png" : "image-inline-landscape.png"))
+            }
+            window.close()
+        }
+    }
+
     func testHostedImageSlashCommandOpensPickerAndCancelKeepsWritableImageBlock() async throws {
         let (window, model, directory) = try await slashPopupFixture(command: "/image")
         defer {
@@ -1371,15 +2281,15 @@ final class EditorInteractionTests: XCTestCase {
 
 
 
-    func testShiftEnterFromLongTextBlockFocusesParagraphBelowWholeBlock() async throws {
+    func testEnterAtEndOfLongParagraphFocusesNewBlock() async throws {
         let (window, model, directory) = try await slashPopupFixture()
         defer { window.close(); try? FileManager.default.removeItem(at: directory) }
         let editor = try XCTUnwrap(window.firstResponder as? NSTextView)
         let source = String(repeating: "这是很长的一行正文，需要保留完整内容。\n", count: 90)
         editor.setSelectedRange(NSRange(location: 0, length: editor.string.utf16.count))
         editor.insertText(source, replacementRange: editor.selectedRange())
-        editor.setSelectedRange(NSRange(location: source.utf16.count / 2, length: 0))
-        let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .shift, timestamp: 0,
+        editor.setSelectedRange(NSRange(location: source.utf16.count, length: 0))
+        let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
             windowNumber: window.windowNumber, context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
         editor.keyDown(with: event)
         for _ in 0..<300 where model.blocks.count < 2 || (window.firstResponder as? NSTextView)?.string != "" {
@@ -1637,6 +2547,83 @@ final class EditorInteractionTests: XCTestCase {
         await model.flushAll()
     }
 
+    func testTableEdgeAppendUsesLiveCellsAndPreservesDimensions() async throws {
+        let (_, store, model, original) = try await fixture()
+        model.insertSlashCommand(.table, in: original[0])
+        await model.flushAll()
+        let table = try XCTUnwrap(model.blocks.first)
+        model.changeText(#"[["`方法`","说明"],["数据","内容"]]"#, in: table)
+        model.changeTableLayout(TableLayout(columnWidths: [240, 300], rowHeights: [60, 80]), in: table)
+        model.appendTableAxes(row: false, column: true, in: table)
+        model.appendTableAxes(row: true, column: false, in: table)
+        model.appendTableAxes(row: true, column: true, in: table)
+        let current = try XCTUnwrap(model.blocks.first)
+        let cells = try JSONDecoder().decode([[String]].self, from: Data(current.text.utf8))
+        XCTAssertEqual(cells.count, 4)
+        XCTAssertTrue(cells.allSatisfy { $0.count == 4 })
+        XCTAssertEqual(cells[0], ["方法", "说明", "", ""])
+        XCTAssertEqual(current.tableLayout.columnWidths, [240, 300, 160, 160])
+        XCTAssertEqual(current.tableLayout.rowHeights, [60, 80, 44, 44])
+        XCTAssertTrue(current.tableLayout.cellsArePlain)
+        await model.flushAll()
+        let saved = try await store.blocks(in: table.pageID)
+        XCTAssertEqual(saved.first, current)
+    }
+
+    func testCommonCodeLanguagesAliasesAndLanguageSpecificTokens() {
+        for (alias, language) in [("py", "Python"), ("ts", "TypeScript"), ("cpp", "C++"), ("cs", "C#"),
+                                  ("sh", "Bash"), ("yml", "YAML"), ("ps1", "PowerShell"), ("objc", "Objective-C")] {
+            XCTAssertEqual(CodeLanguage.canonical(alias), language)
+        }
+        func pieces(_ source: String, _ language: String, _ kind: String) -> [String] {
+            CodeSyntax.tokens(source, language: language).filter { $0.kind == kind }.map { (source as NSString).substring(with: $0.range) }
+        }
+        XCTAssertEqual(pieces("select 'http://x--y' -- comment", "SQL", "comment"), ["-- comment"])
+        XCTAssertEqual(pieces("select true", "sql", "keyword"), ["select"])
+        XCTAssertEqual(pieces("const url = \"http://x/#y\"; // note", "js", "comment"), ["// note"])
+        XCTAssertEqual(pieces("def f():\n  return \"# text\" # note", "py", "comment"), ["# note"])
+        XCTAssertEqual(pieces("interface User { readonly name: string }", "ts", "keyword"), ["interface", "readonly", "string"])
+        XCTAssertEqual(pieces("<!-- note --><div>Hello</div>", "HTML", "markup"), ["<div>", "</div>"])
+        XCTAssertEqual(pieces("FROM alpine\n# build\nRUN echo ok", "dockerfile", "keyword"), ["FROM", "RUN"])
+        XCTAssertEqual(pieces("-- comment\nlocal x = nil", "Lua", "comment"), ["-- comment"])
+        XCTAssertTrue(CodeSyntax.tokens("let x = 42", language: "txt").isEmpty)
+        let languages = CodeLanguage.groups.flatMap(\.languages)
+        XCTAssertEqual(Set(languages).count, languages.count)
+        for language in languages where language != "Plain Text" {
+            XCTAssertFalse(CodeSyntax.tokens("# Title\n// note\n-- note\nlet value = \"text\";\n123", language: language).isEmpty, language)
+        }
+    }
+
+    func testHostedTableReferenceFocusAndRailsRender() async throws {
+        let (window, model, directory) = try await slashPopupFixture()
+        defer { window.close(); try? FileManager.default.removeItem(at: directory) }
+        let original = try XCTUnwrap(model.blocks.first)
+        model.insertSlashCommand(.table, in: original)
+        model.changeTableCells([["", ""], ["", ""]], in: original)
+        model.changeTableLayout(TableLayout(columnWidths: [320, 320], rowHeights: [70, 70], cellsArePlain: true), in: original)
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        var editors: [CodeTextView] = []
+        for _ in 0..<100 {
+            editors = window.contentView.map { descendants($0).compactMap { $0 as? CodeTextView } } ?? []
+            if editors.count >= 4 { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(editors.count, 4)
+        try await Task.sleep(for: .milliseconds(100))
+        window.makeKeyAndOrderFront(nil)
+        XCTAssertTrue(window.makeFirstResponder(editors[2]))
+        try await Task.sleep(for: .milliseconds(100))
+        let host = try XCTUnwrap(window.contentView)
+        host.layoutSubtreeIfNeeded()
+        let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+        host.cacheDisplay(in: host.bounds, to: bitmap)
+        let data = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        let output = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/table-reference-native.png")
+        try data.write(to: output)
+        await model.flushAll()
+    }
+
     func testTableLayoutLimitsAndStructureChanges() throws {
         let layout = TableLayout(columnWidths: [240, -20, .infinity], rowHeights: [96, -5, .nan])
         XCTAssertEqual(layout.columnWidths, [240, 72, 160])
@@ -1647,6 +2634,53 @@ final class EditorInteractionTests: XCTestCase {
         let old = try JSONDecoder().decode(TransferBlock.self, from: Data(#"{"kind":"table","text":"[[\"A\",\"B\"]]"}"#.utf8))
         XCTAssertEqual(old.tableLayout.column(0), 160)
         XCTAssertEqual(old.tableLayout.row(0), 44)
+    }
+
+    func testNativeTableContextMenuIncludesAxisDeletionWithoutReplacingTextActions() throws {
+        let view = CodeTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
+        var rowDeleted = false, columnDeleted = false
+        view.deleteTableRowAction = { rowDeleted = true }
+        view.deleteTableColumnAction = { columnDeleted = true }
+        let event = try XCTUnwrap(NSEvent.mouseEvent(with: .rightMouseDown, location: .zero, modifierFlags: [],
+            timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+        let menu = try XCTUnwrap(view.menu(for: event))
+        let row = try XCTUnwrap(menu.items.first { $0.action == #selector(CodeTextView.deleteTableRowFromMenu(_:)) })
+        let column = try XCTUnwrap(menu.items.first { $0.action == #selector(CodeTextView.deleteTableColumnFromMenu(_:)) })
+        XCTAssertTrue(row.target === view); XCTAssertTrue(column.target === view)
+        XCTAssertTrue(menu.items.contains { $0.action == #selector(NSText.paste(_:)) })
+        view.perform(try XCTUnwrap(row.action), with: row)
+        view.perform(try XCTUnwrap(column.action), with: column)
+        XCTAssertTrue(rowDeleted); XCTAssertTrue(columnDeleted)
+    }
+
+    func testDeleteArbitraryTableAxesPreservesCellsDimensionsAndPersistence() async throws {
+        let (_, store, model, _) = try await fixture()
+        let original = try XCTUnwrap(model.blocks.first)
+        model.insertSlashCommand(.table, in: original)
+        await model.flushAll()
+        let table = try XCTUnwrap(model.blocks.first)
+        model.changeTableCells([["甲", "乙", "丙"], ["1", "2", "3"], ["`literal`", "a|b", "余下"]], in: table)
+        model.changeTableLayout(TableLayout(columnWidths: [100, 200, 300], rowHeights: [40, 80, 120], cellsArePlain: true), in: table)
+        // Use the same stale view snapshot repeatedly; mutations must read live state.
+        model.deleteTableRow(1, in: table)
+        model.deleteTableColumn(1, in: table)
+        var current = try XCTUnwrap(model.blocks.first)
+        XCTAssertEqual(current.text, #"[["甲","丙"],["`literal`","余下"]]"#)
+        XCTAssertEqual(current.tableLayout.columnWidths, [100, 300])
+        XCTAssertEqual(current.tableLayout.rowHeights, [40, 120])
+        XCTAssertTrue(current.tableLayout.cellsArePlain)
+        model.deleteTableRow(-1, in: table); model.deleteTableColumn(99, in: table)
+        XCTAssertEqual(model.blocks.first, current)
+        model.deleteTableRow(0, in: table); model.deleteTableColumn(0, in: table)
+        current = try XCTUnwrap(model.blocks.first)
+        XCTAssertEqual(current.text, #"[["余下"]]"#)
+        XCTAssertEqual(current.tableLayout.columnWidths, [300])
+        XCTAssertEqual(current.tableLayout.rowHeights, [120])
+        model.deleteTableRow(0, in: table); model.deleteTableColumn(0, in: table)
+        XCTAssertEqual(model.blocks.first, current, "Keep at least one cell")
+        await model.flushAll()
+        let saved = try await store.blocks(in: current.pageID)
+        XCTAssertEqual(saved.first, current)
     }
 
     func testTableLiteralCharactersStayPlainAfterEditingResizeAndReopen() async throws {
@@ -1752,17 +2786,16 @@ final class EditorInteractionTests: XCTestCase {
     }
 
     func testHostedTableResizeUsesRealDragEventsAndPersistsBothAxes() async throws {
-        let (window, model, directory) = try await slashPopupFixture()
+        let (window, model, directory) = try await slashPopupFixture(command: "")
         defer { window.close(); try? FileManager.default.removeItem(at: directory) }
-        let text = try XCTUnwrap(window.firstResponder as? NSTextView)
-        let enter = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
-            timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: "\r",
-            charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
-        text.keyDown(with: enter)
-        for _ in 0..<200 where model.blocks.first?.kind != .table { try await Task.sleep(for: .milliseconds(5)) }
+        // This test exercises resize tracking, not popup focus. Build its table
+        // directly so another app gaining focus cannot cancel fixture setup.
+        model.insertSlashCommand(.table, in: try XCTUnwrap(model.blocks.first))
+        await model.flushAll()
         func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
         func grip(_ identifier: String) async throws -> TableResizeGripView {
             for _ in 0..<200 {
+                window.contentView?.layoutSubtreeIfNeeded()
                 if let root = window.contentView, let view = descendants(root).compactMap({ $0 as? TableResizeGripView }).first(where: { $0.identifier?.rawValue == identifier }) { return view }
                 try await Task.sleep(for: .milliseconds(5))
             }
@@ -1867,6 +2900,64 @@ final class EditorInteractionTests: XCTestCase {
         target.scrollWheel(with: event)
         try await Task.sleep(for: .milliseconds(150))
         XCTAssertNotEqual(outer.contentView.bounds.origin.y, before)
+    }
+
+    func testHostedBottomTableRepeatedScrollingSettlesWithoutHeightFeedback() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/BottomTable-" + UUID().uuidString)
+        let store = try SQLiteStore(databaseURL: directory.appendingPathComponent("fixture.sqlite"))
+        let page = try await store.createPage()
+        var previous: Block?
+        for index in 0..<8 {
+            let block = try await store.createBlock(pageID: page.id, kind: .paragraph, after: previous)
+            try await store.updateBlock(block.id, text: String(repeating: "滚动测试 \(index) 长正文\n", count: 20))
+            previous = block
+        }
+        let table = try await store.createBlock(pageID: page.id, kind: .table, after: previous)
+        let cells = (0..<8).map { row in (0..<4).map { "第\(row)行第\($0)列\n" + String(repeating: "多行内容\n", count: row == 7 ? 5 : 1) } }
+        let text = String(decoding: try JSONEncoder().encode(cells), as: UTF8.self)
+        try await store.updateBlock(table.id, text: text, tableLayout: TableLayout(cellsArePlain: true))
+        let model = WorkspaceModel(store: store)
+        await model.refreshPages(); model.select(page.id)
+        for _ in 0..<100 where model.blocks.count < 9 { try await Task.sleep(for: .milliseconds(5)) }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 600), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        let host = NSHostingView(rootView: PageEditorView(model: model, page: page))
+        window.contentView = host; window.orderFront(nil)
+        defer { window.close() }
+        try await Task.sleep(for: .milliseconds(150))
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        let router = try XCTUnwrap(descendants(host).compactMap { $0 as? DocumentScrollRoutingView }.first)
+        let outer = try XCTUnwrap(router.enclosingScrollView)
+        let document = try XCTUnwrap(outer.documentView)
+        let cg = try XCTUnwrap(CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: -120, wheel2: 0, wheel3: 0))
+        let wheel = try XCTUnwrap(NSEvent(cgEvent: cg))
+        var heights: [CGFloat] = []
+        for step in 0..<30 {
+            host.layoutSubtreeIfNeeded()
+            let bottom = max(0, document.bounds.height - outer.contentView.bounds.height)
+            outer.contentView.scroll(to: NSPoint(x: 0, y: document.isFlipped ? bottom : 0))
+            outer.reflectScrolledClipView(outer.contentView)
+            outer.scrollWheel(with: wheel)
+            try await Task.sleep(for: .milliseconds(40))
+            if step >= 20 { heights.append(document.bounds.height) }
+        }
+        XCTAssertLessThanOrEqual((heights.max() ?? 0) - (heights.min() ?? 0), 2)
+        XCTAssertTrue(descendants(host).compactMap { $0 as? CodeTextView }.contains { $0.string.contains("第7行") })
+        let rowEditor = try XCTUnwrap(descendants(host).compactMap { $0 as? CodeTextView }.first { $0.string.hasPrefix("第1行第0列") })
+        rowEditor.deleteTableRowFromMenu(nil)
+        try await Task.sleep(for: .milliseconds(100))
+        let updated = try XCTUnwrap(model.blocks.first { $0.id == table.id })
+        XCTAssertEqual(try JSONDecoder().decode([[String]].self, from: Data(updated.text.utf8)).count, 7)
+        for _ in 0..<10 {
+            let bottom = max(0, document.bounds.height - outer.contentView.bounds.height)
+            outer.contentView.scroll(to: NSPoint(x: 0, y: document.isFlipped ? bottom : 0))
+            outer.reflectScrolledClipView(outer.contentView)
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        let lastCell = try XCTUnwrap(descendants(host).compactMap { $0 as? CodeTextView }.first { $0.string.hasPrefix("第7行第0列") })
+        XCTAssertGreaterThan(try XCTUnwrap(lastCell.enclosingScrollView).frame.height, 80)
+        await model.flushAll()
     }
 
     func testEmptyBlocksHideControlsAndStructuralBlocksRemainUsable() {
@@ -2017,6 +3108,42 @@ final class EditorInteractionTests: XCTestCase {
         for _ in 0..<100 where model.blocks.count != blocks.count { try await Task.sleep(for: .milliseconds(5)) }
         XCTAssertEqual(model.blocks.count, blocks.count)
         return (directory, store, model, blocks)
+    }
+
+    func testDuplicateSelectionFlushesEditsPreservesTypesAndSelectsCopies() async throws {
+        let (_, store, model, original) = try await fixture()
+        model.changeText("尚未自动保存", in: model.blocks[0])
+        let ids: Set<UUID> = [original[0].id, original[1].id, original[3].id]
+        try await model.duplicateBlocks(ids)
+        XCTAssertEqual(model.blocks.count, original.count + ids.count)
+        let copies = model.blocks.filter { model.selectedBlockIDs.contains($0.id) }
+        XCTAssertEqual(copies.map(\.kind), [.paragraph, .code, .image])
+        XCTAssertEqual(copies.first?.text, "尚未自动保存")
+        XCTAssertTrue(model.selectedBlockIDs.isDisjoint(with: ids))
+        let saved = try await store.blocks(in: original[0].pageID)
+        XCTAssertEqual(saved, model.blocks)
+        let snapshot = model.blocks
+        do { try await model.duplicateBlocks([UUID()]); XCTFail("Stale selection must fail") } catch { }
+        let unchanged = try await store.blocks(in: original[0].pageID)
+        XCTAssertEqual(unchanged, snapshot)
+    }
+
+    func testBlockConversionProtectsStructuredPayloads() async throws {
+        let (_, _, model, _) = try await fixture()
+        let code = model.blocks[1]
+        model.changeKind(.table, of: code)
+        XCTAssertEqual(model.blocks[1], code)
+        for source in BlockKind.allCases {
+            for target in BlockKind.allCases {
+                XCTAssertEqual(source.canConvert(to: target), source == target ||
+                    (source.supportsProseConversion && target.supportsProseConversion) || (source == .code && target == .paragraph))
+            }
+        }
+        let paragraph = model.blocks[0]
+        model.changeKind(.quote, of: paragraph)
+        XCTAssertEqual(model.blocks[0].kind, .quote)
+        XCTAssertEqual(model.blocks[0].text, paragraph.text)
+        await model.flushAll()
     }
 
     func testUnchangedTextDoesNotStartAutosave() async throws {
@@ -2186,6 +3313,9 @@ final class EditorInteractionTests: XCTestCase {
         XCTAssertNotNil(router.route(down))
         // NSTextView's completion hands its final pointer position to the page.
         router.finishNativeTracking(at: endpoint)
+        // Finish our synthetic gesture explicitly. The user may be holding the
+        // real mouse button while these hosted tests run on the desktop.
+        _ = router.route(try event(.leftMouseUp, point: endpoint))
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(model.selectedBlockIDs, Set(model.blocks.map(\.id)))
         XCTAssertFalse(router.selectingBlocks)

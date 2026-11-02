@@ -43,35 +43,57 @@ enum ImageSource {
         guard (try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= maximumBytes else { throw AppError.message(L10n.tr("图片文件不能超过 12 MB")) }
         return try embedded(Data(contentsOf: url))
     }
-    static func thumbnail(_ value: String) -> NSImage? {
+    static func thumbnail(_ value: String, maximumPixels: Int = 1200) -> NSImage? {
         guard let split = value.range(of: ";base64,"), let data = Data(base64Encoded: String(value[split.upperBound...])),
               let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 1200, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) else { return nil }
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: maximumPixels, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) else { return nil }
         return NSImage(cgImage: image, size: .zero)
+    }
+}
+
+/// Give the image its own fitted bounds, rather than a full-width empty frame.
+struct ImageDisplayLayout: Layout {
+    var preferredWidth: Double? = nil
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let image = subviews.first else { return .zero }
+        let natural = image.sizeThatFits(.unspecified)
+        guard natural.width > 0, natural.height > 0, natural.width.isFinite, natural.height.isFinite else { return .zero }
+        let available = max(1, proposal.width ?? 640)
+        let scale: CGFloat
+        if let width = ImageSizing.width(preferredWidth) {
+            scale = min(available, CGFloat(width)) / natural.width
+        } else {
+            scale = min(1, min(640, available) / natural.width, 420 / natural.height)
+        }
+        return CGSize(width: natural.width * scale, height: natural.height * scale)
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, anchor: .topLeading,
+                             proposal: ProposedViewSize(width: bounds.width, height: bounds.height))
     }
 }
 
 struct MediaImageView: View {
     let source: String
+    var preferredWidth: Double? = nil
     @State private var local: NSImage?
     @State private var loaded = false
     var body: some View {
         Group {
             if source.hasPrefix("data:image/") {
-                if let local { Image(nsImage: local).resizable().scaledToFit() }
+                if let local { ImageDisplayLayout(preferredWidth: preferredWidth) { Image(nsImage: local).resizable().scaledToFit() } }
                 else if loaded { Label(L10n.tr("本地图片数据无法读取，请重新选择"), systemImage: "exclamationmark.triangle") }
                 else { ProgressView() }
             } else if let url = URL(string: source), ["https", "http"].contains(url.scheme?.lowercased() ?? "") {
                 AsyncImage(url: url) { phase in
                     switch phase {
-                    case .success(let image): image.resizable().scaledToFit()
+                    case .success(let image): ImageDisplayLayout(preferredWidth: preferredWidth) { image.resizable().scaledToFit() }
                     case .failure: Label(L10n.tr("图片无法加载，请检查 URL、网络或访问权限"), systemImage: "exclamationmark.triangle").foregroundStyle(.secondary)
                     default: ProgressView()
                     }
                 }
             } else { Label(L10n.tr("尚未选择图片"), systemImage: "photo").foregroundStyle(.secondary) }
         }
-        .frame(maxWidth: .infinity, maxHeight: 360, alignment: .leading)
         .task(id: source) { loaded = false; local = source.hasPrefix("data:image/") ? ImageSource.thumbnail(source) : nil; loaded = true }
     }
 }
@@ -170,5 +192,68 @@ struct MediaSourcePicker: View {
                     .disabled(source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }.padding(24).frame(width: 480)
+    }
+}
+
+struct ImageZoomPreview: View {
+    let source: String
+    @Environment(\.dismiss) private var dismiss
+    @State private var image: NSImage?
+    @State private var failure = false
+    @State private var zoom: Double? = nil
+
+    var body: some View {
+        GeometryReader { viewport in
+            let natural = image?.size ?? CGSize(width: 1, height: 1)
+            let fit = min(max(1, viewport.size.width - 40) / max(1, natural.width),
+                          max(1, viewport.size.height - 90) / max(1, natural.height), 1)
+            let scale = zoom ?? fit
+            VStack(spacing: 0) {
+                HStack(spacing: 12) {
+                    Text(L10n.tr("图片预览")).fontWeight(.medium)
+                    Spacer()
+                    Button { zoom = max(0.05, scale / 1.25) } label: { Image(systemName: "minus.magnifyingglass") }
+                        .accessibilityLabel(L10n.tr("缩小"))
+                    Slider(value: Binding(get: { scale }, set: { zoom = $0 }), in: 0.05...4)
+                        .frame(width: 140).accessibilityLabel(L10n.tr("缩放比例"))
+                    Button { zoom = min(4, scale * 1.25) } label: { Image(systemName: "plus.magnifyingglass") }
+                        .accessibilityLabel(L10n.tr("放大"))
+                    Text("\(Int(scale * 100))%").monospacedDigit().frame(width: 52)
+                    Button(L10n.tr("适合窗口")) { zoom = nil }
+                    Button("100%") { zoom = 1 }
+                    Button(L10n.tr("关闭")) { dismiss() }.keyboardShortcut(.cancelAction)
+                }.buttonStyle(.borderless).padding(16)
+                Divider()
+                if let image {
+                    ScrollView([.horizontal, .vertical]) {
+                        Image(nsImage: image).resizable()
+                            .frame(width: max(1, natural.width * scale), height: max(1, natural.height * scale))
+                            .padding(20)
+                            .frame(minWidth: viewport.size.width, minHeight: max(1, viewport.size.height - 65))
+                    }
+                } else if failure {
+                    Text(L10n.tr("图片无法加载，请检查 URL、网络或访问权限")).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else { ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity) }
+            }
+        }
+        .frame(minWidth: 680, idealWidth: 960, minHeight: 480, idealHeight: 720)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .task(id: source) {
+            image = nil; failure = false; zoom = nil
+            if source.hasPrefix("data:image/") {
+                image = ImageSource.thumbnail(source, maximumPixels: 4096)
+            } else if let url = URL(string: source), ["https", "http"].contains(url.scheme?.lowercased() ?? "") {
+                do {
+                    let (data, response) = try await URLSession.shared.data(from: url)
+                    guard !Task.isCancelled else { return }
+                    if data.count <= ImageSource.maximumBytes,
+                       (response as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true {
+                        image = ImageSource.thumbnail("data:image/png;base64," + data.base64EncodedString(), maximumPixels: 4096)
+                    }
+                } catch { if Task.isCancelled { return } }
+            }
+            failure = image == nil
+        }
     }
 }

@@ -53,10 +53,11 @@ enum DOCXTransfer {
             }.joined()
             return "<w:p><w:pPr><w:pStyle w:val=\"\(style)\"/></w:pPr>\(runs)</w:p>"
         }
-        for page in try document.orderedPages() {
+        for page in try document.expandingImageCards().orderedPages() {
             if page.parentID != nil { body += paragraph(document.path(for: page), style: "Caption") }
             if !page.title.isEmpty { body += paragraph(page.title, style: "Title") }
-            for block in page.blocks {
+            let numbers = ListNumbering.numbers(page.blocks)
+            for (blockIndex, block) in page.blocks.enumerated() {
                 switch block.kind {
                 case .heading: body += paragraph(block.text, style: "Heading1", formatting: block.formatting)
                 case .heading2: body += paragraph(block.text, style: "Heading2", formatting: block.formatting)
@@ -65,7 +66,7 @@ enum DOCXTransfer {
                 case .code: body += paragraph(block.text, style: "Code", formatting: block.formatting)
                 case .todo: body += paragraph((block.checked ? "☑ " : "☐ ") + block.text)
                 case .bullet: body += paragraph("• " + block.text)
-                case .numbered: body += paragraph("1. " + block.text)
+                case .numbered: body += paragraph("\(numbers[blockIndex]). " + block.text)
                 case .quote, .callout: body += paragraph(block.text, style: "Quote")
                 case .divider: body += paragraph("────────────────────")
                 case .image:

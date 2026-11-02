@@ -11,15 +11,24 @@ enum RichTextFormatting {
         guard color != .labelColor, color != .textColor, let rgb = color.usingColorSpace(.deviceRGB) else { return nil }
         return String(format: "%02X%02X%02X", Int((rgb.redComponent * 255).rounded()), Int((rgb.greenComponent * 255).rounded()), Int((rgb.blueComponent * 255).rounded()))
     }
+    static func hasDefaultCodeBackground(_ attributes: [NSAttributedString.Key: Any]) -> Bool {
+        attributes[NSAttributedString.Key("VeloraDefaultCodeBackground")] as? Bool == true
+            && (attributes[.backgroundColor] as? NSColor)?.isEqual(NSColor.quaternaryLabelColor.withAlphaComponent(0.12)) == true
+    }
     static func attributes(_ style: InlineTextStyle, base: NSFont) -> [NSAttributedString.Key: Any] {
         let size = CGFloat(min(96, max(8, style.fontSize ?? Double(base.pointSize))))
-        var font = style.fontFamily.flatMap { NSFont(name: $0, size: size) } ?? NSFontManager.shared.convert(base, toSize: size)
+        let defaultCodeFont = style.code && style.fontFamily == nil
+        var font = style.fontFamily.flatMap { NSFont(name: $0, size: size) }
+            ?? (defaultCodeFont ? NSFont.monospacedSystemFont(ofSize: size, weight: .regular) : NSFontManager.shared.convert(base, toSize: size))
         let baseTraits = NSFontManager.shared.traits(of: base)
         let bold = style.bold ?? baseTraits.contains(.boldFontMask)
         let italic = style.italic ?? baseTraits.contains(.italicFontMask)
         font = NSFontManager.shared.convert(font, toHaveTrait: bold ? .boldFontMask : .unboldFontMask)
         font = NSFontManager.shared.convert(font, toHaveTrait: italic ? .italicFontMask : .unitalicFontMask)
-        var attributes: [NSAttributedString.Key: Any] = [.font: font, NSAttributedString.Key("VeloraInlineCode"): style.code]
+        var attributes: [NSAttributedString.Key: Any] = [.font: font, NSAttributedString.Key("VeloraInlineCode"): style.code,
+            NSAttributedString.Key("VeloraDefaultCodeFont"): defaultCodeFont,
+            NSAttributedString.Key("VeloraDefaultCodeBackground"): style.code && style.highlight == nil]
+        if style.code { attributes[.backgroundColor] = NSColor.quaternaryLabelColor.withAlphaComponent(0.12) }
         if let italic = style.italic { attributes[.obliqueness] = italic && !NSFontManager.shared.traits(of: font).contains(.italicFontMask) ? 0.18 : 0.0 }
         attributes[.underlineStyle] = style.underline ? NSUnderlineStyle.single.rawValue : 0
         attributes[.strikethroughStyle] = style.strikethrough ? NSUnderlineStyle.single.rawValue : 0
@@ -41,7 +50,9 @@ enum RichTextFormatting {
             var style = InlineTextStyle()
             style.code = attrs[NSAttributedString.Key("VeloraInlineCode")] as? Bool ?? false
             style.link = (attrs[.link] as? URL)?.absoluteString ?? (attrs[.link] as? String)
-            if font.familyName != base.familyName { style.fontFamily = font.familyName ?? font.fontName }
+            let defaultCodeFont = style.code && attrs[NSAttributedString.Key("VeloraDefaultCodeFont")] as? Bool == true
+                && font.familyName == NSFont.monospacedSystemFont(ofSize: font.pointSize, weight: .regular).familyName
+            if !defaultCodeFont, font.familyName != base.familyName { style.fontFamily = font.familyName ?? font.fontName }
             if abs(font.pointSize - base.pointSize) > 0.1 { style.fontSize = Double(font.pointSize) }
             if traits.contains(.boldFontMask) != baseTraits.contains(.boldFontMask) { style.bold = traits.contains(.boldFontMask) }
             let italic = traits.contains(.italicFontMask) || ((attrs[.obliqueness] as? NSNumber)?.doubleValue ?? 0) > 0
@@ -49,7 +60,7 @@ enum RichTextFormatting {
             style.underline = (attrs[.underlineStyle] as? NSNumber)?.intValue ?? 0 != 0
             style.strikethrough = (attrs[.strikethroughStyle] as? NSNumber)?.intValue ?? 0 != 0
             style.color = (attrs[.foregroundColor] as? NSColor).flatMap(hex)
-            style.highlight = (attrs[.backgroundColor] as? NSColor).flatMap(hex)
+            if !hasDefaultCodeBackground(attrs) { style.highlight = (attrs[.backgroundColor] as? NSColor).flatMap(hex) }
             if !style.isEmpty { result.append(TextStyleRun(location: range.location, length: range.length, style: style)) }
         }
         return result
@@ -86,7 +97,7 @@ final class TextStyleClipboard: ObservableObject {
         copied.underline = (attributes[.underlineStyle] as? NSNumber)?.intValue ?? 0 != 0
         copied.strikethrough = (attributes[.strikethroughStyle] as? NSNumber)?.intValue ?? 0 != 0
         copied.color = (attributes[.foregroundColor] as? NSColor).flatMap(RichTextFormatting.hex)
-        copied.highlight = (attributes[.backgroundColor] as? NSColor).flatMap(RichTextFormatting.hex)
+        copied.highlight = RichTextFormatting.hasDefaultCodeBackground(attributes) ? nil : (attributes[.backgroundColor] as? NSColor).flatMap(RichTextFormatting.hex)
         guard let data = try? JSONEncoder().encode(copied) else { return }
         pasteboard.clearContents()
         guard pasteboard.setData(data, forType: Self.type) else { return }

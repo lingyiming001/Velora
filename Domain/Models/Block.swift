@@ -2,14 +2,14 @@ import Foundation
 
 enum BlockKind: String, CaseIterable, Identifiable, Sendable, Codable {
     case paragraph, heading, heading2, heading3, bullet, numbered, todo, toggle, quote, callout, divider
-    case image, video, audio, file, bookmark, pdfDocument
+    case image, imageCard, video, audio, file, bookmark, pdfDocument
     case code, table, tableOfContents, equation, markdown, warning, success
 
     var id: String { rawValue }
     static var categories: [String] { [L10n.text("基础块"), L10n.text("媒体与链接"), L10n.text("进阶块")] }
     var category: String {
         switch self {
-        case .image, .video, .audio, .file, .bookmark, .pdfDocument: L10n.tr("媒体与链接")
+        case .image, .imageCard, .video, .audio, .file, .bookmark, .pdfDocument: L10n.tr("媒体与链接")
         case .code, .table, .tableOfContents, .equation, .markdown: L10n.tr("进阶块")
         default: L10n.tr("基础块")
         }
@@ -28,6 +28,7 @@ enum BlockKind: String, CaseIterable, Identifiable, Sendable, Codable {
         case .callout: L10n.tr("提示块")
         case .divider: L10n.tr("分割线")
         case .pdfDocument: L10n.tr("PDF 文档")
+        case .imageCard: L10n.tr("图文卡片")
         case .image: L10n.tr("图片")
         case .video: L10n.tr("视频")
         case .audio: L10n.tr("音频")
@@ -54,6 +55,7 @@ enum BlockKind: String, CaseIterable, Identifiable, Sendable, Codable {
         case .callout: "lightbulb"
         case .divider: "minus"
         case .pdfDocument: "doc.richtext"
+        case .imageCard: "rectangle.split.2x1"
         case .image: "photo"
         case .video: "video"
         case .audio: "waveform"
@@ -68,6 +70,24 @@ enum BlockKind: String, CaseIterable, Identifiable, Sendable, Codable {
         case .tableOfContents: "list.bullet.indent"
         }
     }
+    /// Logical paragraphs and list items split on Return; visual wrapping is unchanged.
+    var returnSplitsBlock: Bool {
+        self == .paragraph || isHeading || [.bullet, .numbered, .todo].contains(self)
+    }
+    var exitsOnTrailingEmptyLine: Bool {
+        [.quote, .callout, .warning, .success, .toggle].contains(self)
+    }
+    /// Only prose types share the same body semantics. Structured payloads must
+    /// never be reinterpreted as table JSON, URLs or source code by a type menu.
+    var supportsProseConversion: Bool {
+        [.paragraph, .heading, .heading2, .heading3, .bullet, .numbered,
+         .todo, .toggle, .quote, .callout, .warning, .success].contains(self)
+    }
+    func canConvert(to target: BlockKind) -> Bool {
+        self == target || (supportsProseConversion && target.supportsProseConversion)
+            || (self == .code && target == .paragraph)
+    }
+
     var isCallout: Bool { [.callout, .warning, .success].contains(self) }
     var isHeading: Bool { [.heading, .heading2, .heading3].contains(self) }
     var isMedia: Bool { [.image, .video, .audio, .file, .bookmark].contains(self) }
@@ -103,6 +123,7 @@ enum BlockKind: String, CaseIterable, Identifiable, Sendable, Codable {
         case .quote: aliases = ["blockquote"]
         case .callout: aliases = ["tip", "note"]
         case .divider: aliases = ["hr", "line"]
+        case .imageCard: aliases = ["imagecard", "card"]
         case .image: aliases = ["img", "picture"]
         case .video: aliases = ["movie"]
         case .audio: aliases = ["sound"]
@@ -121,7 +142,7 @@ enum BlockKind: String, CaseIterable, Identifiable, Sendable, Codable {
     }
 
     var initialText: String { self == .table ? "[[\"\",\"\"],[\"\",\"\"]]" : "" }
-    var acceptsTextInput: Bool { ![.table, .divider, .image, .pdfDocument, .tableOfContents].contains(self) }
+    var acceptsTextInput: Bool { ![.table, .divider, .image, .imageCard, .pdfDocument, .tableOfContents].contains(self) }
 
     var placeholder: String {
         if isMedia { return L10n.tr("粘贴 https:// 链接") }
@@ -171,6 +192,8 @@ struct Block: Identifiable, Hashable, Sendable {
     var collapsed: Bool = false
     var formatting: [TextStyleRun] = []
     var tableLayout = TableLayout()
+    var imageWidth: Double? = nil
+    var listStart: Int? = nil
 
     var hasContent: Bool {
         if kind == .divider || kind == .tableOfContents { return true }
@@ -179,5 +202,59 @@ struct Block: Identifiable, Hashable, Sendable {
             return rows.joined().contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         }
         return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+enum ImageSizing {
+    static func width(_ value: Double?) -> Double? {
+        guard let value, value.isFinite else { return nil }
+        return min(2400, max(80, value)).rounded()
+    }
+}
+
+/// An explicit start survives intervening prose; nil continues an adjacent list.
+enum ListNumbering {
+    static func start(_ value: Int?) -> Int? {
+        guard let value, value >= 0 else { return nil }
+        return min(value, 1_000_000_000)
+    }
+    static func advance(kind: BlockKind, start: Int?, counter: inout Int) -> Int {
+        if kind == .numbered { counter = self.start(start) ?? min(counter + 1, 1_000_000_000) }
+        else { counter = 0 }
+        return kind == .numbered ? counter : 1
+    }
+    static func numbers(_ blocks: [TransferBlock]) -> [Int] {
+        var counter = 0
+        return blocks.map { advance(kind: $0.kind, start: $0.listStart, counter: &counter) }
+    }
+}
+
+
+struct ImageTextCard: Codable, Equatable, Sendable {
+    var image: String
+    var title: String
+    var body: String
+    var caption: String
+    static func decode(_ text: String) -> ImageTextCard? {
+        guard let data = text.data(using: .utf8), let card = try? JSONDecoder().decode(Self.self, from: data),
+              (try? ImageSource.validated(card.image)) != nil else { return nil }
+        return card
+    }
+    var encoded: String {
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        return String(decoding: (try? encoder.encode(self)) ?? Data(), as: UTF8.self)
+    }
+    var expanded: [TransferBlock] { [TransferBlock(.image, image, imageWidth: 80), TransferBlock(.heading3, title), TransferBlock(.paragraph, body), TransferBlock(.paragraph, caption)].filter { !$0.text.isEmpty } }
+}
+
+extension TransferDocument {
+    func expandingImageCards() -> TransferDocument {
+        var result = self
+        for index in result.pages.indices {
+            result.pages[index].blocks = result.pages[index].blocks.flatMap { block in
+                block.kind == .imageCard ? (ImageTextCard.decode(block.text)?.expanded ?? [TransferBlock(.paragraph, "[图文卡片无法读取]")]) : [block]
+            }
+        }
+        return result
     }
 }

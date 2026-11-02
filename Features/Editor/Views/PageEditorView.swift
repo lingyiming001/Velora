@@ -15,26 +15,41 @@ struct EditorRowSnapshot: Identifiable, Equatable {
     let headings: [Block]
     let contentRevision: UInt64
     let codeLineCount: Int
+    let tableCells: [[String]]
+    let findMatches: [DocumentFindMatch]
+    let currentFindMatch: DocumentFindMatch?
 
-    static func make(blocks: [Block], selection: Set<UUID>, focus: EditorFocusRequest?, revisions: [UUID: UInt64] = [:]) -> [Self] {
+    static func make(blocks: [Block], selection: Set<UUID>, focus: EditorFocusRequest?, revisions: [UUID: UInt64] = [:], findMatches: [DocumentFindMatch] = [], currentFindMatch: DocumentFindMatch? = nil) -> [Self] {
         let headings = blocks.filter { $0.kind.isHeading }
+        let findByBlock = Dictionary(grouping: findMatches, by: \.blockID)
         var number = 0
         return blocks.enumerated().map { index, block in
-            number = block.kind == .numbered ? number + 1 : 0
+            let displayNumber = ListNumbering.advance(kind: block.kind, start: block.listStart, counter: &number)
             return Self(block: block, selected: selection.contains(block.id), onlyBlock: blocks.count == 1,
                         first: index == 0, last: index == blocks.count - 1,
                         focusRequest: focus?.blockID == block.id ? focus : nil,
-                        number: block.kind == .numbered ? number : 1,
+                        number: displayNumber,
                         headings: block.kind == .tableOfContents ? headings : [], contentRevision: revisions[block.id] ?? 0,
-                        codeLineCount: block.kind == .code && !block.text.isEmpty ? block.text.utf8.reduce(1) { $1 == 10 ? $0 + 1 : $0 } : 0)
+                        codeLineCount: block.kind == .code && !block.text.isEmpty ? block.text.utf8.reduce(1) { $1 == 10 ? $0 + 1 : $0 } : 0,
+                        tableCells: block.kind == .table ? tableCells(for: block) : [],
+                        findMatches: findByBlock[block.id] ?? [], currentFindMatch: currentFindMatch?.blockID == block.id ? currentFindMatch : nil)
         }
     }
+    private static func tableCells(for block: Block) -> [[String]] {
+        if let rows = try? JSONDecoder().decode([[String]].self, from: Data(block.text.utf8)),
+           !rows.isEmpty, let columns = rows.first?.count, columns > 0,
+           rows.allSatisfy({ $0.count == columns }) {
+            return rows.map { $0.map { TableCellContent.visible($0, layout: block.tableLayout) } }
+        }
+        return [[block.text, ""], ["", ""]]
+    }
+
 }
 
 enum SlashCommandMenu {
     static func matches(_ source: String) -> [BlockKind] {
         let query = String(source.dropFirst()).trimmingCharacters(in: .whitespaces).lowercased()
-        let matches = BlockKind.allCases.filter {
+        let matches = BlockKind.allCases.filter { $0 != .imageCard }.filter {
             query.isEmpty || $0.label.localizedCaseInsensitiveContains(query) || $0.rawValue.lowercased().contains(query) || $0.category.contains(query) || $0.hint.localizedCaseInsensitiveContains(query) || $0.slashAliases.contains(where: { $0.contains(query) })
         }
         // Exact commands win over related names such as tableOfContents.
@@ -65,13 +80,6 @@ struct NativeMediaPlayer: NSViewRepresentable {
     }
 }
 
-private struct TableCellHeightKey: PreferenceKey {
-    static let defaultValue: [Int: CGFloat] = [:]
-    static func reduce(value: inout [Int: CGFloat], nextValue: () -> [Int: CGFloat]) {
-        value.merge(nextValue(), uniquingKeysWith: max)
-    }
-}
-
 private enum EditorLayout {
     static let controlsWidth: CGFloat = 50
     static let controlsSpacing: CGFloat = 8
@@ -82,18 +90,34 @@ private struct TableCellEditor: View {
     let text: String
     let placeholder: String
     let header: Bool
+    let onDeleteRow: (() -> Void)?
+    let onDeleteColumn: (() -> Void)?
+    let onFind: (DocumentFindAction) -> Void
+    let findRanges: [NSRange]
+    let currentFindRange: NSRange?
+    let contentRevision: UInt64
     let focusRequest: EditorFocusRequest?
     let isFocusRequestCurrent: (UUID) -> Bool
     let onChange: (String) -> Void
     let onExit: () -> Void
+    let onFocus: (Bool) -> Void
+    let onContentHeightChange: (CGFloat) -> Void
     @State private var height: CGFloat = 28
 
     var body: some View {
         ZStack(alignment: .topLeading) {
             NativeTextEditor(text: text, font: .systemFont(ofSize: 13, weight: header ? .semibold : .regular),
+                             onDeleteTableRow: onDeleteRow, onDeleteTableColumn: onDeleteColumn,
+                             onDocumentFind: onFind, findRanges: findRanges, currentFindRange: currentFindRange,
                              focusRequest: focusRequest, isFocusRequestCurrent: isFocusRequestCurrent,
+                             contentRevision: contentRevision,
                              onExitBlock: { onExit(); return true },
-                             onHeightChange: { if abs(height - $0) > 1 { height = $0 } }, onChange: onChange)
+                             onFocus: onFocus,
+                             onHeightChange: {
+                                 if abs(height - $0) > 1 { height = $0 }
+                                 onContentHeightChange($0)
+                             }, onChange: onChange)
+                .focusEffectDisabled()
                 .frame(height: max(28, height))
             if text.isEmpty {
                 Text(placeholder).font(.system(size: 13, weight: header ? .semibold : .regular))
@@ -106,6 +130,7 @@ private struct TableCellEditor: View {
 struct PageEditorView: View {
     @ObservedObject var model: WorkspaceModel
     let page: Page
+    @FocusState private var titleFocused: Bool
     @AppStorage("editorWidePage") private var widePage = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -116,10 +141,15 @@ struct PageEditorView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 6) {
                     Color.clear.frame(height: 1).id("document-top")
-                    TextField(L10n.tr("未命名"), text: Binding(get: { model.selectedPage?.title ?? page.title }, set: model.renameSelectedPage))
+                    TextField(L10n.tr("未命名"), text: Binding(get: { model.selectedPage?.title ?? page.title }, set: model.renameSelectedPage), axis: .vertical)
                         .textFieldStyle(.plain)
                         .font(.system(size: 40, weight: .bold, design: .default))
                         .accessibilityLabel(L10n.tr("页面标题"))
+                        .focused($titleFocused)
+                        .onChange(of: titleFocused) { _, focused in if focused { model.beginTitleEditing() } }
+                        .contextMenu {
+                            Button(L10n.tr("复制标题")) { ClipboardDocument.copyTitle(model.selectedPage?.title ?? page.title) }
+                        }
                         .onSubmit {
                             if let first = model.blocks.first(where: { $0.kind.acceptsTextInput && !$0.collapsed }) {
                                 model.requestFocus(first.id, offset: 0)
@@ -127,9 +157,11 @@ struct PageEditorView: View {
                         }
                         .padding(.leading, EditorLayout.contentInset)
                         .padding(.bottom, 16)
+                        .background(model.documentFindMatches.contains(where: { $0.blockID == nil }) ? Color.yellow.opacity(0.2) : .clear)
 
                     ForEach(EditorRowSnapshot.make(blocks: model.blocks, selection: model.selectedBlockIDs,
-                                                   focus: model.editorFocusRequest, revisions: model.editorContentRevisions)) { snapshot in
+                                                   focus: model.editorFocusRequest, revisions: model.editorContentRevisions,
+                                                   findMatches: model.documentFindMatches, currentFindMatch: model.currentDocumentFindMatch)) { snapshot in
                         EditorBlockRow(model: model, snapshot: snapshot, availableWidth: documentWidth, scrollTo: { id in
                             withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) { proxy.scrollTo(id, anchor: .top) }
                         }).equatable().id(snapshot.id)
@@ -171,36 +203,49 @@ struct PageEditorView: View {
             }
             .scrollIndicators(.visible)
             .background(Color(nsColor: .textBackgroundColor))
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if model.documentFindPresented { DocumentFindBar(model: model) }
+            }
             .navigationTitle(page.title.isEmpty ? L10n.tr("未命名") : page.title)
             .toolbar {
-                ToolbarItem(placement: .primaryAction) {
+                ToolbarItem(placement: .navigation) {
+                    HStack(spacing: 2) {
                     Menu {
                         ForEach(BlockKind.categories, id: \.self) { category in
                             Section(category) {
-                                ForEach(BlockKind.allCases.filter { $0.category == category }) { kind in
+                                ForEach(BlockKind.allCases.filter { $0 != .imageCard }.filter { $0.category == category }) { kind in
                                     Button { model.addBlock(kind) } label: { Label(kind.label, systemImage: kind.symbol) }
+                                        .labelStyle(.titleAndIcon)
                                 }
                             }
                         }
-                    } label: { Label(L10n.tr("插入块"), systemImage: "plus.square") }
+                    } label: { Label(L10n.tr("插入块"), systemImage: "plus") }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden)
+                    .frame(width: 28, height: 28)
+                    .accessibilityLabel(L10n.tr("插入块"))
                     .help(L10n.tr("插入块，也可输入 / 搜索"))
-                }
-                ToolbarItem(placement: .primaryAction) {
                     Button { widePage.toggle() } label: {
-                        Label(widePage ? L10n.tr("阅读宽度") : L10n.tr("全宽页面"), systemImage: widePage ? "arrow.right.and.line.vertical.and.arrow.left" : "arrow.left.and.right")
-                    }.help(widePage ? L10n.tr("切换为阅读宽度") : L10n.tr("切换为全宽页面"))
-                }
-                ToolbarItem(placement: .primaryAction) {
+                        Label(widePage ? L10n.tr("阅读宽度") : L10n.tr("全宽页面"), systemImage: widePage ? "rectangle.center.inset.filled" : "rectangle")
+                    }.frame(width: 28, height: 28)
+                    .accessibilityLabel(widePage ? L10n.tr("阅读宽度") : L10n.tr("全宽页面"))
+                    .help(widePage ? L10n.tr("切换为阅读宽度") : L10n.tr("切换为全宽页面"))
                     Menu {
+                        Button(L10n.tr("在文档中查找…")) { model.performDocumentFind(.show) }
+                        Divider()
                         Button(L10n.tr("跳到文档开头  ⌘↑")) { model.jumpToDocumentBoundary(atStart: true) }
                         Button(L10n.tr("跳到文档末尾  ⌘↓")) { model.jumpToDocumentBoundary(atStart: false) }
                         Divider()
+                        Button(L10n.tr("将本页网络图片转为本地")) { model.localizePageImages() }
+                            .disabled(model.automationBusy || !model.blocks.contains { $0.kind == .image && ($0.text.hasPrefix("http://") || $0.text.hasPrefix("https://")) })
+                        Divider()
                         Button(L10n.tr("全选内容  ⌘A")) { model.selectAllBlocks() }
                     } label: { Label(L10n.tr("文档导航"), systemImage: "arrow.up.arrow.down") }
-                }
-                ToolbarItem(placement: .status) {
-                    Text(model.saving ? L10n.tr("正在保存…") : L10n.tr("已保存"))
-                        .font(.caption).foregroundStyle(.tertiary)
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden)
+                    .frame(width: 28, height: 28).accessibilityLabel(L10n.tr("文档导航"))
+                    }
+                    .labelStyle(.iconOnly).buttonStyle(.plain).controlSize(.small)
+                    .font(.system(size: 14, weight: .medium)).foregroundStyle(.secondary).tint(.primary)
+                    .padding(.horizontal, 4)
                 }
             }
             .background(DocumentKeyboardCapture(selected: !model.selectedBlockIDs.isEmpty,
@@ -214,6 +259,10 @@ struct PageEditorView: View {
                         Text(L10n.tr("↩ 下方继续 · Shift 范围选择 · ⌘A 全选 · Esc 取消")).foregroundStyle(.secondary).font(.caption)
                         Spacer()
                         Button(L10n.tr("复制所选内容")) { model.copySelectedBlocks() }
+                        Button(L10n.tr("创建所选块副本")) {
+                            let ids = model.selectedBlockIDs
+                            Task { do { try await model.duplicateBlocks(ids) } catch { model.errorMessage = error.localizedDescription } }
+                        }.disabled(model.automationBusy)
                         Button(L10n.tr("取消选择")) { model.clearBlockSelection() }
                         Button(L10n.tr("删除所选内容"), role: .destructive) { deleteSelection() }
                     }.padding(12).background(.bar)
@@ -226,12 +275,92 @@ struct PageEditorView: View {
                 guard let request = model.documentBoundaryRequest else { return }
                 withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) { proxy.scrollTo(request.atStart ? "document-top" : "document-bottom", anchor: request.atStart ? .top : .bottom) }
             }
+            .onChange(of: model.currentDocumentFindMatch) { _, match in
+                guard let match else { return }
+                if let id = match.blockID {
+                    if let block = model.blocks.first(where: { $0.id == id }), block.collapsed {
+                        model.setBlockOptions(for: block, collapsed: false)
+                    }
+                    proxy.scrollTo(id, anchor: .center)
+                } else { proxy.scrollTo("document-top", anchor: .top) }
+            }
             .onDisappear { Task { await model.flushAll() } }
         }
         }
     }
     private func deleteSelection() {
         Task { do { try await model.deleteSelectedBlocks() } catch { model.errorMessage = error.localizedDescription } }
+    }
+}
+
+private struct DocumentFindBar: View {
+    @ObservedObject var model: WorkspaceModel
+    @FocusState private var focused: Bool
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+        HStack(spacing: 4) {
+            Button { model.documentReplacePresented.toggle() } label: {
+                Image(systemName: model.documentReplacePresented ? "chevron.down" : "chevron.right").font(.system(size: 10, weight: .semibold)).frame(width: 20, height: 28)
+            }.help(L10n.tr("显示或隐藏替换"))
+            HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            TextField(L10n.tr("在本文档中查找"), text: $model.documentFindQuery)
+                .textFieldStyle(.plain).focusEffectDisabled().focused($focused)
+                .accessibilityLabel(L10n.tr("在本文档中查找"))
+                .onKeyPress(keys: [.return], phases: .down) { key in
+                    model.performDocumentFind(key.modifiers.contains(.shift) ? .previous : .next)
+                    return .handled
+                }
+            Text(model.documentFindQuery.isEmpty ? "" : model.documentFindMatches.isEmpty ? L10n.tr("无匹配项") : "\(model.documentFindIndex + 1) / \(model.documentFindMatches.count)")
+                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                .fixedSize()
+                .accessibilityLabel(L10n.tr("查找结果"))
+            }
+            .padding(.horizontal, 8).frame(height: 30)
+            .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 6))
+            Button { model.performDocumentFind(.previous) } label: { Image(systemName: "chevron.up").font(.system(size: 11, weight: .medium)).frame(width: 26, height: 28) }
+                .help(L10n.tr("上一个匹配项") + " ⇧⌘G").disabled(model.documentFindMatches.isEmpty)
+            Button { model.performDocumentFind(.next) } label: { Image(systemName: "chevron.down").font(.system(size: 11, weight: .medium)).frame(width: 26, height: 28) }
+                .help(L10n.tr("下一个匹配项") + " ⌘G").disabled(model.documentFindMatches.isEmpty)
+            Divider().frame(height: 14).padding(.horizontal, 3)
+            Button { model.closeDocumentFind() } label: { Image(systemName: "xmark").font(.system(size: 11, weight: .medium)).frame(width: 26, height: 28) }
+                .help(L10n.tr("关闭查找") + " Esc").keyboardShortcut(.cancelAction)
+        }
+        if model.documentReplacePresented {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.turn.down.right").foregroundStyle(.secondary).frame(width: 24)
+                TextField(L10n.tr("替换为（留空则删除匹配文本）"), text: $model.documentReplacement)
+                    .textFieldStyle(.plain).padding(.horizontal, 8).frame(height: 30)
+                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 7))
+                    .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Color.primary.opacity(0.08)))
+                    .accessibilityLabel(L10n.tr("替换为"))
+                    .onSubmit { model.replaceDocumentMatches(all: false) }
+            }
+            HStack(spacing: 8) {
+                if let count = model.documentReplacementCount {
+                    Text(String(format: L10n.tr("已替换 %d 处"), count)).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                Button(L10n.tr("撤销替换")) { model.undoDocumentReplacement() }
+                    .disabled(!model.canUndoDocumentReplacement)
+                Button(L10n.tr("替换")) { model.replaceDocumentMatches(all: false) }
+                    .disabled(model.documentFindMatches.isEmpty || model.automationBusy)
+                Button(L10n.tr("全部替换")) { model.replaceDocumentMatches(all: true) }
+                    .disabled(model.documentFindMatches.isEmpty || model.automationBusy)
+            }.buttonStyle(.bordered).controlSize(.small).padding(.leading, 32)
+        }
+        }
+        .font(.system(size: 12)).buttonStyle(.plain).foregroundStyle(.secondary)
+        .padding(8).frame(maxWidth: 560)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.07)))
+        .shadow(color: .black.opacity(0.05), radius: 6, y: 2)
+        .padding(.horizontal, 20).padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .background(Color(nsColor: .textBackgroundColor))
+        .onAppear { focused = true }
+        .onChange(of: model.documentFindFocusID) { _, _ in focused = true }
+        .onExitCommand { model.closeDocumentFind() }
     }
 }
 
@@ -256,12 +385,21 @@ private struct EditorBlockRow: View, Equatable {
     @State private var richPreviewError: String?
     @State private var copied = false
     @State private var selectingImage = false
+    @State private var showingImagePreview = false
+    @State private var imageDragWidth: Double?
+    @State private var displayedImageWidth: CGFloat = 0
     @State private var selectingMedia = false
+    @State private var savingResource = false
+    @State private var savedResourceURL: URL?
+    @State private var resourceSaveTask: Task<Void, Never>?
     @State private var mediaError: String?
     @State private var playerObservation: NSKeyValueObservation?
     @State private var playbackSource: URL?
     @State private var customLanguage = ""
     @State private var showingLanguageEditor = false
+    @State private var selectedTableRow: Int?
+    @State private var selectedTableColumn: Int?
+    @State private var focusedTableCell: String?
     @State private var player: AVPlayer?
     @State private var hovered = false
     @State private var focused = false
@@ -270,7 +408,7 @@ private struct EditorBlockRow: View, Equatable {
     @State private var selectedIndex = 0
     @State private var columnDrag: (index: Int, value: Double)?
     @State private var rowDrag: (index: Int, value: Double)?
-    @State private var tableRowContentHeights: [Int: CGFloat] = [:]
+    @State private var tableCellContentHeights: [Int: [Int: CGFloat]] = [:]
 
     private var commands: [BlockKind] { SlashCommandMenu.matches(block.text) }
     private var showingCommands: Bool {
@@ -288,15 +426,23 @@ private struct EditorBlockRow: View, Equatable {
     var body: some View {
         HStack(alignment: .top, spacing: EditorLayout.controlsSpacing) {
             HStack(spacing: 2) {
-                Button { model.addBlock(after: block) } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 16, weight: .regular))
-                        .frame(width: 24, height: 28)
-                        .contentShape(Rectangle())
+                Menu {
+                    ForEach(BlockKind.categories, id: \.self) { category in
+                        Section(category) {
+                            ForEach(BlockKind.allCases.filter { $0 != .imageCard }.filter { $0.category == category }) { kind in
+                                Button { model.addBlock(kind, after: block) } label: {
+                                    Label(kind.label, systemImage: kind.symbol)
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "plus").font(.system(size: 16))
+                        .frame(width: 24, height: 28).contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .help(L10n.tr("在下方添加块"))
-                .accessibilityLabel(L10n.tr("在下方添加块"))
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 24, height: 28)
+                .help(L10n.tr("在下方插入…"))
+                .accessibilityLabel(L10n.tr("在下方插入…"))
                 blockMenu
             }
             .foregroundStyle(Color(red: 0.45, green: 0.47, blue: 0.56))
@@ -311,22 +457,12 @@ private struct EditorBlockRow: View, Equatable {
                 PDFDocumentBlock(source: Binding(get: { block.text }, set: { model.changeText($0, in: block) }), extract: { text in
                     model.addBlock(.markdown, after: block, text: text)
                 })
+            } else if block.kind == .imageCard {
+                if let card = ImageTextCard.decode(block.text) {
+                    ImageTextCardEditor(card: card) { model.changeText($0.encoded, in: block) }
+                } else { Text(L10n.tr("图文卡片无法读取")) }
             } else if block.kind == .image {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Label(L10n.tr("图片"), systemImage: "photo").font(.caption).foregroundStyle(.secondary)
-                        Spacer()
-                        Button(block.text.isEmpty ? L10n.tr("选择图片…") : L10n.tr("更换图片…")) { selectingImage = true }
-
-                    }
-                    if !block.text.isEmpty { MediaImageView(source: block.text) }
-                    else {
-                        Button { selectingImage = true } label: {
-                            Label(L10n.tr("从 URL 或本地文件选择图片"), systemImage: "photo.badge.plus")
-                                .frame(maxWidth: .infinity, minHeight: 110)
-                        }.buttonStyle(.plain).foregroundStyle(.secondary)
-                    }
-                }.padding(12).background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
+                imageContent
             } else if block.kind == .equation || block.kind == .markdown || isMermaidCode {
                 richContent
             } else if block.kind == .code {
@@ -364,10 +500,12 @@ private struct EditorBlockRow: View, Equatable {
                                          onDocumentBoundary: { model.jumpToDocumentBoundary(atStart: $0, extend: $1); return true },
                                          onBlockMouseDown: handleBlockClick,
                                          onPasteDocument: pasteDocument,
+                                         onDocumentFind: model.performDocumentFind,
+                                         findRanges: snapshot.findMatches.map(\.range), currentFindRange: snapshot.currentFindMatch?.range,
                                          focusRequest: snapshot.focusRequest, isFocusRequestCurrent: { model.editorFocusRequest?.id == $0 }, contentRevision: snapshot.contentRevision,
                                          onReturnBlock: { model.returnFromSingleLineBlock(block, text: $0, formatting: $1, selection: $2) },
                                          onExitBlock: { model.exitBlock(block); return true },
-                                         shiftReturnInsertsNewline: block.kind.isHeading || [.bullet, .numbered, .todo].contains(block.kind),
+                                         shiftReturnInsertsNewline: block.kind.returnSplitsBlock || block.kind.exitsOnTrailingEmptyLine,
                                  onBackspaceAtStart: { model.backspaceAtStart(of: block) },
                                          onCommand: handleCommand,
                                          onFocus: { focused = $0 },
@@ -392,6 +530,7 @@ private struct EditorBlockRow: View, Equatable {
                 }
             }
             if block.kind.isMedia && block.kind != .image { mediaPreview }
+            if savingResource || savedResourceURL != nil { resourceSaveFeedback }
             }
             .padding(.horizontal, block.kind.isCallout ? 12 : 0)
             .padding(.vertical, block.kind.isCallout ? 10 : 0)
@@ -408,9 +547,11 @@ private struct EditorBlockRow: View, Equatable {
         .sheet(isPresented: $selectingMedia) {
             MediaSourcePicker(kind: block.kind, source: block.text) { model.changeText($0, in: block) }
         }
-        .sheet(isPresented: $selectingImage) { ImageSourcePicker(initialValue: block.text) { model.changeText($0, in: block) } }
+        .sheet(isPresented: $showingImagePreview) { ImageZoomPreview(source: block.text) }
+        .sheet(isPresented: $selectingImage) { ImageSourcePicker(initialValue: block.text) { model.setImageSource($0, in: block) } }
         .contentShape(Rectangle())
         .onHover { hovered = $0 }
+        .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(snapshot.currentFindMatch == nil ? Color.clear : Color.accentColor.opacity(0.5), lineWidth: 1).allowsHitTesting(false))
         .zIndex(showingCommands ? 1 : 0)
     }
 
@@ -434,16 +575,156 @@ private struct EditorBlockRow: View, Equatable {
         return true
     }
 
+    @ViewBuilder private var imageContent: some View {
+        if block.text.isEmpty {
+            Button { selectingImage = true } label: {
+                Label(L10n.tr("从 URL 或本地文件选择图片"), systemImage: "photo.badge.plus")
+                    .frame(maxWidth: .infinity, minHeight: 96)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).foregroundStyle(.secondary)
+            .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.secondary.opacity(0.2), style: StrokeStyle(lineWidth: 1, dash: [5, 4])).allowsHitTesting(false))
+        } else {
+            MediaImageView(source: block.text, preferredWidth: imageDragWidth ?? block.imageWidth)
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { displayedImageWidth = $0 }
+                .onTapGesture(count: 2) { showingImagePreview = true }
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .overlay(alignment: .topTrailing) {
+                    HStack(spacing: 6) {
+                        Button(action: saveResource) { Image(systemName: "arrow.down.to.line") }
+                            .disabled(savingResource).help(L10n.tr("保存到本地…")).accessibilityLabel(L10n.tr("保存到本地…"))
+                        Button { showingImagePreview = true } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
+                            .help(L10n.tr("放大查看")).accessibilityLabel(L10n.tr("放大查看"))
+                        Button { selectingImage = true } label: { Image(systemName: "arrow.triangle.2.circlepath") }
+                            .help(L10n.tr("更换图片…")).accessibilityLabel(L10n.tr("更换图片…"))
+                    }
+                        .buttonStyle(.bordered)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+                        .padding(8)
+                        .opacity(hovered || snapshot.selected ? 1 : 0)
+                        .allowsHitTesting(hovered || snapshot.selected)
+                        .accessibilityHidden(!hovered && !snapshot.selected)
+                }
+                .overlay(alignment: .trailing) {
+                    let startingWidth = Double(displayedImageWidth)
+                    TableResizeGrip(horizontal: true, index: 0, identifierPrefix: "image") { delta, ended in
+                        let value = min(max(80, Double(availableWidth - EditorLayout.contentInset)), max(80, startingWidth + delta))
+                        imageDragWidth = value
+                        if ended { commitImageWidth(value) }
+                    }
+                    .frame(width: 14)
+                    .overlay(Capsule().fill(Color.secondary.opacity(0.6)).frame(width: 4, height: 32).allowsHitTesting(false))
+                    .opacity(hovered || snapshot.selected || imageDragWidth != nil ? 1 : 0)
+                    .allowsHitTesting(hovered || snapshot.selected || imageDragWidth != nil)
+                    .help(L10n.tr("拖动调整图片大小"))
+                    .accessibilityLabel(L10n.tr("图片宽度"))
+                    .accessibilityAdjustableAction { direction in commitImageWidth(startingWidth + (direction == .increment ? 32 : -32)) }
+                }
+                .contextMenu {
+                    Button(L10n.tr("保存到本地…"), action: saveResource).disabled(savingResource)
+                    Button(L10n.tr("与下方文字合并为图文卡片")) { model.mergeImageWithFollowingText(block) }
+                    if block.text.hasPrefix("http://") || block.text.hasPrefix("https://") {
+                        Button(L10n.tr("转为文档内本地图片")) { model.localizeImage(block) }
+                    }
+                    Divider()
+                    Button(L10n.tr("放大查看")) { showingImagePreview = true }
+                    Button(L10n.tr("恢复默认大小")) { commitImageWidth(nil) }
+                    Button(L10n.tr("更换图片…")) { selectingImage = true }
+                }
+        }
+    }
+
+    @ViewBuilder private var resourceSaveFeedback: some View {
+        HStack(spacing: 8) {
+            if savingResource {
+                ProgressView().controlSize(.small)
+                Text(L10n.tr("正在准备媒体文件…"))
+                Button(L10n.tr("取消")) { resourceSaveTask?.cancel() }
+            } else if let url = savedResourceURL {
+                Image(systemName: "checkmark.circle").foregroundStyle(.green)
+                Text(L10n.tr("已保存到本地"))
+                Button(L10n.tr("在 Finder 中显示")) { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+            }
+        }.font(.caption).foregroundStyle(.secondary).buttonStyle(.borderless)
+    }
+
+    private func saveResource() {
+        guard !savingResource else { return }
+        let source = block.text, kind = block.kind
+        let parentWindow = NSApp.keyWindow
+        savingResource = true; savedResourceURL = nil
+        resourceSaveTask = Task { @MainActor in
+            defer { savingResource = false; resourceSaveTask = nil }
+            do {
+                let resource = try await MediaResourceExporter.prepare(source: source, kind: kind)
+                defer { resource.discard() }
+                try Task.checkCancellation()
+                let panel = NSSavePanel()
+                panel.title = L10n.tr("保存到本地")
+                panel.prompt = L10n.tr("保存")
+                panel.nameFieldStringValue = resource.filename
+                panel.canCreateDirectories = true
+                panel.isExtensionHidden = false
+                let result: NSApplication.ModalResponse = await withCheckedContinuation { continuation in
+                    if let parentWindow, parentWindow.isVisible, parentWindow.attachedSheet == nil {
+                        panel.beginSheetModal(for: parentWindow) { continuation.resume(returning: $0) }
+                    } else { panel.begin { continuation.resume(returning: $0) } }
+                }
+                guard result == .OK, let destination = panel.url else { return }
+                try await resource.write(to: destination)
+                if model.blocks.first(where: { $0.id == block.id })?.text == source { savedResourceURL = destination }
+            } catch is CancellationError { }
+            catch let error as URLError where error.code == .cancelled { }
+            catch { model.errorMessage = L10n.tr("保存媒体失败：") + error.localizedDescription }
+        }
+    }
+
+    private func commitImageWidth(_ width: Double?) {
+        Task {
+            do { try await model.resizeImage(width, in: block) }
+            catch { model.errorMessage = error.localizedDescription }
+            imageDragWidth = nil
+        }
+    }
+
     private var blockMenu: some View {
         Menu {
-            ForEach(BlockKind.categories, id: \.self) { category in
-                Menu(category) {
-                    ForEach(BlockKind.allCases.filter { $0.category == category }) { kind in
-                        Button(kind.label) { model.changeKind(kind, of: block) }
+            if MediaResourceExporter.supports(block.kind), !block.text.isEmpty {
+                Button(L10n.tr("保存到本地…"), systemImage: "arrow.down.to.line", action: saveResource).disabled(savingResource)
+                Divider()
+            }
+            if block.kind == .image {
+                if !block.text.isEmpty {
+                    Button(L10n.tr("放大查看")) { showingImagePreview = true }
+                    Button(L10n.tr("恢复默认大小")) { commitImageWidth(nil) }
+                }
+                Button(block.text.isEmpty ? L10n.tr("选择图片…") : L10n.tr("更换图片…")) { selectingImage = true }
+                Divider()
+            }
+            if block.kind == .numbered {
+                Button(L10n.tr("接续前一编号")) {
+                    Task { do { try await model.continueListNumbering(in: block) } catch { model.errorMessage = error.localizedDescription } }
+                }
+                Button(L10n.tr("从 1 重新编号")) {
+                    Task { do { try await model.setListStart(1, in: block) } catch { model.errorMessage = error.localizedDescription } }
+                }
+                Divider()
+            }
+            let conversions = BlockKind.allCases.filter { $0 != .imageCard }.filter { $0 != block.kind && block.kind.canConvert(to: $0) }
+            if !conversions.isEmpty {
+                Menu(L10n.tr("转换为")) {
+                    ForEach(conversions) { kind in
+                        Button { model.changeKind(kind, of: block) } label: {
+                            Label(kind.label, systemImage: kind.symbol)
+                        }
                     }
                 }
             }
             Divider()
+            Button(L10n.tr("创建块副本"), systemImage: "plus.square.on.square") {
+                Task { do { try await model.duplicateBlocks([block.id]) } catch { model.errorMessage = error.localizedDescription } }
+            }.disabled(model.automationBusy)
             Button(L10n.tr("复制块内容"), systemImage: "doc.on.doc", action: copyCode)
             Button(L10n.tr("上移"), systemImage: "arrow.up") { model.moveBlock(block, offset: -1) }
                 .disabled(snapshot.first)
@@ -512,6 +793,9 @@ private struct EditorBlockRow: View, Equatable {
         HStack {
             Button(block.text.isEmpty ? L10n.tr("选择媒体或文件…") : L10n.tr("更换来源…")) { selectingMedia = true }
             Spacer()
+            if MediaResourceExporter.supports(block.kind), !block.text.isEmpty {
+                Button(L10n.tr("保存到本地…"), action: saveResource).disabled(savingResource)
+            }
         }.font(.caption).buttonStyle(.borderless)
         if let url = mediaURL {
             if url.isFileURL && !FileManager.default.isReadableFile(atPath: url.path) {
@@ -557,13 +841,7 @@ private struct EditorBlockRow: View, Equatable {
         }
     }
 
-    private var cells: [[String]] {
-        if let data = block.text.data(using: .utf8),
-           let rows = try? JSONDecoder().decode([[String]].self, from: data),
-           !rows.isEmpty, let columns = rows.first?.count, columns > 0,
-           rows.allSatisfy({ $0.count == columns }) { return rows.map { $0.map { TableCellContent.visible($0, layout: block.tableLayout) } } }
-        return [[block.text, ""], ["", ""]]
-    }
+    private var cells: [[String]] { snapshot.tableCells }
 
     private func saveCells(_ rows: [[String]]) { model.changeTableCells(rows, in: block) }
 
@@ -572,7 +850,7 @@ private struct EditorBlockRow: View, Equatable {
         return CGFloat(block.tableLayout.column(index))
     }
     private func contentRowHeight(_ row: Int) -> CGFloat {
-        (tableRowContentHeights[row] ?? 20) + 16
+        max(28, tableCellContentHeights[row]?.values.max() ?? 28) + 16
     }
     private func rowHeight(_ index: Int) -> CGFloat {
         let requested: CGFloat
@@ -614,61 +892,168 @@ private struct EditorBlockRow: View, Equatable {
             }
     }
 
+    private var tableGridWidth: CGFloat {
+        cells[0].indices.reduce(CGFloat(2 + max(0, cells[0].count - 1))) { $0 + columnWidth($1) }
+    }
+
+    private var tableControlsVisible: Bool {
+        focusedTableCell != nil || snapshot.selected || columnDrag != nil || rowDrag != nil
+    }
+
+    private func tableAxisMenu(_ index: Int, row: Bool, axisCount: Int) -> some View {
+        let title = String(format: L10n.tr(row ? "第 %d 行操作" : "第 %d 列操作"), index + 1)
+        return Menu {
+            Button(String(format: L10n.tr(row ? "删除第 %d 行" : "删除第 %d 列"), index + 1), role: .destructive) {
+                if row { deleteTableRow(index) } else { deleteTableColumn(index) }
+            }
+            .disabled(axisCount <= 1)
+        } label: {
+            Text(" ")
+        }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden)
+        .frame(width: 18, height: 18)
+        .background(Color(nsColor: .textBackgroundColor), in: Circle())
+        .overlay(Circle().strokeBorder(Color.secondary.opacity(0.3), lineWidth: 1.5).allowsHitTesting(false))
+        .overlay {
+            Image(systemName: "equal")
+                .font(.system(size: 10, weight: .medium))
+                .rotationEffect(.degrees(row ? 0 : 90))
+                .foregroundStyle(.primary)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+        .contentShape(Circle())
+        .help(title).accessibilityLabel(title)
+        .opacity(tableControlsVisible ? 1 : 0)
+        .allowsHitTesting(tableControlsVisible)
+        .accessibilityHidden(!tableControlsVisible)
+    }
+
     private var tableContent: some View {
         VStack(alignment: .leading, spacing: 8) {
             ScrollView(.horizontal) {
-                Grid(horizontalSpacing: 1, verticalSpacing: 1) {
+                VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 5) {
+                VStack(alignment: .leading, spacing: 1) {
                     ForEach(cells.indices, id: \.self) { row in
-                        GridRow {
+                        HStack(alignment: .top, spacing: 1) {
                             ForEach(cells[row].indices, id: \.self) { column in
                                 TableCellEditor(text: cells[row][column], placeholder: row == 0 ? L10n.tr("列名") : L10n.tr("内容"),
                                                 header: row == 0,
+                                                onDeleteRow: cells.count > 1 ? { deleteTableRow(row) } : nil,
+                                                onDeleteColumn: cells[0].count > 1 ? { deleteTableColumn(column) } : nil,
+                                                onFind: model.performDocumentFind,
+                                                findRanges: snapshot.findMatches.filter { $0.row == row && $0.column == column }.map(\.range),
+                                                currentFindRange: snapshot.currentFindMatch.flatMap { $0.row == row && $0.column == column ? $0.range : nil },
+                                                contentRevision: snapshot.contentRevision,
                                                 focusRequest: row == 0 && column == 0 ? snapshot.focusRequest : nil,
                                                 isFocusRequestCurrent: { model.editorFocusRequest?.id == $0 },
                                                 onChange: { value in
                                     var updated = cells
                                     updated[row][column] = value
                                     saveCells(updated)
-                                }, onExit: { model.exitBlock(block) })
+                                }, onExit: { model.exitBlock(block) }, onFocus: { active in
+                                    let cellID = "\(row):\(column)"
+                                    if active { focusedTableCell = cellID }
+                                    else if focusedTableCell == cellID { focusedTableCell = nil }
+                                    if active { selectedTableRow = row; selectedTableColumn = column }
+                                }, onContentHeightChange: { measured in
+                                    guard measured.isFinite, measured > 0 else { return }
+                                    let value = ceil(measured)
+                                    if tableCellContentHeights[row]?[column] != value {
+                                        tableCellContentHeights[row, default: [:]][column] = value
+                                    }
+                                })
                                 .frame(width: max(1, columnWidth(column) - 16), alignment: .leading)
                                 .fixedSize(horizontal: false, vertical: true)
                                 .padding(8)
                                 .frame(width: columnWidth(column), alignment: .leading)
-                                .frame(minHeight: rowHeight(row), maxHeight: .infinity, alignment: .topLeading)
+                                // Explicit intrinsic row heights avoid Grid's
+                                // unbounded-height negotiation inside a lazy page.
+                                .frame(height: max(rowHeight(row), contentRowHeight(row)), alignment: .topLeading)
                                 .background {
-                                    GeometryReader { geometry in
-                                        Color.clear.preference(key: TableCellHeightKey.self,
-                                            value: [row: max(0, ceil(geometry.size.height) - 16)])
-                                    }
+                                    Color(nsColor: .textBackgroundColor)
+                                        .overlay(row == 0 ? Color.primary.opacity(0.025) : .clear)
                                 }
-                                .background(row == 0 ? Color.primary.opacity(0.06) : Color(nsColor: .textBackgroundColor))
+                                .clipped()
+                                .overlay(Rectangle().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5).allowsHitTesting(false))
                                 .overlay(alignment: .trailing) { columnHandle(column) }
                                 .overlay(alignment: .bottom) { rowHandle(row) }
+                                .overlay {
+                                    if tableControlsVisible && selectedTableRow == row && selectedTableColumn == column {
+                                        Rectangle().strokeBorder(Color.cyan, lineWidth: 2).allowsHitTesting(false)
+                                    }
+                                }
+                                .contextMenu {
+                                    Button(L10n.tr("删除所在行"), role: .destructive) { deleteTableRow(row) }
+                                        .disabled(cells.count <= 1)
+                                    Button(L10n.tr("删除所在列"), role: .destructive) { deleteTableColumn(column) }
+                                        .disabled(cells[0].count <= 1)
+                                }
                                 .accessibilityLabel(L10n.tr("第 \(row + 1) 行，第 \(column + 1) 列"))
+                                .overlay(alignment: .leading) {
+                                    if column == 0 { tableAxisMenu(row, row: true, axisCount: cells.count).offset(x: -9) }
+                                }
+                                .overlay(alignment: .top) {
+                                    if row == 0 { tableAxisMenu(column, row: false, axisCount: cells[0].count).offset(y: -9) }
+                                }
                             }
                         }
                     }
-                }.padding(1).background(Color.primary.opacity(0.12))
-            }
-            .onPreferenceChange(TableCellHeightKey.self) { heights in
-                if tableRowContentHeights != heights { tableRowContentHeights = heights }
-            }
-            HStack {
-                Button(L10n.tr("添加行")) { saveCells(cells + [Array(repeating: "", count: cells[0].count)]) }
-                Button(L10n.tr("添加列")) { saveCells(cells.map { $0 + [""] }) }
-                Menu(L10n.tr("删除")) {
-                    Button(L10n.tr("删除末行")) { saveCells(Array(cells.dropLast())) }.disabled(cells.count <= 1)
-                    Button(L10n.tr("删除末列")) { saveCells(cells.map { Array($0.dropLast()) }) }.disabled(cells[0].count <= 1)
-                }.fixedSize()
-                Button(L10n.tr("重置表格尺寸")) {
-                    var layout = block.tableLayout
-                    layout.columnWidths = []; layout.rowHeights = []
-                    model.changeTableLayout(layout, in: block)
+                }.padding(1)
+                Button { model.appendTableAxes(row: false, column: true, in: block) } label: {
+                    Label(L10n.tr("添加列"), systemImage: "plus").labelStyle(.iconOnly)
+                        .frame(width: 28).frame(maxHeight: .infinity)
+                        .contentShape(Rectangle())
                 }
-            }.font(.caption).buttonStyle(.borderless)
-            Text(L10n.tr("拖动单元格右边缘调整列宽，下边缘调整行高"))
-                .font(.caption2).foregroundStyle(.tertiary)
+                .buttonStyle(.plain).background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 7))
+                .help(L10n.tr("添加列"))
+                .opacity(tableControlsVisible ? 1 : 0).allowsHitTesting(tableControlsVisible)
+                .accessibilityHidden(!tableControlsVisible)
+                }.fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 5) {
+                    Button { model.appendTableAxes(row: true, column: false, in: block) } label: {
+                        Label(L10n.tr("添加行"), systemImage: "plus").labelStyle(.iconOnly)
+                            .frame(width: tableGridWidth, height: 28).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain).background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 7))
+                    .help(L10n.tr("添加行"))
+                    Button { model.appendTableAxes(row: true, column: true, in: block) } label: {
+                        Label(L10n.tr("添加行和列"), systemImage: "plus").labelStyle(.iconOnly)
+                            .frame(width: 28, height: 28).contentShape(Circle())
+                    }
+                    .buttonStyle(.plain).background(Color.primary.opacity(0.045), in: Circle())
+                    .help(L10n.tr("添加行和列"))
+                }
+                .opacity(tableControlsVisible ? 1 : 0).allowsHitTesting(tableControlsVisible)
+                .accessibilityHidden(!tableControlsVisible)
+                }
+                // Reserve only the circular handles' overhang, not a separate grid column.
+                .padding(.top, 10).padding(.leading, 10)
+            }
         }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func deleteTableRow(_ row: Int) {
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        tableCellContentHeights = Dictionary(uniqueKeysWithValues: tableCellContentHeights.compactMap { index, heights in
+            index == row ? nil : (index > row ? index - 1 : index, heights)
+        })
+        rowDrag = nil; columnDrag = nil
+        selectedTableRow = nil; selectedTableColumn = nil
+        model.deleteTableRow(row, in: block)
+    }
+
+    private func deleteTableColumn(_ column: Int) {
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        tableCellContentHeights = tableCellContentHeights.mapValues { heights in
+            Dictionary(uniqueKeysWithValues: heights.compactMap { index, height in
+                index == column ? nil : (index > column ? index - 1 : index, height)
+            })
+        }
+        rowDrag = nil; columnDrag = nil
+        selectedTableRow = nil; selectedTableColumn = nil
+        model.deleteTableColumn(column, in: block)
     }
 
     private var calloutColor: Color {
@@ -691,6 +1076,8 @@ private struct EditorBlockRow: View, Equatable {
                 NativeTextEditor(text: block.text, font: .monospacedSystemFont(ofSize: codeFontSize, weight: .regular),
                                  onDeleteBlocks: deleteBlocks,
                                  onBlockMouseDown: handleBlockClick,
+                                 onDocumentFind: model.performDocumentFind,
+                                 findRanges: snapshot.findMatches.map(\.range), currentFindRange: snapshot.currentFindMatch?.range,
                                  codeLanguage: "Plain Text", sanitizePastedLaTeX: block.kind == .equation,
                                  showCodeLineNumbers: false, darkCode: colorScheme == .dark,
                                  focusRequest: snapshot.focusRequest, isFocusRequestCurrent: { model.editorFocusRequest?.id == $0 }, contentRevision: snapshot.contentRevision,
@@ -750,6 +1137,8 @@ private struct EditorBlockRow: View, Equatable {
                                  onDeleteBlocks: deleteBlocks,
                                  onDocumentBoundary: { model.jumpToDocumentBoundary(atStart: $0, extend: $1); return true },
                                  onBlockMouseDown: handleBlockClick,
+                                 onDocumentFind: model.performDocumentFind,
+                                 findRanges: snapshot.findMatches.map(\.range), currentFindRange: snapshot.currentFindMatch?.range,
                                  codeLanguage: block.language, showCodeLineNumbers: codeLineNumbers, darkCode: colorScheme == .dark,
                                  focusRequest: snapshot.focusRequest, isFocusRequestCurrent: { model.editorFocusRequest?.id == $0 }, contentRevision: snapshot.contentRevision,
                                  onExitBlock: { model.exitBlock(block); return true },
@@ -782,7 +1171,7 @@ private struct EditorBlockRow: View, Equatable {
         if block.kind == .pdfDocument, let data = EmbeddedPDF.data(block.text) {
             copied = pasteboard.setData(data, forType: .pdf)
             if let text = EmbeddedPDF.document(block.text)?.string { pasteboard.setString(text, forType: .string) }
-        } else { copied = ClipboardDocument.copyBlocks([TransferBlock(block)]) }
+        } else { copied = ClipboardDocument.copyBlocks(model.clipboardBlocks([block.id])) }
     }
 
     private var codeHeader: some View {
@@ -790,14 +1179,16 @@ private struct EditorBlockRow: View, Equatable {
             Image(systemName: "chevron.left.forwardslash.chevron.right")
                 .font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
             Menu {
-                ForEach(["Plain Text", "Swift", "Python", "JavaScript", "TypeScript", "HTML", "CSS",
-                         "JSON", "SQL", "Bash", "C", "C++", "C#", "Java", "Kotlin", "Go", "Rust",
-                         "Ruby", "PHP", "YAML", "Markdown", "Mermaid"], id: \.self) { language in
+                ForEach(CodeLanguage.groups) { group in
+                    Menu(L10n.text(group.title)) {
+                    ForEach(group.languages, id: \.self) { language in
                     Button {
                         model.setBlockOptions(for: block, language: language)
                     } label: {
-                        if block.language == language { Label(language, systemImage: "checkmark") }
+                        if CodeLanguage.canonical(block.language) == language { Label(language, systemImage: "checkmark") }
                         else { Text(language) }
+                    }
+                    }
                     }
                 }
                 Divider()
@@ -805,7 +1196,7 @@ private struct EditorBlockRow: View, Equatable {
                     customLanguage = block.language
                     showingLanguageEditor = true
                 }
-            } label: { Text(block.language.isEmpty ? "Plain Text" : block.language).fontWeight(.medium) }
+            } label: { Text(CodeLanguage.canonical(block.language)).fontWeight(.medium) }
             .menuStyle(.borderlessButton).fixedSize()
             .help(L10n.tr("选择语言"))
             Spacer(minLength: 8)
@@ -946,4 +1337,39 @@ private struct EditorBlockRow: View, Equatable {
         return true
     }
 
+}
+
+
+private struct ImageTextCardEditor: View {
+    let card: ImageTextCard
+    let onChange: (ImageTextCard) -> Void
+    @State private var image: NSImage?
+    private func binding(_ key: WritableKeyPath<ImageTextCard, String>) -> Binding<String> {
+        Binding(get: { card[keyPath: key] }, set: { value in var copy = card; copy[keyPath: key] = value; onChange(copy) })
+    }
+    var body: some View {
+        HStack(alignment: .top, spacing: 14) {
+            Group {
+                if let image { Image(nsImage: image).resizable().scaledToFit().frame(width: min(68, image.size.width), height: min(68, image.size.height)) }
+                else if let url = URL(string: card.image), url.scheme == "https" || url.scheme == "http" {
+                    AsyncImage(url: url) { picture in picture.resizable().scaledToFit().padding(4) } placeholder: { ProgressView() }
+                } else { Image(systemName: "photo").foregroundStyle(.secondary) }
+            }
+            .frame(width: 76, height: 76)
+            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.secondary.opacity(0.14), lineWidth: 1))
+            .accessibilityLabel(L10n.tr("图片"))
+            VStack(alignment: .leading, spacing: 7) {
+                TextField(L10n.tr("标题"), text: binding(\.title), axis: .vertical)
+                    .font(.system(size: 17, weight: .semibold)).accessibilityLabel(L10n.tr("卡片标题"))
+                TextField(L10n.tr("说明"), text: binding(\.body), axis: .vertical)
+                    .font(.system(size: 16)).accessibilityLabel(L10n.tr("卡片说明"))
+                TextField(L10n.tr("关键词"), text: binding(\.caption), axis: .vertical)
+                    .font(.system(size: 14)).foregroundStyle(.secondary).accessibilityLabel(L10n.tr("卡片关键词"))
+            }.textFieldStyle(.plain).frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 12)
+        .overlay(alignment: .bottom) { Divider().opacity(0.6) }
+        .task(id: card.image) { image = card.image.hasPrefix("data:") ? ImageSource.thumbnail(card.image) : nil }
+    }
 }

@@ -7,6 +7,12 @@ enum ClipboardDocument {
     static let richTextSelectionType = NSPasteboard.PasteboardType("com.velora.rich-text-selection")
     static let blocksType = NSPasteboard.PasteboardType("com.velora.blocks")
 
+    @discardableResult
+    static func copyTitle(_ title: String, to pasteboard: NSPasteboard = .general) -> Bool {
+        pasteboard.clearContents()
+        return pasteboard.setString(title, forType: .string)
+    }
+
     static func attributedText(from pasteboard: NSPasteboard) -> NSAttributedString? {
         for (type, format) in [(NSPasteboard.PasteboardType.rtfd, NSAttributedString.DocumentType.rtfd),
                                (.rtf, .rtf), (.html, .html)] {
@@ -75,26 +81,62 @@ enum ClipboardDocument {
             + paragraph(NSRange(location: end, length: ns.length - end))
     }
 
+    /// Raw code from a code-copy button has no Markdown fence or language label.
+    /// Require a Python declaration plus executable syntax, not prose keywords.
+    static func pythonCode(_ text: String?) -> String? {
+        guard let text, text.count <= 1_000_000, text.contains("\n"),
+              DocumentTransfer.firstMatch(#"(?m)^\s{0,3}(?:```|~~~)"#, text) == nil else { return nil }
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+        let declaration = DocumentTransfer.firstMatch(#"(?m)^(?:from [A-Za-z_][\w.]* import [A-Za-z_*]|import [A-Za-z_][\w.]*|(?:async )?def [A-Za-z_]\w*\(|class [A-Za-z_]\w*)"#, normalized) != nil
+        let syntax = DocumentTransfer.firstMatch(#"(?m)^[ \t]*(?:[A-Za-z_]\w*\s*=|(?:async )?def \w+\(|class \w+|if .+:|return .+|print\()"#, normalized) != nil
+        // Do not treat an article containing a code sample as one code block.
+        let lines = normalized.components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        guard declaration, syntax, lines.allSatisfy({ line in
+            line.hasPrefix(" ") || line.hasPrefix("\t") || line.hasPrefix("#") ||
+            DocumentTransfer.firstMatch(#"^(?:from |import |(?:async )?def |class |if |elif |else:|for |while |try:|except|finally:|with |return |raise |assert |pass$|[A-Za-z_]\w*(?:\.|\(|\s*=)|[\]})])"#, line) != nil
+        }) else { return nil }
+        return normalized
+    }
+
     static func isStructured(_ plain: String?, html: String?) -> Bool {
+        if pythonCode(plain) != nil { return true }
         if let plain, mermaidMarkdown(plain) != nil { return true }
         if let text = plain, DocumentTransfer.firstMatch(#"(?m)(^\s{0,3}(#{1,6}\s|```|~~~|[-*+]\s|\d+[.)]\s|>\s|\$\$|\\\[)|\*\*[^*]+\*\*|`[^`\n]+`|\[[^\]]+\]\(https?://|\\\(.+?\\\)|\$[^\n$]+\$|^\|.+\|)"#, text) != nil { return true }
-        if let html, DocumentTransfer.firstMatch(#"(?i)data-mermaid-source|language-mermaid|<(?:h[1-6]|table|pre|ul|ol|blockquote|strong|b|em|math)\b|class=["'][^"']*katex"#, html) != nil { return true }
+        if let html, DocumentTransfer.firstMatch(#"(?i)<(?:svg|img)\b|images\.openai\.com/static-rsc-|data-mermaid-source|language-mermaid|<(?:h[1-6]|table|pre|ul|ol|blockquote|strong|b|em|math)\b|class=["'][^"']*katex"#, html) != nil { return true }
         return false
     }
     static func markdown(plain: String?, html: String?) async throws -> String {
         if let plain, let diagram = mermaidMarkdown(plain) { return diagram }
+        if (html == nil || html?.isEmpty == true), let code = pythonCode(plain) {
+            let longest = code.split(whereSeparator: { $0 != "`" }).map(\.count).max() ?? 0
+            let fence = String(repeating: "`", count: max(3, longest + 1))
+            return fence + "python\n" + code + (code.hasSuffix("\n") ? "" : "\n") + fence
+        }
+        // ChatGPT image cards may have only a link to its image CDN in HTML.
+        // Keep the HTML conversion ahead of Markdown-like visible link labels.
+        if let html, DocumentTransfer.firstMatch(#"(?i)<img\b|https?://images\.openai\.com/static-rsc-[0-9]+/"#, html) != nil {
+            return try await DocumentRenderSession.markdown(fromHTML: html, plainText: plain)
+        }
+        if let html, DocumentTransfer.firstMatch(#"(?i)<svg\b"#, html) != nil {
+            return try await DocumentRenderSession.markdown(fromHTML: html, plainText: plain)
+        }
         // Prefer HTML when it carries a Mermaid language marker absent from plain text.
         if let html, DocumentTransfer.firstMatch(#"(?i)(language-mermaid|data-language=["']mermaid|class=["']mermaid|data-mermaid-source)"#, html) != nil,
            plain.flatMap({ DocumentTransfer.firstMatch(#"(?im)^\s*(`{3,}|~{3,})mermaid\s*$"#, $0) }) == nil {
-            return try await DocumentRenderSession.markdown(fromHTML: html)
+            return try await DocumentRenderSession.markdown(fromHTML: html, plainText: plain)
         }
         // ChatGPT's visible clipboard text can contain presentation-only Unicode
         // around TeX backslashes. Its KaTeX annotation contains the exact source.
         if let html, DocumentTransfer.firstMatch(#"(?i)class=[\"'][^\"']*katex|annotation\b[^>]*application/x-tex"#, html) != nil {
-            return try await DocumentRenderSession.markdown(fromHTML: html)
+            return try await DocumentRenderSession.markdown(fromHTML: html, plainText: plain)
+        }
+        // Browser selections often expose plain text with a few Markdown-like
+        // fragments, but only HTML retains heading/list/quotation boundaries.
+        if let html, DocumentTransfer.firstMatch(#"(?i)<(?:h[1-6]|blockquote|ul|ol|pre|table|hr)\b"#, html) != nil {
+            return try await DocumentRenderSession.markdown(fromHTML: html, plainText: plain)
         }
         if let plain, isStructured(plain, html: nil) { return sanitizedMathPaste(plain) }
-        if let html, !html.isEmpty { return try await DocumentRenderSession.markdown(fromHTML: html) }
+        if let html, !html.isEmpty { return try await DocumentRenderSession.markdown(fromHTML: html, plainText: plain) }
         return sanitizedMathPaste(plain ?? "")
     }
 

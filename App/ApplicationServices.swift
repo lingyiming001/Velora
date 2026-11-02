@@ -171,6 +171,43 @@ final class ApplicationServices: ObservableObject {
         status = L10n.tr("已切换到「\(target.name)」")
     }
 
+    @discardableResult
+    func movePage(_ pageID: UUID, toWorkspace workspaceID: UUID) async throws -> UUID {
+        guard let catalog, let source = store, let model,
+              workspaceID != catalog.activeID,
+              let target = catalog.workspaces.first(where: { $0.id == workspaceID }),
+              let page = model.pages.first(where: { $0.id == pageID && !$0.archived }) else {
+            throw AppError.message(L10n.tr("请选择其他有效的工作空间和文档"))
+        }
+        let sourceURL = URL(fileURLWithPath: catalog.active.databasePath).resolvingSymlinksInPath().standardizedFileURL
+        let targetURL = URL(fileURLWithPath: target.databasePath).resolvingSymlinksInPath().standardizedFileURL
+        guard sourceURL != targetURL else { throw AppError.message(L10n.tr("源和目标不能使用同一个数据库")) }
+        guard FileManager.default.fileExists(atPath: target.databasePath) else {
+            throw AppError.message(L10n.tr("工作空间数据库不存在：") + target.databasePath)
+        }
+        guard !busy else { throw AppError.message(L10n.tr("正在处理其他操作，请稍后重试")) }
+        defer { finishTransition() }
+        try await prepareTransition()
+        let destination = try SQLiteStore(databaseURL: targetURL)
+        let snapshot = try await source.transferSnapshot(name: page.title, pageID: pageID, includeChildren: true)
+        let ordered = try snapshot.orderedPages()
+        guard let rootIndex = ordered.firstIndex(where: { $0.id == pageID }) else { throw StoreError.missingPage }
+        // Destination commits its complete tree before the recoverable source
+        // archive. A failure between databases can duplicate, never lose, data.
+        let imported = try await destination.importTransfer(snapshot)
+        let rootID = imported[rootIndex]
+        do { try await source.archiveTransferredPage(pageID, matching: snapshot) }
+        catch {
+            await model.refreshPages()
+            throw AppError.message(L10n.tr("目标工作空间已保存副本，但源文档未移走，请检查后重试：") + error.localizedDescription)
+        }
+        let movedIDs = Set(snapshot.pages.map(\.id))
+        await model.refreshPages()
+        if let selected = model.selectedPageID, movedIDs.contains(selected) { model.select(page.parentID) }
+        status = L10n.tr("文档及子页面已移动到「\(target.name)」，源副本可从回收箱恢复")
+        return rootID
+    }
+
     private var workspaceStorageRoot: URL {
         catalog?.storageRoot.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? catalogURL.deletingLastPathComponent()
     }
@@ -374,8 +411,7 @@ final class ApplicationServices: ObservableObject {
         server?.stop(); server = nil
         guard UserDefaults.standard.bool(forKey: "mcpEnabled"), let model else { mcpStatus = L10n.tr("已关闭"); return }
         do {
-            var token = try SecretStore.read("mcp-token")
-            if token.isEmpty { token = UUID().uuidString + UUID().uuidString; try SecretStore.save(token, account: "mcp-token") }
+            let token = try MCPTokenStore.loadOrCreate()
             let rawPort = UserDefaults.standard.integer(forKey: "mcpPort")
             let port = rawPort == 0 ? 18427 : rawPort
             guard (1024...65535).contains(port) else { throw AppError.message(L10n.tr("端口应在 1024–65535 之间")) }
@@ -387,12 +423,18 @@ final class ApplicationServices: ObservableObject {
         } catch { mcpStatus = error.localizedDescription }
     }
 
-    func copyMCPConfig() {
+    func copyMCPConfig(stdio: Bool = false) {
         do {
-            let token = try SecretStore.read("mcp-token")
-            guard !token.isEmpty else { status = L10n.tr("请先启用 MCP 以生成令牌"); return }
+            let token = try MCPTokenStore.loadOrCreate()
             let port = UserDefaults.standard.integer(forKey: "mcpPort")
-            let value: [String: Any] = ["mcpServers": ["velora": ["type": "http", "url": "http://127.0.0.1:\(port == 0 ? 18427 : port)/mcp", "headers": ["Authorization": "Bearer \(token)"]]]]
+            let configuration: [String: Any]
+            if stdio {
+                guard let bridge = Bundle.main.url(forResource: "velora_mcp_bridge", withExtension: "py") else { throw AppError.message("MCP stdio 桥接文件缺失") }
+                configuration = ["command": "/usr/bin/env", "args": ["python3", bridge.path], "env": ["VELORA_MCP_TOKEN": token, "VELORA_MCP_PORT": String(port == 0 ? 18427 : port)]]
+            } else {
+                configuration = ["type": "http", "url": "http://127.0.0.1:\(port == 0 ? 18427 : port)/mcp", "headers": ["Authorization": "Bearer \(token)"]]
+            }
+            let value: [String: Any] = ["mcpServers": ["velora": configuration]]
             let data = try JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys])
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(String(decoding: data, as: UTF8.self), forType: .string)
@@ -401,8 +443,39 @@ final class ApplicationServices: ObservableObject {
     }
 
     func rotateMCPToken() {
-        do { try SecretStore.save(UUID().uuidString + UUID().uuidString, account: "mcp-token"); configureMCP(); status = L10n.tr("令牌已更新，原客户端需重新配置") }
+        do { try MCPTokenStore.rotate(); configureMCP(); status = L10n.tr("令牌已更新，原客户端需重新配置") }
         catch { status = error.localizedDescription }
+    }
+}
+
+/// The MCP bearer token protects a loopback-only service and is not a remote account
+/// credential. Keep it in a mode-0600 file so workspace transitions never need to
+/// unlock Keychain. Real provider API keys continue to use `SecretStore` below.
+enum MCPTokenStore {
+    static func loadOrCreate(at url: URL? = nil) throws -> String {
+        let target = url ?? defaultURL
+        if let data = try? Data(contentsOf: target),
+           let token = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !token.isEmpty { return token }
+        return try rotate(at: target)
+    }
+
+    @discardableResult
+    static func rotate(at url: URL? = nil) throws -> String {
+        let target = url ?? defaultURL
+        let directory = target.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        let token = UUID().uuidString + UUID().uuidString
+        try Data(token.utf8).write(to: target, options: [.atomic])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+        return token
+    }
+
+    private static var defaultURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Velora", isDirectory: true)
+            .appendingPathComponent("mcp-token")
     }
 }
 

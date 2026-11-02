@@ -55,14 +55,14 @@ final class DocumentRenderSession: NSObject, WKNavigationDelegate, WKScriptMessa
         try Task.checkCancellation()
         return try await view.callAsyncJavaScript("return await Promise.race([(async()=>{" + script + "})(),new Promise((_,reject)=>setTimeout(()=>reject(new Error('文档处理超时')),30000))])", arguments: arguments, in: nil, contentWorld: .page)
     }
-    static func markdown(fromHTML html: String) async throws -> String {
+    static func markdown(fromHTML html: String, plainText: String? = nil) async throws -> String {
         let session = DocumentRenderSession(); defer { session.close() }
-        return try await session.run("return htmlToMarkdown(html)", arguments: ["html": html]) as? String ?? ""
+        return try await session.run("return await clipboardHTMLToMarkdown(html, plainText)", arguments: ["html": html, "plainText": plainText ?? ""]) as? String ?? ""
     }
     func render(_ document: TransferDocument) async throws {
         let expanded = try EmbeddedPDF.expanded(document)
         let source = try expanded.orderedPages().map {
-            try DocumentExporter.markdown($0, assetDirectory: nil)
+            try DocumentExporter.markdown($0, assetDirectory: nil, cardsAsHTML: true)
         }.joined(separator: "\n\n---\n\n")
         _ = try await run("await renderContent(source, false, false, 16); await prepareExport(); if(document.querySelector('.math-error,.mermaid-error'))throw new Error('存在无效公式或图表，请在页面中修正后导出'); return true", arguments: ["source": source])
     }

@@ -4,6 +4,189 @@ import CryptoKit
 @testable import Velora
 
 final class SQLiteStoreTests: XCTestCase {
+    func testOrderedStartSurvivesReopenBlockAndPageCopiesAndJSON() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/ListStart-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("store.sqlite")
+        let store = try SQLiteStore(databaseURL: url)
+        let page = try await store.createPage()
+        let block = try await store.createBlock(pageID: page.id, kind: .numbered)
+        try await store.updateBlock(block.id, text: "Prompt")
+        try await store.setListStart(2, for: block.id)
+        let reopened = try SQLiteStore(databaseURL: url)
+        let saved = try await reopened.blocks(in: page.id)
+        XCTAssertEqual(saved.first?.listStart, 2)
+        let copied = try await store.duplicateBlocks([block.id], pageID: page.id)
+        XCTAssertEqual(copied.map(\.listStart), [2, 2])
+        let copyID = try await store.duplicatePage(page.id)
+        let pageCopy = try await store.blocks(in: copyID)
+        XCTAssertEqual(pageCopy.map(\.listStart), [2, 2])
+        let snapshot = try await store.transferSnapshot(name: "list", pageID: page.id)
+        let decoded = try JSONDecoder().decode(TransferDocument.self, from: JSONEncoder().encode(snapshot))
+        let imported = try await store.importTransfer(decoded)
+        let importedBlocks = try await store.blocks(in: XCTUnwrap(imported.first))
+        XCTAssertEqual(importedBlocks.map(\.listStart), [2, 2])
+        let legacy = try JSONDecoder().decode(TransferBlock.self, from: Data(#"{"kind":"numbered","text":"old"}"#.utf8))
+        XCTAssertNil(legacy.listStart)
+    }
+
+    func testImageWidthPersistsThroughReopenCopiesAndJSONImport() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/ImageWidth-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("store.sqlite")
+        let store = try SQLiteStore(databaseURL: url)
+        let page = try await store.createPage()
+        let image = try await store.createBlock(pageID: page.id, kind: .image)
+        try await store.setImageWidth(520, for: image.id)
+        let reopened = try SQLiteStore(databaseURL: url)
+        let saved = try await reopened.blocks(in: page.id)
+        XCTAssertEqual(saved.first?.imageWidth, 520)
+        let copied = try await store.duplicateBlocks([image.id], pageID: page.id)
+        XCTAssertEqual(copied.map(\.imageWidth), [520, 520])
+        let copiedPage = try await store.duplicatePage(page.id)
+        let pageImages = try await store.blocks(in: copiedPage)
+        XCTAssertEqual(pageImages.map(\.imageWidth), [520, 520])
+        let snapshot = try await store.transferSnapshot(name: "width", pageID: page.id)
+        let decoded = try JSONDecoder().decode(TransferDocument.self, from: JSONEncoder().encode(snapshot))
+        let imported = try await store.importTransfer(decoded)
+        let importedImages = try await store.blocks(in: XCTUnwrap(imported.first))
+        XCTAssertEqual(importedImages.map(\.imageWidth), [520, 520])
+        try await store.setImageWidth(nil, for: image.id)
+        let reset = try await store.blocks(in: page.id)
+        XCTAssertNil(reset.first?.imageWidth)
+        let old = try JSONDecoder().decode(TransferBlock.self, from: Data(#"{"kind":"image","text":""}"#.utf8))
+        XCTAssertNil(old.imageWidth)
+        XCTAssertNil(ImageSizing.width(.nan))
+        XCTAssertEqual(ImageSizing.width(50000), 2400)
+        XCTAssertEqual(ImageSizing.width(-1), 80)
+    }
+
+    func testPageCopyNamesUseIncreasingNumbersAndFlattenOldSuffixes() {
+        XCTAssertEqual(PageCopyNaming.title(for: "未命名", siblings: ["未命名"]), "未命名 1")
+        XCTAssertEqual(PageCopyNaming.title(for: "未命名 1", siblings: ["未命名", "未命名 1", "未命名 3"]), "未命名 4")
+        XCTAssertEqual(PageCopyNaming.title(for: "未命名 副本 副本 副本", siblings: []), "未命名 1")
+        XCTAssertEqual(PageCopyNaming.title(for: "Note copy copy 2", siblings: ["Note 1"]), "Note 2")
+        XCTAssertEqual(PageCopyNaming.title(for: "面试-2026", siblings: []), "面试-2026 1")
+        XCTAssertEqual(PageCopyNaming.title(for: "未命名 5", siblings: []), "未命名 6")
+        XCTAssertEqual(PageCopyNaming.title(for: "", siblings: []), L10n.tr("未命名") + " 1")
+    }
+
+    func testDuplicatePageCopiesActiveSubtreeMetadataAndSiblingPosition() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/DuplicatePage-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("store.sqlite")
+        let store = try SQLiteStore(databaseURL: url)
+        let parent = try await store.createPage()
+        let source = try await store.createPage(parentID: parent.id)
+        try await store.renamePage(source.id, title: "原页面")
+        let after = try await store.createPage(parentID: parent.id)
+        let child = try await store.createPage(parentID: source.id)
+        let grandchild = try await store.createPage(parentID: child.id)
+        let trash = try await store.createPage(parentID: source.id)
+        try await store.archivePage(trash.id, archived: true)
+        let seed = try await store.createBlock(pageID: source.id, kind: .paragraph)
+        var style = InlineTextStyle(); style.bold = true
+        _ = try await store.replaceBlock(seed.id, pageID: source.id, with: [
+            TransferBlock(.code, "let x = 1", language: "Swift", collapsed: true),
+            TransferBlock(.table, "[[\"内容\"]]", tableLayout: TableLayout(columnWidths: [240], rowHeights: [88])),
+            TransferBlock(.todo, "完成", checked: true, formatting: [TextStyleRun(location: 0, length: 2, style: style)]),
+            TransferBlock(.file, "/tmp/external.pdf")
+        ])
+        let body = try await store.createBlock(pageID: grandchild.id, kind: .paragraph)
+        try await store.updateBlock(body.id, text: "孙页面正文")
+        let originalBlocks = try await store.blocks(in: source.id)
+        let copyID = try await store.duplicatePage(source.id)
+        let pages = try await store.pages()
+        let copy = try XCTUnwrap(pages.first { $0.id == copyID })
+        XCTAssertEqual(copy.parentID, parent.id)
+        XCTAssertEqual(copy.title, "原页面 1")
+        XCTAssertEqual(pages.filter { !$0.archived && $0.parentID == parent.id }.map(\.id), [source.id, copyID, after.id])
+        let copiedChild = try XCTUnwrap(pages.first { $0.parentID == copyID })
+        let copiedGrandchild = try XCTUnwrap(pages.first { $0.parentID == copiedChild.id })
+        XCTAssertEqual(pages.filter { $0.parentID == copyID }.count, 1)
+        let copiedBlocks = try await store.blocks(in: copyID)
+        XCTAssertEqual(copiedBlocks.map(TransferBlock.init), originalBlocks.map(TransferBlock.init))
+        XCTAssertTrue(Set(copiedBlocks.map(\.id)).isDisjoint(with: originalBlocks.map(\.id)))
+        let grandBody = try await store.blocks(in: copiedGrandchild.id)
+        XCTAssertEqual(grandBody.first?.text, "孙页面正文")
+        try await store.updateBlock(copiedBlocks[0].id, text: "independent")
+        let unchanged = try await store.blocks(in: source.id)
+        XCTAssertEqual(unchanged, originalBlocks)
+        let secondID = try await store.duplicatePage(source.id)
+        let reopened = try SQLiteStore(databaseURL: url)
+        let saved = try await reopened.pages()
+        XCTAssertEqual(saved.first { $0.id == secondID }?.title, "原页面 2")
+        XCTAssertNotNil(saved.first { $0.id == copyID })
+        do { _ = try await store.duplicatePage(trash.id); XCTFail("Archived source must fail") } catch { }
+    }
+
+    func testDuplicatePageRollsBackWholeTreeOnBlockWriteFailure() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/DuplicateRollback-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("store.sqlite")
+        let store = try SQLiteStore(databaseURL: url)
+        let (source, _) = try await store.createPageWithInitialBlock()
+        _ = try await store.createPage(parentID: source.id)
+        let before = try await store.pages()
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_exec(db, "CREATE TRIGGER fail_copy BEFORE INSERT ON blocks BEGIN SELECT RAISE(ABORT,'injected failure'); END", nil, nil, nil), SQLITE_OK)
+        do { _ = try await store.duplicatePage(source.id); XCTFail("Injected write must fail") } catch { }
+        let after = try await store.pages()
+        XCTAssertEqual(after, before)
+    }
+
+    func testPageWithInitialInputUsesSiblingOrderAndRejectsMissingParent() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/CreateInput-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try SQLiteStore(databaseURL: directory.appendingPathComponent("store.sqlite"))
+        let (first, input) = try await store.createPageWithInitialBlock()
+        let (second, _) = try await store.createPageWithInitialBlock()
+        let (child, _) = try await store.createPageWithInitialBlock(parentID: first.id)
+        XCTAssertEqual(second.order, first.order + 1024)
+        XCTAssertEqual(child.order, 1024)
+        let blocks = try await store.blocks(in: first.id)
+        XCTAssertEqual(blocks, [input])
+        do { _ = try await store.createPageWithInitialBlock(parentID: UUID()); XCTFail("Missing parent must fail") } catch { }
+        let pages = try await store.pages()
+        XCTAssertEqual(pages.count, 3)
+    }
+
+    func testDuplicateBlocksRetainsMetadataAndOrderAfterReopen() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/Duplicate-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("store.sqlite")
+        let store = try SQLiteStore(databaseURL: url)
+        let page = try await store.createPage()
+        let seed = try await store.createBlock(pageID: page.id, kind: .paragraph)
+        var style = InlineTextStyle(); style.bold = true
+        let runs = [TextStyleRun(location: 0, length: 2, style: style)]
+        _ = try await store.replaceBlock(seed.id, pageID: page.id, with: [
+            TransferBlock(.code, "代码", language: "Swift", collapsed: true, formatting: runs),
+            TransferBlock(.table, "[[\"数据\"]]", tableLayout: TableLayout(columnWidths: [240], rowHeights: [80])),
+            TransferBlock(.todo, "完成", checked: true)
+        ])
+        let source = try await store.blocks(in: page.id)
+        let result = try await store.duplicateBlocks(Set(source.map(\.id)), pageID: page.id)
+        XCTAssertEqual(result.count, 6)
+        for index in source.indices {
+            let copy = result[index + 3]
+            XCTAssertNotEqual(copy.id, source[index].id)
+            XCTAssertEqual(TransferBlock(copy), TransferBlock(source[index]))
+        }
+        XCTAssertEqual(result.map(\.order), (1...6).map { Int64($0 * 1024) })
+        let reopened = try SQLiteStore(databaseURL: url)
+        let saved = try await reopened.blocks(in: page.id)
+        XCTAssertEqual(saved, result)
+    }
+
     func testMergeTextBlocksRequiresAdjacentBlocksAndPreservesSavedFormatting() async throws {
         let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent(".agents/test/MergeText-" + UUID().uuidString)
@@ -291,6 +474,120 @@ final class SQLiteStoreTests: XCTestCase {
 
 @MainActor
 final class WorkspaceManagementTests: XCTestCase {
+    private func namedPage(_ title: String, in store: SQLiteStore, parentID: UUID? = nil) async throws -> Page {
+        var page = try await store.createPage(parentID: parentID)
+        try await store.renamePage(page.id, title: title)
+        page.title = title
+        return page
+    }
+    func testMoveDocumentAcrossWorkspacesPreservesTreeUnsavedContentAndRecovery() async throws {
+        let (directory, services) = try fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceProfile = try XCTUnwrap(services.currentWorkspace)
+        let source = try XCTUnwrap(services.store)
+        let parent = try await namedPage("原父页面", in: source)
+        let root = try await namedPage("文档", in: source, parentID: parent.id)
+        let child = try await namedPage("子页面", in: source, parentID: root.id)
+        let deleted = try await namedPage("已删除子页面", in: source, parentID: root.id)
+        try await source.archivePage(deleted.id, archived: true)
+        let prose = try await source.createBlock(pageID: root.id, kind: .heading)
+        let code = try await source.createBlock(pageID: child.id, kind: .code)
+        try await source.updateBlock(code.id, text: "    print('原样')\n")
+        try await source.setBlockOptions(code.id, language: "Python", collapsed: true)
+        let table = try await source.createBlock(pageID: child.id, kind: .table)
+        try await source.updateBlock(table.id, text: #"[["A","B"],["`真实`","a|b"]]"#,
+            tableLayout: TableLayout(columnWidths: [120, 280], rowHeights: [50, 90], cellsArePlain: true))
+        let image = try await source.createBlock(pageID: child.id, kind: .image)
+        try await source.updateBlock(image.id, text: "https://example.com/image.png")
+        try await services.createWorkspace(name: "目标", summary: "", symbol: "book.fill", color: "blue")
+        let targetProfile = try XCTUnwrap(services.currentWorkspace)
+        let target = try XCTUnwrap(services.store)
+        let existing = try await namedPage("文档", in: target)
+        try await services.switchWorkspace(sourceProfile.id)
+        let model = try XCTUnwrap(services.model)
+        await model.refreshPages(); model.select(root.id)
+        for _ in 0..<100 where model.blocks.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
+        var bold = InlineTextStyle(); bold.bold = true
+        model.changeRichText("尚未自动保存😀", formatting: [TextStyleRun(location: 0, length: 2, style: bold)], in: prose)
+        let newID = try await services.movePage(root.id, toWorkspace: targetProfile.id)
+        XCTAssertEqual(services.currentWorkspace?.id, sourceProfile.id)
+        XCTAssertFalse(services.busy); XCTAssertFalse(model.workspaceTransitioning)
+        XCTAssertEqual(model.selectedPageID, parent.id)
+        let moved = try await target.transferSnapshot(name: "", pageID: newID)
+        XCTAssertEqual(moved.pages.map(\.title), ["文档", "子页面"])
+        XCTAssertNil(moved.pages[0].parentID)
+        XCTAssertEqual(moved.pages[1].parentID, newID)
+        XCTAssertEqual(moved.pages[0].blocks[0].text, "尚未自动保存😀")
+        XCTAssertEqual(moved.pages[0].blocks[0].formatting.first?.style.bold, true)
+        let originalChild = try await source.blocks(in: child.id).map(TransferBlock.init)
+        XCTAssertEqual(moved.pages[1].blocks, originalChild)
+        let destinationPages = try await target.pages()
+        XCTAssertTrue(destinationPages.contains { $0.id == existing.id && !$0.archived })
+        let archived = try await source.pages()
+        XCTAssertTrue(archived.first { $0.id == root.id }?.archived == true)
+        XCTAssertTrue(archived.first { $0.id == child.id }?.archived == true)
+        XCTAssertFalse(archived.first { $0.id == parent.id }?.archived ?? true)
+        try await source.restorePage(root.id)
+        let restored = try await source.pages()
+        XCTAssertFalse(restored.first { $0.id == child.id }?.archived ?? true)
+        XCTAssertTrue(restored.first { $0.id == deleted.id }?.archived == true)
+        let reopened = try SQLiteStore(databaseURL: URL(fileURLWithPath: targetProfile.databasePath))
+        let persisted = try await reopened.transferSnapshot(name: "", pageID: newID)
+        XCTAssertEqual(persisted, moved)
+    }
+
+    func testMoveCopyFailureRollsBackDestinationAndArchiveFailureKeepsBothCopies() async throws {
+        let (directory, services) = try fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceProfile = try XCTUnwrap(services.currentWorkspace)
+        let source = try XCTUnwrap(services.store)
+        let page = try await namedPage("安全移动", in: source)
+        let block = try await source.createBlock(pageID: page.id, kind: .paragraph)
+        try await source.updateBlock(block.id, text: "不可丢失")
+        try await services.createWorkspace(name: "目标", summary: "", symbol: "book.fill", color: "blue")
+        let targetProfile = try XCTUnwrap(services.currentWorkspace)
+        let target = try XCTUnwrap(services.store)
+        try await services.switchWorkspace(sourceProfile.id)
+        await services.model?.refreshPages()
+        func execute(_ sql: String, path: String) throws {
+            var db: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(path, &db), SQLITE_OK)
+            defer { sqlite3_close(db) }
+            let result = sqlite3_exec(db, sql, nil, nil, nil)
+            XCTAssertEqual(result, SQLITE_OK)
+        }
+        try execute("CREATE TRIGGER reject_move BEFORE INSERT ON blocks BEGIN SELECT RAISE(ABORT,'test copy failure'); END;", path: targetProfile.databasePath)
+        do { try await services.movePage(page.id, toWorkspace: targetProfile.id); XCTFail("Copy must fail") } catch {}
+        var targetPages = try await target.pages()
+        XCTAssertTrue(targetPages.isEmpty, "Import transaction must roll back pages as well as blocks")
+        var sourcePages = try await source.pages()
+        XCTAssertFalse(sourcePages.first { $0.id == page.id }?.archived ?? true)
+        XCTAssertFalse(services.busy); XCTAssertFalse(try XCTUnwrap(services.model).workspaceTransitioning)
+        try execute("DROP TRIGGER reject_move;", path: targetProfile.databasePath)
+        try execute("CREATE TRIGGER reject_archive BEFORE UPDATE OF archived ON pages WHEN NEW.archived=1 BEGIN SELECT RAISE(ABORT,'test archive failure'); END;", path: sourceProfile.databasePath)
+        do { try await services.movePage(page.id, toWorkspace: targetProfile.id); XCTFail("Archive must fail") } catch {}
+        targetPages = try await target.pages()
+        XCTAssertEqual(targetPages.filter { !$0.archived }.count, 1)
+        sourcePages = try await source.pages()
+        XCTAssertFalse(sourcePages.first { $0.id == page.id }?.archived ?? true)
+        let copy = try await target.blocks(in: try XCTUnwrap(targetPages.first).id)
+        XCTAssertEqual(copy.first?.text, "不可丢失")
+        XCTAssertFalse(services.busy)
+    }
+
+    func testSourceArchiveRejectsStaleTransferSnapshot() async throws {
+        let (directory, services) = try fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = try XCTUnwrap(services.store)
+        let page = try await namedPage("文档", in: source)
+        let block = try await source.createBlock(pageID: page.id, kind: .paragraph)
+        let snapshot = try await source.transferSnapshot(name: page.title, pageID: page.id)
+        try await source.updateBlock(block.id, text: "复制后产生的新修改")
+        do { try await source.archiveTransferredPage(page.id, matching: snapshot); XCTFail("Do not hide new edits") } catch {}
+        let pages = try await source.pages()
+        XCTAssertFalse(pages.first?.archived ?? true)
+    }
+
     private func fixture() throws -> (URL, ApplicationServices) {
         let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent(".agents/test/WorkspaceManagement-" + UUID().uuidString)

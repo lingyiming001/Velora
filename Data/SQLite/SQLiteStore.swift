@@ -2,7 +2,7 @@ import Foundation
 import SQLite3
 
 actor SQLiteStore {
-    static let currentSchemaVersion = 5
+    static let currentSchemaVersion = 7
     private var db: OpaquePointer?
     private(set) var databaseURL: URL
 
@@ -85,6 +85,24 @@ actor SQLiteStore {
             } catch { try? Self.exec(db, "ROLLBACK"); throw error }
         }
 
+        if schemaVersion < 6 {
+            try Self.exec(db, "BEGIN IMMEDIATE")
+            do {
+                try Self.exec(db, "ALTER TABLE blocks ADD COLUMN image_width REAL")
+                try Self.exec(db, "PRAGMA user_version=6")
+                try Self.exec(db, "COMMIT")
+            } catch { try? Self.exec(db, "ROLLBACK"); throw error }
+        }
+
+        if schemaVersion < 7 {
+            try Self.exec(db, "BEGIN IMMEDIATE")
+            do {
+                try Self.exec(db, "ALTER TABLE blocks ADD COLUMN ordered_start INTEGER")
+                try Self.exec(db, "PRAGMA user_version=7")
+                try Self.exec(db, "COMMIT")
+            } catch { try? Self.exec(db, "ROLLBACK"); throw error }
+        }
+
     }
 
     deinit { if let db { sqlite3_close(db) } }
@@ -140,7 +158,7 @@ actor SQLiteStore {
     }
 
     func blocks(in pageID: UUID) throws -> [Block] {
-        let stmt = try statement("SELECT id,kind,body,sort_order,checked,language,collapsed,formatting,table_layout FROM blocks WHERE page_id=? ORDER BY sort_order,id")
+        let stmt = try statement("SELECT id,kind,body,sort_order,checked,language,collapsed,formatting,table_layout,image_width,ordered_start FROM blocks WHERE page_id=? ORDER BY sort_order,id")
         defer { sqlite3_finalize(stmt) }
         let key = pageID.uuidString
         _ = key.withCString { sqlite3_bind_text(stmt, 1, $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
@@ -152,17 +170,26 @@ actor SQLiteStore {
                                 checked: sqlite3_column_int(stmt, 4) != 0,
                                 language: text(stmt, 5), collapsed: sqlite3_column_int(stmt, 6) != 0,
                                 formatting: (try? JSONDecoder().decode([TextStyleRun].self, from: Data(text(stmt, 7).utf8))) ?? [],
-                                tableLayout: (try? JSONDecoder().decode(TableLayout.self, from: Data(text(stmt, 8).utf8))) ?? TableLayout()))
+                                tableLayout: (try? JSONDecoder().decode(TableLayout.self, from: Data(text(stmt, 8).utf8))) ?? TableLayout(),
+                                imageWidth: sqlite3_column_type(stmt, 9) == SQLITE_NULL ? nil : ImageSizing.width(sqlite3_column_double(stmt, 9)),
+                                listStart: sqlite3_column_type(stmt, 10) == SQLITE_NULL ? nil : ListNumbering.start(Int(sqlite3_column_int64(stmt, 10)))))
         }
         return result
     }
 
     func createPage(parentID: UUID? = nil) throws -> Page {
-        if let parentID, !(try pages()).contains(where: { $0.id == parentID && !$0.archived }) {
-            throw StoreError.missingPage
+        if let parentID {
+            let parent = try statement("SELECT 1 FROM pages WHERE id=? AND archived=0")
+            defer { sqlite3_finalize(parent) }
+            sqlite3_bind_text(parent, 1, parentID.uuidString, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            guard sqlite3_step(parent) == SQLITE_ROW else { throw StoreError.missingPage }
         }
-        // Sibling order must be deterministic even for pages created in the same millisecond.
-        let lastOrder = try pages().filter { !$0.archived && $0.parentID == parentID }.map(\.order).max() ?? 0
+        let siblings = try statement("SELECT COALESCE(MAX(sort_order),0) FROM pages WHERE archived=0 AND parent_id IS ?")
+        defer { sqlite3_finalize(siblings) }
+        if let parentID { sqlite3_bind_text(siblings, 1, parentID.uuidString, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
+        else { sqlite3_bind_null(siblings, 1) }
+        guard sqlite3_step(siblings) == SQLITE_ROW else { throw StoreError.database(String(cString: sqlite3_errmsg(db))) }
+        let lastOrder = sqlite3_column_int64(siblings, 0)
         let nextOrder = lastOrder.addingReportingOverflow(1024)
         guard !nextOrder.overflow else { throw StoreError.invalidMove }
         let page = Page(id: UUID(), parentID: parentID, title: "未命名", order: nextOrder.partialValue, archived: false, updatedAt: Date())
@@ -174,6 +201,17 @@ actor SQLiteStore {
                     [page.id.uuidString, page.title, String(page.order), String(page.updatedAt.timeIntervalSince1970)])
         }
         return page
+    }
+
+    /// Publish a new editor page only after its initial input is committed.
+    func createPageWithInitialBlock(parentID: UUID? = nil) throws -> (Page, Block) {
+        try transaction {
+            let page = try createPage(parentID: parentID)
+            let block = Block(id: UUID(), pageID: page.id, kind: .paragraph, text: "", order: 1024, checked: false)
+            try run("INSERT INTO blocks(id,page_id,kind,body,sort_order,checked) VALUES(?,?,?,?,?,0)",
+                    [block.id.uuidString, page.id.uuidString, block.kind.rawValue, "", String(block.order)])
+            return (page, block)
+        }
     }
 
     func renamePage(_ id: UUID, title: String) throws {
@@ -191,9 +229,9 @@ actor SQLiteStore {
             """, [id.uuidString, UUID().uuidString, String(Date().timeIntervalSince1970)])
     }
 
-    private func transaction(_ operation: () throws -> Void) throws {
+    private func transaction<T>(_ operation: () throws -> T) throws -> T {
         try Self.exec(db, "BEGIN IMMEDIATE")
-        do { try operation(); try Self.exec(db, "COMMIT") }
+        do { let result = try operation(); try Self.exec(db, "COMMIT"); return result }
         catch { try? Self.exec(db, "ROLLBACK"); throw error }
     }
 
@@ -228,9 +266,51 @@ actor SQLiteStore {
 
     func emptyTrash() throws { try run("DELETE FROM pages WHERE archived=1", []) }
 
-    func movePage(_ id: UUID, toParent parentID: UUID?, before beforeID: UUID? = nil) throws {
+    /// Copy the active subtree in one transaction. New identities make the
+    /// copy independently editable; external media keep their original URLs.
+    func duplicatePage(_ id: UUID) throws -> UUID {
+        try transaction {
+            let all = try pages()
+            guard let source = all.first(where: { $0.id == id && !$0.archived }) else { throw StoreError.missingPage }
+            let active = all.filter { !$0.archived }
+            let children = Dictionary(grouping: active, by: \.parentID)
+            var queue = [source]
+            var visited: Set<UUID> = [id]
+            var cursor = 0
+            while cursor < queue.count {
+                for child in children[queue[cursor].id] ?? [] where visited.insert(child.id).inserted { queue.append(child) }
+                cursor += 1
+            }
+            let ids = Dictionary(uniqueKeysWithValues: queue.map { ($0.id, UUID()) })
+            let copyID = ids[id]!
+            let siblings = children[source.parentID] ?? []
+            let titles = Set(siblings.map(\.title))
+            let title = PageCopyNaming.title(for: source.title, siblings: titles)
+            for page in queue {
+                let newID = ids[page.id]!
+                let parent = page.id == id ? source.parentID : page.parentID.flatMap { ids[$0] }
+                try run("INSERT INTO pages(id,parent_id,title,sort_order,archived,updated_at) VALUES(?,NULLIF(?,''),?,?,0,?)",
+                        [newID.uuidString, parent?.uuidString ?? "", page.id == id ? title : page.title,
+                         String(page.order), String(Date().timeIntervalSince1970)])
+                for block in try blocks(in: page.id) {
+                    try run("INSERT INTO blocks(id,page_id,kind,body,sort_order,checked,language,collapsed,formatting,table_layout,image_width,ordered_start) SELECT ?,?,kind,body,sort_order,checked,language,collapsed,formatting,table_layout,image_width,ordered_start FROM blocks WHERE id=?",
+                            [UUID().uuidString, newID.uuidString, block.id.uuidString])
+                }
+            }
+            var siblingIDs = siblings.map(\.id)
+            guard let position = siblingIDs.firstIndex(of: id) else { throw StoreError.missingPage }
+            siblingIDs.insert(copyID, at: position + 1)
+            for (index, sibling) in siblingIDs.enumerated() {
+                try run("UPDATE pages SET sort_order=? WHERE id=?", [String(Int64(index + 1) * 1024), sibling.uuidString])
+            }
+            return copyID
+        }
+    }
+
+    @discardableResult
+    func movePage(_ id: UUID, toParent parentID: UUID?, before beforeID: UUID? = nil) throws -> [Page] {
         let all = try pages()
-        guard let page = all.first(where: { $0.id == id && !$0.archived }) else { return }
+        guard let page = all.first(where: { $0.id == id && !$0.archived }) else { throw StoreError.missingPage }
         var ancestor = parentID
         var visited: Set<UUID> = [id]
         while let current = ancestor {
@@ -251,6 +331,7 @@ actor SQLiteStore {
                 try run("UPDATE pages SET sort_order=? WHERE id=?", [String((position + 1) * 1024), item.id.uuidString])
             }
         }
+        return try pages()
     }
 
     func splitTextBlock(_ first: Block, inserting second: Block, before: Bool = false) throws {
@@ -300,6 +381,47 @@ actor SQLiteStore {
         return block
     }
 
+    func mergeImageCard(_ sources: [Block], card: ImageTextCard) throws {
+        guard let first = sources.first, sources.count >= 3 else { throw StoreError.missingPage }
+        let current = try blocks(in: first.pageID)
+        guard sources.allSatisfy({ old in current.contains(old) }) else { throw AppError.message("内容已变化，请重试") }
+        try transaction {
+            try run("UPDATE blocks SET kind=?,body=?,image_width=NULL WHERE id=?", [BlockKind.imageCard.rawValue, card.encoded, first.id.uuidString])
+            for item in sources.dropFirst() { try run("DELETE FROM blocks WHERE id=?", [item.id.uuidString]) }
+        }
+    }
+
+    func embedPageImages(_ images: [UUID: String], expected: [UUID: String], pageID: UUID) throws {
+        let current = try blocks(in: pageID)
+        guard images.keys.allSatisfy({ id in current.contains { $0.id == id && $0.kind == .image && $0.text == expected[id] } }) else {
+            throw AppError.message("图片已变化，未覆盖当前内容")
+        }
+        for source in images.values { _ = try ImageSource.validated(source) }
+        try transaction {
+            for (id, source) in images { try run("UPDATE blocks SET body=? WHERE id=? AND page_id=?", [source, id.uuidString, pageID.uuidString]) }
+            try run("UPDATE pages SET updated_at=? WHERE id=?", [String(Date().timeIntervalSince1970), pageID.uuidString])
+        }
+    }
+
+    /// Appends a complete external document without replacing existing block identities.
+    func appendTransferBlocks(_ items: [TransferBlock], to pageID: UUID) throws -> [UUID] {
+        guard try pages().contains(where: { $0.id == pageID && !$0.archived }) else { throw StoreError.missingPage }
+        guard !items.isEmpty, items.count <= 100000 else { throw AppError.message("导入内容为空或块数过多") }
+        for item in items where item.kind == .image && !item.text.isEmpty { _ = try ImageSource.validated(item.text) }
+        for item in items where item.kind == .imageCard { guard ImageTextCard.decode(item.text) != nil else { throw AppError.message("图文卡片无效") } }
+        let existing = try blocks(in: pageID)
+        let start = (existing.map(\.order).max() ?? 0) + 1024
+        let ids = items.map { _ in UUID() }
+        try transaction {
+            for (index, item) in items.enumerated() {
+                try run("INSERT INTO blocks(id,page_id,kind,body,sort_order,checked,language,collapsed,formatting,table_layout,image_width,ordered_start) VALUES(?,?,?,?,?,?,?,?,?,?,NULLIF(?,''),NULLIF(?,''))",
+                        [ids[index].uuidString, pageID.uuidString, item.kind.rawValue, item.text, String(start + Int64(index) * 1024), item.checked ? "1" : "0", item.language, item.collapsed ? "1" : "0", String(decoding: try JSONEncoder().encode(item.formatting), as: UTF8.self), String(decoding: try JSONEncoder().encode(item.tableLayout), as: UTF8.self), ImageSizing.width(item.imageWidth).map { String($0) } ?? "", ListNumbering.start(item.listStart).map { String($0) } ?? ""])
+            }
+            try run("UPDATE pages SET updated_at=? WHERE id=?", [String(Date().timeIntervalSince1970), pageID.uuidString])
+        }
+        return ids
+    }
+
     /// Atomically replaces one editor block with imported semantic blocks.
     func replaceBlock(_ id: UUID, pageID: UUID, with replacements: [TransferBlock]) throws -> [Block] {
         let existing = try blocks(in: pageID)
@@ -309,7 +431,7 @@ actor SQLiteStore {
         let inserted = replacements.enumerated().map { offset, item in
             Block(id: UUID(), pageID: pageID, kind: item.kind, text: item.text,
                   order: Int64(targetIndex + offset + 1) * 1024, checked: item.checked,
-                  language: item.language, collapsed: item.collapsed, formatting: item.formatting, tableLayout: item.tableLayout)
+                  language: item.language, collapsed: item.collapsed, formatting: item.formatting, tableLayout: item.tableLayout, imageWidth: item.imageWidth, listStart: item.listStart)
         }
         var ordered = existing
         ordered.remove(at: targetIndex)
@@ -321,15 +443,49 @@ actor SQLiteStore {
                 let order = String((position + 1) * 1024)
                 if insertedIDs.contains(item.id) {
                     let formatting = String(decoding: try JSONEncoder().encode(item.formatting), as: UTF8.self)
-                    try run("INSERT INTO blocks(id,page_id,kind,body,sort_order,checked,language,collapsed,formatting,table_layout) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    try run("INSERT INTO blocks(id,page_id,kind,body,sort_order,checked,language,collapsed,formatting,table_layout,image_width,ordered_start) VALUES(?,?,?,?,?,?,?,?,?,?,NULLIF(?,''),NULLIF(?,''))",
                             [item.id.uuidString, item.pageID.uuidString, item.kind.rawValue, item.text, order,
-                             item.checked ? "1" : "0", item.language, item.collapsed ? "1" : "0", formatting, String(decoding: try JSONEncoder().encode(item.tableLayout), as: UTF8.self)])
+                             item.checked ? "1" : "0", item.language, item.collapsed ? "1" : "0", formatting, String(decoding: try JSONEncoder().encode(item.tableLayout), as: UTF8.self), ImageSizing.width(item.imageWidth).map { String($0) } ?? "", ListNumbering.start(item.listStart).map { String($0) } ?? ""])
                 } else {
                     try run("UPDATE blocks SET sort_order=? WHERE id=?", [order, item.id.uuidString])
                 }
             }
         }
         return inserted
+    }
+
+    /// Insert a complete copy of the selection after its final source block.
+    /// Validate all IDs before writing so stale selections cannot partially copy.
+    func duplicateBlocks(_ ids: Set<UUID>, pageID: UUID) throws -> [Block] {
+        var ordered = try blocks(in: pageID)
+        let sources = ordered.filter { ids.contains($0.id) }
+        guard !ids.isEmpty, sources.count == ids.count,
+              let last = ordered.lastIndex(where: { ids.contains($0.id) }) else {
+            throw StoreError.database("要创建副本的块不存在")
+        }
+        let copies = sources.map { source -> Block in
+            Block(id: UUID(), pageID: pageID, kind: source.kind, text: source.text,
+                  order: 0, checked: source.checked, language: source.language,
+                  collapsed: source.collapsed, formatting: source.formatting, tableLayout: source.tableLayout, imageWidth: source.imageWidth, listStart: source.listStart)
+        }
+        ordered.insert(contentsOf: copies, at: last + 1)
+        let copyIDs = Set(copies.map(\.id))
+        try transaction {
+            for index in ordered.indices {
+                ordered[index].order = Int64(index + 1) * 1024
+                let item = ordered[index]
+                if copyIDs.contains(item.id) {
+                    try run("INSERT INTO blocks(id,page_id,kind,body,sort_order,checked,language,collapsed,formatting,table_layout,image_width,ordered_start) VALUES(?,?,?,?,?,?,?,?,?,?,NULLIF(?,''),NULLIF(?,''))",
+                            [item.id.uuidString, pageID.uuidString, item.kind.rawValue, item.text, String(item.order),
+                             item.checked ? "1" : "0", item.language, item.collapsed ? "1" : "0",
+                             String(decoding: try JSONEncoder().encode(item.formatting), as: UTF8.self),
+                             String(decoding: try JSONEncoder().encode(item.tableLayout), as: UTF8.self), ImageSizing.width(item.imageWidth).map { String($0) } ?? "", ListNumbering.start(item.listStart).map { String($0) } ?? ""])
+                } else {
+                    try run("UPDATE blocks SET sort_order=? WHERE id=?", [String(item.order), item.id.uuidString])
+                }
+            }
+        }
+        return ordered
     }
 
     func moveBlock(_ id: UUID, pageID: UUID, offset: Int) throws -> [Block] {
@@ -362,12 +518,22 @@ actor SQLiteStore {
 
     func applyBlockCommand(_ id: UUID, kind: BlockKind, text: String, formatting: [TextStyleRun] = []) throws {
         let encoded = String(decoding: try JSONEncoder().encode(formatting), as: UTF8.self)
-        try run("UPDATE blocks SET kind=?,body=?,formatting=?,checked=0,language='Plain Text',collapsed=0,table_layout='{}' WHERE id=?",
+        try run("UPDATE blocks SET kind=?,body=?,formatting=?,checked=0,language='Plain Text',collapsed=0,table_layout='{}',image_width=NULL,ordered_start=NULL WHERE id=?",
                 [kind.rawValue, text, encoded, id.uuidString])
     }
 
+    func setListStart(_ start: Int?, for id: UUID) throws {
+        try run("UPDATE blocks SET ordered_start=NULLIF(?,'') WHERE id=? AND kind='numbered'",
+                [ListNumbering.start(start).map { String($0) } ?? "", id.uuidString])
+    }
+
+    func setImageWidth(_ width: Double?, for id: UUID) throws {
+        try run("UPDATE blocks SET image_width=NULLIF(?,'') WHERE id=? AND kind='image'",
+                [ImageSizing.width(width).map { String($0) } ?? "", id.uuidString])
+    }
+
     func setBlockKind(_ id: UUID, kind: BlockKind) throws {
-        try run("UPDATE blocks SET kind=? WHERE id=?", [kind.rawValue, id.uuidString])
+        try run("UPDATE blocks SET kind=?,ordered_start=NULL WHERE id=?", [kind.rawValue, id.uuidString])
     }
 
     func setBlockOptions(_ id: UUID, language: String, collapsed: Bool) throws {
@@ -457,11 +623,24 @@ actor SQLiteStore {
         return document
     }
 
+    /// Verify and archive in one source transaction. If another writer changed
+    /// the tree after it was copied, keep the source rather than hiding new edits.
+    func archiveTransferredPage(_ id: UUID, matching snapshot: TransferDocument) throws {
+        try transaction {
+            let current = try transferSnapshot(name: snapshot.name, pageID: id, includeChildren: true, includeArchived: false)
+            guard current == snapshot else {
+                throw AppError.message(L10n.tr("移动期间源文档已变化，源文档已保留"))
+            }
+            try archivePage(id, archived: true)
+        }
+    }
+
     func importTransfer(_ document: TransferDocument) throws -> [UUID] {
         let ordered = try document.orderedPages()
         for page in ordered {
             guard page.title.count <= 10000 else { throw AppError.message("页面标题过长，未导入") }
             for block in page.blocks where block.kind == .image && !block.text.isEmpty { _ = try ImageSource.validated(block.text) }
+            for block in page.blocks where block.kind == .imageCard { guard ImageTextCard.decode(block.text) != nil else { throw AppError.message("图文卡片无效") } }
         }
         let ids = Dictionary(uniqueKeysWithValues: ordered.map { ($0.id, UUID()) })
         var batches: [UUID: String] = [:]
@@ -474,8 +653,8 @@ actor SQLiteStore {
                 try run("INSERT INTO pages(id,parent_id,title,sort_order,archived,updated_at,trash_batch) VALUES(?,NULLIF(?,''),?,?,?,?,NULLIF(?,''))",
                         [id, parent, page.title, String(Int64(Date().timeIntervalSince1970 * 1000) + Int64(index)), page.archived ? "1" : "0", String(Date().timeIntervalSince1970), batch])
                 for (position, block) in page.blocks.enumerated() {
-                    try run("INSERT INTO blocks(id,page_id,kind,body,sort_order,checked,language,collapsed,formatting,table_layout) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                            [UUID().uuidString, id, block.kind.rawValue, block.text, String(position), block.checked ? "1" : "0", block.language, block.collapsed ? "1" : "0", String(decoding: try JSONEncoder().encode(block.formatting), as: UTF8.self), String(decoding: try JSONEncoder().encode(block.tableLayout), as: UTF8.self)])
+                    try run("INSERT INTO blocks(id,page_id,kind,body,sort_order,checked,language,collapsed,formatting,table_layout,image_width,ordered_start) VALUES(?,?,?,?,?,?,?,?,?,?,NULLIF(?,''),NULLIF(?,''))",
+                            [UUID().uuidString, id, block.kind.rawValue, block.text, String(position), block.checked ? "1" : "0", block.language, block.collapsed ? "1" : "0", String(decoding: try JSONEncoder().encode(block.formatting), as: UTF8.self), String(decoding: try JSONEncoder().encode(block.tableLayout), as: UTF8.self), ImageSizing.width(block.imageWidth).map { String($0) } ?? "", ListNumbering.start(block.listStart).map { String($0) } ?? ""])
                 }
             }
         }

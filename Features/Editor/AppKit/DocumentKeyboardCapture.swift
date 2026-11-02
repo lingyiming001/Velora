@@ -15,12 +15,44 @@ struct DocumentKeyboardCapture: NSViewRepresentable {
         view.selectAll = selectAll; view.delete = delete; view.copy = copy; view.escape = escape; view.insertAfter = insertAfter; view.boundary = boundary
         view.selectionActive = selected
         if selected {
-            DispatchQueue.main.async { if view.selectionActive, view.window?.firstResponder !== view { view.window?.makeFirstResponder(view) } }
+            DispatchQueue.main.async {
+                guard view.selectionActive, let window = view.window,
+                      !((window.firstResponder as? NSTextView)?.isFieldEditor ?? false), window.firstResponder !== view else { return }
+                window.makeFirstResponder(view)
+            }
         }
     }
 }
 
 final class DocumentSelectionView: NSView {
+    private static let instances = NSHashTable<DocumentSelectionView>.weakObjects()
+    private var keyboardMonitor: Any?
+    /// A text view may regain first responder during SwiftUI focus updates.
+    /// Resolve the active document selection before copying its local text range.
+    static func copySelection(in window: NSWindow?, cutting: Bool = false) -> Bool {
+        guard let window, window.attachedSheet == nil,
+              let owner = instances.allObjects.first(where: { $0.window === window && $0.selectionActive }) else { return false }
+        // Title/search/native text fields own their own selection. A stale
+        // document block selection must never intercept their Copy/Cut actions.
+        if (window.firstResponder as? NSTextView)?.isFieldEditor == true { return false }
+        owner.copy()
+        if cutting { owner.delete() }
+        return true
+    }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        Self.instances.add(self)
+        if let keyboardMonitor { NSEvent.removeMonitor(keyboardMonitor); self.keyboardMonitor = nil }
+        guard window != nil else { return }
+        keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.selectionActive, event.window === self.window,
+                  event.modifierFlags.intersection([.command, .option, .control, .shift]) == .command,
+                  let key = event.charactersIgnoringModifiers?.lowercased(), ["c", "x"].contains(key),
+                  Self.copySelection(in: self.window, cutting: key == "x") else { return event }
+            return nil
+        }
+    }
+    deinit { if let keyboardMonitor { NSEvent.removeMonitor(keyboardMonitor) } }
     var selectionActive = false
     var selectAll: () -> Void = {}
     var delete: () -> Void = {}

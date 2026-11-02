@@ -7,6 +7,495 @@ import XCTest
 
 @MainActor
 final class DocumentTransferTests: XCTestCase {
+    func testRawPythonCodeCopyCreatesPythonBlockWithExactWhitespace() async throws {
+        let source = "from dotenv import load_dotenv\nfrom langchain_openai import ChatOpenAI\n\n# 加载环境变量\nload_dotenv()\n\nmodel = ChatOpenAI(\n    model=\"gpt-4o-mini\",\n    temperature=0\n)\nresponse = model.invoke(\"解释 LangChain\")\nprint(response.content)"
+        XCTAssertTrue(ClipboardDocument.isStructured(source, html: nil))
+        let markdown = try await ClipboardDocument.markdown(plain: source, html: nil)
+        let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+        XCTAssertEqual(blocks.count, 1)
+        XCTAssertEqual(blocks[0].kind, .code)
+        XCTAssertEqual(blocks[0].language.lowercased(), "python")
+        XCTAssertEqual(blocks[0].text, source)
+        XCTAssertNil(ClipboardDocument.pythonCode("下面是代码：\nfrom dotenv import load_dotenv\nmodel = 1\n这是一段说明"))
+        XCTAssertNil(ClipboardDocument.pythonCode("from package import value\n说明文字"))
+    }
+
+    func testClipboardAlreadyCollapsedPythonWarnsWithoutInventingNewlines() async throws {
+        let damaged = "from dotenv import load_dotenvfrom langchain_openai import ChatOpenAI# 1. 加载环境变量load_dotenv()# 2. 创建模型model = ChatOpenAI(    model=\"gpt-4o-mini\",    temperature=0)"
+        let html = "<p>创建文件 <code>example_01.py</code>：</p><div><div><pre dir='ltr'><code>" + HTMLTransfer.escape(damaged) + "</code></pre></div><div></div></div>"
+        let markdown = try await ClipboardDocument.markdown(plain: "创建文件 example_01.py：\n" + damaged, html: html)
+        let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+        let code = try XCTUnwrap(blocks.first { $0.kind == .code })
+        XCTAssertEqual(code.language.lowercased(), "python")
+        XCTAssertEqual(code.text, damaged)
+        XCTAssertTrue(blocks.contains { $0.kind == .warning && $0.text.contains("复制代码") })
+        let valid = try await DocumentRenderSession.markdown(fromHTML: "<p>创建文件 <code>example_01.py</code>：</p><div><pre><code>import os\n\nprint(os.getcwd())</code></pre></div>")
+        let good = try DocumentTransfer.markdown(valid, title: "").pages[0].blocks
+        XCTAssertEqual(good.first { $0.kind == .code }?.text, "import os\n\nprint(os.getcwd())")
+        XCTAssertFalse(good.contains { $0.kind == .warning })
+    }
+
+    func testImageTextCardLocalizationCopyExportsAndExistingBlocksMerge() async throws {
+        let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 12, pixelsHigh: 8, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        let bytes = bitmap.representation(using: .png, properties: [:])!
+        let card = ImageTextCard(image: "https://example.com/logo.png", title: "LangChain", body: "构建 LLM 应用与 Agent", caption: "关键词：模型集成")
+        let converted = try await LocalDocumentImages.blocks([TransferBlock(.imageCard, card.encoded)]) { _ in bytes }
+        let localized = try XCTUnwrap(ImageTextCard.decode(converted[0].text))
+        XCTAssertTrue(localized.image.hasPrefix("data:image/png;base64,"))
+        XCTAssertEqual(localized.title, card.title)
+        let page = TransferPage(title: "资料", blocks: converted)
+        let markdown = try DocumentExporter.markdown(page, assetDirectory: nil)
+        XCTAssertTrue(markdown.contains("![图片]")); XCTAssertTrue(markdown.contains("LangChain"))
+        XCTAssertFalse(markdown.contains("\"caption\""))
+        let html = HTMLTransfer.page(page)
+        XCTAssertTrue(html.contains("velora-image-card"))
+        let renderer = DocumentRenderSession(); defer { renderer.close() }
+        try await renderer.render(TransferDocument(name: "卡片", pages: [page]))
+        let visualHTML = try await renderer.html(TransferDocument(name: "卡片", pages: [page]))
+        XCTAssertTrue(visualHTML.contains("velora-image-card"))
+        let roundTrip = try await DocumentRenderSession.markdown(fromHTML: html)
+        let imported = try DocumentTransfer.markdown(roundTrip, title: "", consumeLeadingTitle: false)
+        XCTAssertEqual(ImageTextCard.decode(imported.pages[0].blocks.first(where: { $0.kind == .imageCard })!.text), localized)
+        let directory = try mediaSaveDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try SQLiteStore(databaseURL: directory.appendingPathComponent("cards.sqlite"))
+        let ids = try await store.importTransfer(TransferDocument(name: "资料", pages: [TransferPage(title: "旧布局", blocks: localized.expanded)]))
+        let original = try await store.blocks(in: ids[0])
+        try await store.mergeImageCard(original, card: localized)
+        let merged = try await store.blocks(in: ids[0])
+        XCTAssertEqual(merged.count, 1); XCTAssertEqual(merged[0].id, original[0].id)
+        XCTAssertEqual(merged[0].kind, .imageCard)
+        XCTAssertEqual(ImageTextCard.decode(merged[0].text), localized)
+        let copy = NSPasteboard.withUniqueName(); defer { copy.releaseGlobally() }
+        XCTAssertTrue(ClipboardDocument.copyBlocks([TransferBlock(merged[0])], to: copy))
+        XCTAssertEqual(ClipboardDocument.blocks(from: copy), converted)
+        let docx = try DOCXTransfer.encode(TransferDocument(name: "卡片", pages: [page]))
+        XCTAssertTrue(try ZIPPackage.decode(docx).keys.contains { $0.hasPrefix("word/media/") })
+    }
+
+    func testRemoteImagesEmbedOriginalBytesDeduplicateAndSurviveReopening() async throws {
+        let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 8, pixelsHigh: 6, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        let bytes = bitmap.representation(using: .png, properties: [:])!
+        let remote = "https://example.com/expiring-image.png"
+        var requests = 0
+        let input = [TransferBlock(.paragraph, "原文"), TransferBlock(.image, remote, imageWidth: 180), TransferBlock(.image, remote), TransferBlock(.bookmark, "https://example.com")]
+        let embedded = try await LocalDocumentImages.blocks(input) { source in
+            requests += 1; XCTAssertEqual(source, remote); return bytes
+        }
+        XCTAssertEqual(requests, 1)
+        XCTAssertTrue(embedded[1].text.hasPrefix("data:image/png;base64,"))
+        XCTAssertEqual(Data(base64Encoded: embedded[1].text.components(separatedBy: ";base64,")[1]), bytes)
+        XCTAssertEqual(embedded[1].text, embedded[2].text)
+        XCTAssertEqual(embedded[1].imageWidth, 180)
+        XCTAssertEqual(embedded[3], input[3])
+        let directory = try mediaSaveDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("offline.sqlite")
+        let store = try SQLiteStore(databaseURL: path)
+        let ids = try await store.importTransfer(TransferDocument(name: "离线图片", pages: [TransferPage(title: "图片", blocks: embedded)]))
+        let reopened = try SQLiteStore(databaseURL: path)
+        let loaded = try await reopened.blocks(in: ids[0])
+        XCTAssertEqual(loaded[1].text, embedded[1].text)
+        XCTAssertNotNil(ImageSource.thumbnail(loaded[1].text))
+        let noNetwork = try await LocalDocumentImages.blocks(embedded) { _ in XCTFail("Local image must not fetch"); return Data() }
+        XCTAssertEqual(noNetwork, embedded)
+        let remoteIDs = try await store.importTransfer(TransferDocument(name: "旧页", pages: [TransferPage(title: "旧页", blocks: input)]))
+        let before = try await store.blocks(in: remoteIDs[0])
+        let replacements = [before[1].id: embedded[1].text, before[2].id: embedded[2].text]
+        try await store.embedPageImages(replacements, expected: [before[1].id: remote, before[2].id: remote], pageID: remoteIDs[0])
+        let after = try await store.blocks(in: remoteIDs[0])
+        XCTAssertEqual(after.map(\.id), before.map(\.id))
+        XCTAssertEqual(after[1].text, embedded[1].text)
+        do {
+            try await store.embedPageImages(replacements, expected: [before[1].id: remote, before[2].id: remote], pageID: remoteIDs[0])
+            XCTFail("Stale sources must not overwrite current data")
+        } catch { }
+    }
+
+    func testImageLocalizationFailureDoesNotReturnPartialContent() async throws {
+        let input = [TransferBlock(.paragraph, "原文"), TransferBlock(.image, "https://example.com/missing.png")]
+        do {
+            _ = try await LocalDocumentImages.blocks(input) { _ in Data("not an image".utf8) }
+            XCTFail("Invalid download must fail")
+        } catch { }
+        XCTAssertEqual(input[1].text, "https://example.com/missing.png")
+    }
+
+    func testChatGPTImageCardsBecomeImagesInsteadOfSourceTitleLinks() async throws {
+        let names = ["LangChain", "LangGraph", "LangSmith"]
+        let sourceTitles = ["LangChain - Partner Ecosystem | MongoDB", "Improve your AI infrastructure - AI memory engine", "AI Quality Assurance & Governance – Humancloud Technologies"]
+        var html = "<p>这是初学者经常混淆的三个概念。</p>"
+        for index in names.indices {
+            html += "<div><a href='https://images.openai.com/static-rsc-4/resource-\(index)?purpose=inline'>" + sourceTitles[index] + "</a><p><strong>" + names[index] + "</strong></p><p>用途说明</p><p>关键词：应用开发、模型集成</p></div>"
+        }
+        let markdown = try await ClipboardDocument.markdown(plain: sourceTitles.map { "[" + $0 + "](https://example.com)" }.joined(separator: "\n"), html: html)
+        let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+        XCTAssertEqual(blocks.filter { $0.kind == .imageCard }.count, 3)
+        let flattened = TransferDocument(name: "", pages: [TransferPage(title: "", blocks: blocks)]).expandingImageCards().pages[0].blocks
+        let images = flattened.filter { $0.kind == .image }
+        XCTAssertEqual(images.count, 3, markdown)
+        for index in names.indices {
+            XCTAssertEqual(images[index].text, "https://images.openai.com/static-rsc-4/resource-\(index)?purpose=inline")
+            XCTAssertTrue(flattened.contains { $0.text == names[index] })
+            XCTAssertFalse(blocks.contains { $0.text.contains(sourceTitles[index]) })
+        }
+        XCTAssertTrue(ClipboardDocument.isStructured(nil, html: html))
+        let reopened = try JSONDecoder().decode([TransferBlock].self, from: JSONEncoder().encode(blocks))
+        XCTAssertEqual(reopened, blocks)
+    }
+
+    func testLinkedImagesDoNotNestMarkdownLinksAndNormalLinksRemainText() async throws {
+        let html = "<a href='https://example.com/article'><img src='https://example.com/logo.png' alt='Logo'/></a><a href='https://example.com/manual'>文档链接</a><a href='https://images.openai.com.evil.example/static-rsc-4/x'>普通链接</a><a href='javascript:alert(1)'>无效链接</a>"
+        let markdown = try await ClipboardDocument.markdown(plain: "**标题**", html: html)
+        let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+        XCTAssertEqual(blocks.filter { $0.kind == .image }.map(\.text), ["https://example.com/logo.png"])
+        XCTAssertFalse(markdown.contains("[\n\n!["))
+        XCTAssertTrue(markdown.contains("[文档链接](<https://example.com/manual>)"))
+        XCTAssertTrue(markdown.contains("[普通链接](<https://images.openai.com.evil.example/static-rsc-4/x>)"))
+        XCTAssertFalse(markdown.contains("javascript:"))
+    }
+
+    func testChatGPTCodePasteRestoresExactPlainTextLineBreaksAndIndentation() async throws {
+        let code = "from langchain_core.prompts import ChatPromptTemplate\n\nprompt = ChatPromptTemplate.from_messages([\n    (\"system\", \"你是一位专业的 Python 讲师\"),\n    (\"human\", \"请解释：{question}\")\n])"
+        let collapsed = code.replacingOccurrences(of: "\n", with: "")
+        let html = "<p>示例</p><div data-language='python'><pre><code>" + HTMLTransfer.escape(collapsed) + "</code></pre></div><p>结束</p>"
+        let markdown = try await ClipboardDocument.markdown(plain: "示例\nPython\n" + code + "\n结束", html: html)
+        let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+        let block = try XCTUnwrap(blocks.first { $0.kind == .code })
+        XCTAssertEqual(block.text, code)
+        XCTAssertEqual(block.language.lowercased(), "python")
+        let copied = NSPasteboard.withUniqueName(); defer { copied.releaseGlobally() }
+        XCTAssertTrue(ClipboardDocument.copyBlocks([block], to: copied))
+        XCTAssertEqual(copied.string(forType: .string), code)
+        XCTAssertEqual(ClipboardDocument.blocks(from: copied)?.first?.text, code)
+    }
+
+    func testHTMLCodeBlockStyledSpanLinesAndBlankLinesWithoutPlainClipboard() async throws {
+        let html = "<pre><code class='language-python'><span style='display:block'>import example</span><span style='display:block'></span><span style='display:block'>if True:</span><span style='display:block'>    print(1)</span></code></pre>"
+        let markdown = try await DocumentRenderSession.markdown(fromHTML: html)
+        let blocks = try DocumentTransfer.markdown(markdown, title: "").pages[0].blocks
+        XCTAssertEqual(blocks.first?.text, "import example\n\nif True:\n    print(1)")
+        XCTAssertEqual(blocks.first?.language.lowercased(), "python")
+        let header = try await DocumentRenderSession.markdown(fromHTML: "<div><div><span>Python</span><button>Copy</button><button>Run</button></div><div><pre><code>print(1)</code></pre></div></div>")
+        XCTAssertEqual(try DocumentTransfer.markdown(header, title: "").pages[0].blocks.first(where: { $0.kind == .code })?.language.lowercased(), "python")
+        let unrelated = try await DocumentRenderSession.markdown(fromHTML: "<pre><code>a = 1\nb = 2</code></pre>", plainText: "另一段\n无关内容")
+        XCTAssertEqual(try DocumentTransfer.markdown(unrelated, title: "").pages[0].blocks.first?.text, "a = 1\nb = 2")
+    }
+
+    func testChatGPTSVGIconsSurviveClipboardAsCompactOfflineImages() async throws {
+        let icons = [
+            "<path d='M12 22v-5'/><path d='M8 2v5M16 2v5'/><rect x='5' y='7' width='14' height='10' rx='3'/>",
+            "<path d='M21 11a8 8 0 0 1-8 8H5l-3 3V11a9 9 0 0 1 19 0Z'/>",
+            "<rect x='4' y='3' width='16' height='18' rx='3'/><path d='M8 8h8M8 12h5'/>",
+            "<ellipse cx='12' cy='5' rx='8' ry='3'/><path d='M4 5v14c0 4 16 4 16 0V5M4 12c0 4 16 4 16 0'/>",
+            "<path d='m4 20 7-7a6 6 0 0 0 7-7l-4 4-3-3 4-4a6 6 0 0 0-7 7l-7 7Z'/>",
+            "<circle cx='12' cy='12' r='9'/><path d='M12 6v6l4 2'/>",
+            "<path d='M12 2 21 6v7c0 5-9 9-9 9s-9-4-9-9V6Z'/><path d='M12 7v6M12 16h.01'/>"
+        ]
+        let titles = ["连接模型", "管理 Prompt", "处理文档", "检索知识", "调用工具", "管理状态", "处理异常"]
+        let rows = zip(icons,titles).map { icon,title in
+            "<div style='display:flex'><span aria-hidden='true'><svg aria-hidden='true' viewBox='0 0 24 24' width='24' height='24' fill='none' stroke='currentColor' stroke-width='2'>" + icon + "</svg></span><div><p><strong>" + title + "</strong></p><p>能力说明</p></div></div>"
+        }.joined()
+        let markdown = try await ClipboardDocument.markdown(plain: titles.joined(separator: "\n"), html: rows)
+        let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).expandingImageCards().pages[0].blocks
+        let images = blocks.filter { $0.kind == .image }
+        XCTAssertEqual(images.count, 7, markdown)
+        for image in images {
+            let valid = try ImageSource.validated(image.text)
+            let picture = try XCTUnwrap(ImageSource.thumbnail(valid))
+            XCTAssertLessThanOrEqual(picture.size.width, 24)
+            XCTAssertGreaterThan(picture.size.height, 0)
+            let data = try XCTUnwrap(Data(base64Encoded: valid.components(separatedBy: ";base64,").last!))
+            let bitmap = try XCTUnwrap(NSBitmapImageRep(data: data))
+            var visiblePixels = 0
+            for y in 0..<bitmap.pixelsHigh { for x in 0..<bitmap.pixelsWide {
+                if (bitmap.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0.1 { visiblePixels += 1 }
+            } }
+            XCTAssertGreaterThan(visiblePixels, 8, "Icon must contain visible drawing, not a transparent image")
+        }
+        for title in titles { XCTAssertTrue(blocks.contains { $0.text.contains(title) }) }
+        XCTAssertFalse(markdown.contains("<svg"))
+        let json = try JSONEncoder().encode(blocks)
+        XCTAssertEqual(try JSONDecoder().decode([TransferBlock].self, from: json), blocks)
+        let copied = NSPasteboard.withUniqueName(); defer { copied.releaseGlobally() }
+        XCTAssertTrue(ClipboardDocument.copyBlocks(blocks, to: copied))
+        XCTAssertEqual(ClipboardDocument.blocks(from: copied), blocks)
+    }
+
+    func testSVGClipboardStripsActiveContentAndKeepsVisibleText() async throws {
+        let svg = "<svg viewBox='0 0 24 24' width='24' height='24' fill='none' stroke='currentColor' onload='alert(1)'><script>window.pwned=true</script><foreignObject><p>恶意内容</p></foreignObject><image href='https://invalid.example/track'/><circle cx='12' cy='12' r='8'/><path d='M4 4h16' style='stroke:url(https://invalid.example/x)'/></svg>"
+        let markdown = try await DocumentRenderSession.markdown(fromHTML: "<p>之前</p>" + svg + "<p>之后</p><button>" + svg + "复制</button>")
+        let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+        XCTAssertEqual(blocks.filter { $0.kind == .image }.count, 1)
+        XCTAssertTrue(blocks.contains { $0.text == "之前" })
+        XCTAssertTrue(blocks.contains { $0.text == "之后" })
+        XCTAssertFalse(markdown.contains("恶意内容"))
+        XCTAssertFalse(markdown.contains("invalid.example"))
+        XCTAssertFalse(markdown.contains("复制"))
+    }
+
+    func testEPUBBookPackageHierarchyReadingOrderAndOfflineImages() async throws {
+        let parent = UUID(), child = UUID(), grandchild = UUID(), second = UUID()
+        let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 4, pixelsHigh: 3, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        let source = "data:image/png;base64," + bitmap.representation(using: .png, properties: [:])!.base64EncodedString()
+        let document = TransferDocument(name: "技术书 & <学习>", pages: [
+            TransferPage(id: parent, title: "第一章", blocks: [TransferBlock(.heading, "概念 & 基础"), TransferBlock(.numbered, "Token", listStart: 1), TransferBlock(.paragraph, "正文"), TransferBlock(.numbered, "Prompt", listStart: 2), TransferBlock(.image, source), TransferBlock(.image, source), TransferBlock(.code, "if a < b {\n  print(\"&\")\n}"), TransferBlock(.table, "[[\"名称\",\"说明\"],[\"A\",\"B\"]]")]),
+            TransferPage(id: second, title: "第二章", blocks: [TransferBlock(.paragraph, "结束")]),
+            TransferPage(id: child, parentID: parent, title: "子章节", blocks: [TransferBlock(.markdown, "## Markdown 标题\n\n**粗体**")]),
+            TransferPage(id: grandchild, parentID: child, title: "孙章节", blocks: [TransferBlock(.equation, "x^2")])
+        ])
+        let data = try await EPUBTransfer.encode(document)
+        // EPUB OCF requires the first local entry to be stored, with no extra field.
+        XCTAssertEqual(Array(data[8..<10]), [0, 0])
+        XCTAssertEqual(Array(data[28..<30]), [0, 0])
+        XCTAssertEqual(String(data: data[30..<38], encoding: .utf8), "mimetype")
+        XCTAssertEqual(String(data: data[38..<58], encoding: .utf8), "application/epub+zip")
+        let package = try ZIPPackage.decode(data)
+        for (path, bytes) in package where path.hasSuffix(".xhtml") || path.hasSuffix(".xml") || path.hasSuffix(".opf") {
+            XCTAssertNoThrow(try XMLDocument(data: bytes, options: []), path)
+        }
+        let opf = try XMLDocument(data: XCTUnwrap(package["EPUB/package.opf"]))
+        XCTAssertEqual(try opf.nodes(forXPath: "//*[local-name()='itemref']").count, 4)
+        let chapter = String(decoding: try XCTUnwrap(package["EPUB/chapter-1.xhtml"]), as: UTF8.self)
+        XCTAssertTrue(chapter.contains("<ol start=\"2\">"))
+        XCTAssertTrue(chapter.contains("<table>"))
+        XCTAssertFalse(chapter.contains("data:image"))
+        XCTAssertEqual(package.keys.filter { $0.hasPrefix("EPUB/images/") }.count, 1)
+        let nav = String(decoding: try XCTUnwrap(package["EPUB/nav.xhtml"]), as: UTF8.self)
+        XCTAssertTrue(nav.contains("epub:type=\"toc\""))
+        XCTAssertTrue(nav.contains("chapter-1.xhtml#heading-0"))
+        XCTAssertTrue(String(decoding: package["EPUB/chapter-2.xhtml"]!, as: UTF8.self).contains("子章节"))
+        XCTAssertTrue(String(decoding: package["EPUB/chapter-3.xhtml"]!, as: UTF8.self).contains("孙章节"))
+        XCTAssertTrue(String(decoding: package["EPUB/chapter-4.xhtml"]!, as: UTF8.self).contains("第二章"))
+        let output = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".agents/test/epub-fixture.epub")
+        try await DocumentExporter.write(document, format: .epub, to: output)
+        XCTAssertEqual(TransferFormat.epub.ext, "epub")
+        XCTAssertNil(TransferFormat.detect(output), "EPUB export does not imply EPUB import")
+    }
+
+    func testEPUBFailureProtectsExistingExportAndDoesNotLeakLocalPaths() async throws {
+        let directory = try mediaSaveDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let output = directory.appendingPathComponent("book.epub")
+        let original = Data("existing".utf8); try original.write(to: output)
+        let invalid = TransferDocument(name: "图片错误", pages: [TransferPage(title: "A", blocks: [TransferBlock(.image, "data:image/png;base64,YmFk")])])
+        do { try await DocumentExporter.write(invalid, format: .epub, to: output); XCTFail("Invalid image must fail") } catch { }
+        XCTAssertEqual(try Data(contentsOf: output), original)
+        let document = TransferDocument(name: "附件", pages: [TransferPage(title: "A", blocks: [TransferBlock(.file, "file:///private/example.pdf"), TransferBlock(.video, "https://example.com/watch?v=1&x=2"), TransferBlock(.paragraph, "control\u{0001}text")])])
+        let package = try ZIPPackage.decode(try await EPUBTransfer.encode(document))
+        let bytes = try XCTUnwrap(package["EPUB/chapter-1.xhtml"])
+        let html = String(decoding: bytes, as: UTF8.self)
+        XCTAssertFalse(html.contains("/private/"))
+        XCTAssertTrue(html.contains("watch?v=1&amp;x=2"))
+        XCTAssertNoThrow(try XMLDocument(data: bytes))
+    }
+
+    func testChatGPTInlineBadgeAndImportanceRemainOneLineWithCodeAndBoldStyles() async throws {
+        let title = "23. MySQL 索引为什么会失效？什么是最左前缀原则？"
+        let variants = [
+            "<p><code>难度 ★★★★☆</code> <strong>重要程度：★★★★★</strong></p>",
+            "<div style='display:flex;gap:16px'><div><p><code>难度 ★★★★☆</code></p></div><blockquote><p><strong>重要程度：★★★★★</strong></p></blockquote></div>",
+            "<p><code>难度 ★★★★☆</code></p><blockquote><strong>重要程度：★★★★★</strong></blockquote>",
+            "<p><span>\n    <code>难度 ★★★★☆</code>\n    </span><strong>重要程度：★★★★★</strong></p>"
+        ]
+        for row in variants {
+            let html = "<h3>" + title + "</h3>" + row + "<h3>一、标准答案</h3>"
+            let plain = title + "\n难度 ★★★★☆ 重要程度：★★★★★\n一、标准答案"
+            let markdown = try await ClipboardDocument.markdown(plain: plain, html: html)
+            let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+            XCTAssertEqual(blocks.map(\.kind), [.heading3, .paragraph, .heading3], markdown)
+            guard blocks.count == 3 else { continue }
+            XCTAssertTrue(blocks[1].text.contains("难度 ★★★★☆"))
+            XCTAssertTrue(blocks[1].text.contains("重要程度：★★★★★"))
+            XCTAssertFalse(blocks[1].text.contains("\n"))
+            XCTAssertTrue(blocks[1].formatting.contains { $0.style.code })
+            XCTAssertTrue(blocks[1].formatting.contains { $0.style.bold == true })
+            XCTAssertTrue(RichInlineContent.html(blocks[1].text, runs: blocks[1].formatting).contains("<code>"))
+        }
+    }
+
+    func testClipboardLayoutDoesNotMergeIndependentParagraphsOrQuotesAndKeepsCodeIndent() async throws {
+        let html = "<p><code>难度 ★★★★☆</code></p><blockquote><strong>重要程度：★★★★★</strong></blockquote><pre><code>if ok:\n    call()\n\n    done()</code></pre>"
+        let markdown = try await ClipboardDocument.markdown(plain: "难度 ★★★★☆\n重要程度：★★★★★", html: html)
+        let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+        XCTAssertEqual(blocks.map(\.kind), [.paragraph, .quote, .code])
+        XCTAssertEqual(blocks.last?.text, "if ok:\n    call()\n\n    done()")
+        let column = "<div style='display:flex;flex-direction:column'><p>A</p><p>B</p></div>"
+        let columnMarkdown = try await ClipboardDocument.markdown(plain: nil, html: column)
+        let columnBlocks = try DocumentTransfer.markdown(columnMarkdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+        XCTAssertEqual(columnBlocks.map(\.text), ["A", "B"])
+    }
+
+    func testInlineCodeHasNeutralBackgroundAndRoundTripsWithoutInventedHighlight() {
+        let parsed = RichInlineContent.parseMarkdown("`难度 ★★★★☆` **重要程度：★★★★★**")
+        let base = NSFont.systemFont(ofSize: 17)
+        let rendered = RichTextFormatting.attributed(parsed.text, runs: parsed.runs, base: base)
+        let attributes = rendered.attributes(at: 0, effectiveRange: nil)
+        XCTAssertNotNil(attributes[.backgroundColor])
+        XCTAssertTrue(RichTextFormatting.hasDefaultCodeBackground(attributes))
+        let roundTrip = RichTextFormatting.runs(rendered, base: base)
+        XCTAssertTrue(roundTrip.contains { $0.style.code && $0.style.highlight == nil && $0.style.fontFamily == parsed.runs.first?.style.fontFamily })
+        var defaultStyle = InlineTextStyle(); defaultStyle.code = true
+        let defaultCode = RichTextFormatting.attributed("x", runs: [TextStyleRun(location: 0, length: 1, style: defaultStyle)], base: base)
+        XCTAssertNil(RichTextFormatting.runs(defaultCode, base: base).first?.style.fontFamily)
+        var explicit = InlineTextStyle(); explicit.code = true; explicit.highlight = "FFFF00"
+        let highlighted = RichTextFormatting.attributed("x", runs: [TextStyleRun(location: 0, length: 1, style: explicit)], base: base)
+        XCTAssertEqual(RichTextFormatting.runs(highlighted, base: base).first?.style.highlight, "FFFF00")
+    }
+
+    private func mediaSaveDirectory() throws -> URL {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".agents/test/MediaSave-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
+    func testEmbeddedMediaSavesExactOriginalBytesAndCleansTemporaryData() async throws {
+        let directory = try mediaSaveDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let original = Data([0, 1, 2, 3, 250, 255])
+        for (kind, mime, ext) in [(BlockKind.image, "image/png", "png"), (.pdfDocument, "application/pdf", "pdf"), (.audio, "audio/mpeg", "mp3")] {
+            let source = "data:" + mime + ";base64," + original.base64EncodedString()
+            let resource = try await MediaResourceExporter.prepare(source: source, kind: kind, temporaryDirectory: directory)
+            XCTAssertEqual((resource.filename as NSString).pathExtension, ext)
+            let output = directory.appendingPathComponent(resource.filename)
+            try await resource.write(to: output)
+            XCTAssertEqual(try Data(contentsOf: output), original, "Saving must not export a resized display thumbnail")
+            let preparedURL = resource.fileURL
+            resource.discard()
+            XCTAssertFalse(FileManager.default.fileExists(atPath: preparedURL.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+        }
+        do { _ = try await MediaResourceExporter.prepare(source: "data:image/png;base64,!bad!", kind: .image, temporaryDirectory: directory); XCTFail("Invalid data must fail") } catch { }
+    }
+
+    func testLocalMediaSaveCopiesBytesReplacesDestinationAndNeverDeletesSource() async throws {
+        let directory = try mediaSaveDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("原视频.mp4")
+        let original = Data("source video bytes".utf8)
+        try original.write(to: source)
+        let link = directory.appendingPathComponent("video-link.mp4")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: source)
+        let resource = try await MediaResourceExporter.prepare(source: link.absoluteString, kind: .video, temporaryDirectory: directory)
+        let output = directory.appendingPathComponent("copy.mp4")
+        try Data("existing file".utf8).write(to: output)
+        try await resource.write(to: output)
+        XCTAssertEqual(try Data(contentsOf: output), original)
+        XCTAssertFalse(try output.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink ?? true)
+        try await resource.write(to: source) // choosing the original filename is a no-op
+        resource.discard()
+        XCTAssertEqual(try Data(contentsOf: source), original)
+        do { _ = try await MediaResourceExporter.prepare(source: directory.path, kind: .file, temporaryDirectory: directory); XCTFail("Directories are not media files") } catch { }
+        do { _ = try await MediaResourceExporter.prepare(source: directory.appendingPathComponent("missing.mp3").path, kind: .audio, temporaryDirectory: directory); XCTFail("Missing file must fail") } catch { }
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: directory.path).contains { $0.hasPrefix(".velora-save-") })
+    }
+
+    func testRemoteMediaPreparationUsesResponseFilenameAndCleansDownloadOnFailure() async throws {
+        let directory = try mediaSaveDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = try XCTUnwrap(URL(string: "https://example.test/download?token=private"))
+        let downloaded = directory.appendingPathComponent("download.tmp")
+        let original = Data("remote original bytes".utf8)
+        try original.write(to: downloaded)
+        let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil,
+            headerFields: ["Content-Type": "image/png", "Content-Disposition": "attachment; filename=\"diagram.png\""]))
+        let resource = try await MediaResourceExporter.prepare(source: url.absoluteString, kind: .image, temporaryDirectory: directory,
+            download: { _ in (downloaded, response) })
+        XCTAssertEqual(resource.filename, "diagram.png")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: downloaded.path))
+        let destination = directory.appendingPathComponent("saved.png")
+        try await resource.write(to: destination)
+        XCTAssertEqual(try Data(contentsOf: destination), original)
+        resource.discard()
+        try original.write(to: downloaded)
+        let denied = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 403, httpVersion: nil, headerFields: [:]))
+        do {
+            _ = try await MediaResourceExporter.prepare(source: url.absoluteString, kind: .image, temporaryDirectory: directory,
+                download: { _ in (downloaded, denied) })
+            XCTFail("HTTP errors must not be saved as media")
+        } catch { }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: downloaded.path))
+        XCTAssertEqual(try Data(contentsOf: destination), original)
+    }
+
+    func testMediaSaveRejectsWebPagesAndPlaylistsAndHandlesCancellationAtomically() async throws {
+        let directory = try mediaSaveDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = try XCTUnwrap(URL(string: "https://example.test/video"))
+        for mime in ["text/html", "application/vnd.apple.mpegurl", "application/dash+xml"] {
+            let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": mime]))
+            XCTAssertThrowsError(try MediaResourceExporter.validate(response, kind: .video))
+        }
+        let source = directory.appendingPathComponent("source.bin")
+        let destination = directory.appendingPathComponent("saved.bin")
+        try Data("new data".utf8).write(to: source)
+        let original = Data("keep existing data".utf8)
+        try original.write(to: destination)
+        let resource = try await MediaResourceExporter.prepare(source: source.path, kind: .file, temporaryDirectory: directory)
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await resource.write(to: destination)
+        }
+        do { try await task.value; XCTFail("Cancelled write must fail") } catch is CancellationError { } catch { XCTFail("Unexpected error: \(error)") }
+        XCTAssertEqual(try Data(contentsOf: destination), original)
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: directory.path).contains { $0.hasPrefix(".velora-save-") })
+        let safe = MediaResourceExporter.filename("../../图像", mime: "image/png", kind: .image)
+        XCTAssertEqual(safe, "图像.png")
+        XCTAssertEqual(MediaResourceExporter.filename("download.php", mime: "image/png", kind: .image), "download.png")
+        XCTAssertEqual(MediaResourceExporter.filename("clip.mp4", mime: "application/octet-stream", kind: .video), "clip.mp4")
+        XCTAssertFalse(MediaResourceExporter.supports(.bookmark))
+    }
+
+    func testPastedNumberedSectionsKeepStartsAcrossProseCodeAndBullets() async throws {
+        let html = """
+        <ol><li><strong>Token</strong></li></ol>
+        <p>Token 是模型处理文本时的基本单位。</p><p>例如：</p>
+        <pre><code>Java 是一种编程语言</code></pre>
+        <p>Token 很重要：</p><ul><li>上下文长度</li><li>API 费用</li></ul>
+        <ol start="2"><li><strong>Prompt</strong></li></ol>
+        """
+        let markdown = try await ClipboardDocument.markdown(plain: "1. Token\n2. Prompt", html: html)
+        let document = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false)
+        let page = try XCTUnwrap(document.pages.first)
+        let numbered = zip(page.blocks, ListNumbering.numbers(page.blocks)).filter { $0.0.kind == .numbered }
+        XCTAssertEqual(numbered.map { $0.0.text }, ["Token", "Prompt"])
+        XCTAssertEqual(numbered.map { $0.1 }, [1, 2])
+        XCTAssertTrue(numbered.allSatisfy { $0.0.formatting.contains { $0.style.bold == true } })
+        let exported = try DocumentExporter.markdown(page, assetDirectory: nil)
+        XCTAssertTrue(exported.contains("2. **Prompt**"))
+        XCTAssertTrue(DocumentExporter.plain(page).contains("2. Prompt"))
+        XCTAssertTrue(DocumentExporter.richText(document).string.contains("2. Prompt"))
+        let package = try ZIPPackage.decode(DOCXTransfer.encode(document))
+        let xml = try XCTUnwrap(package["word/document.xml"].flatMap { String(data: $0, encoding: .utf8) })
+        XCTAssertTrue(xml.contains("2. Prompt"))
+        let roundTrip = try await ClipboardDocument.markdown(plain: nil, html: HTMLTransfer.page(page))
+        let roundBlocks = try DocumentTransfer.markdown(roundTrip, title: "", consumeLeadingTitle: false).pages[0].blocks
+        XCTAssertEqual(zip(roundBlocks, ListNumbering.numbers(roundBlocks)).filter { $0.0.kind == .numbered }.map { $0.1 }, [1, 2])
+        let values = try await ClipboardDocument.markdown(plain: nil, html: "<ol start='4'><li>A</li><li value='9'>B</li></ol>")
+        let valueBlocks = try DocumentTransfer.markdown(values, title: "", consumeLeadingTitle: false).pages[0].blocks
+        XCTAssertEqual(ListNumbering.numbers(valueBlocks), [4, 9])
+    }
+
+    func testMarkdownRepeatedOneMarkersContinueButSeparateStartsStayExplicit() throws {
+        let blocks = try DocumentTransfer.markdown("1. A\n1. B\n1. C\n\n正文\n\n2. D\n3. E", title: "").pages[0].blocks
+        XCTAssertEqual(zip(blocks, ListNumbering.numbers(blocks)).filter { $0.0.kind == .numbered }.map { $0.1 }, [1, 2, 3, 2, 3])
+        XCTAssertNil(blocks[1].listStart)
+        XCTAssertEqual(blocks[4].listStart, 2)
+    }
+
+    func testBrowserClipboardPrefersSemanticHTMLOverPartialMarkdownPlainText() async throws {
+        let html = """
+        <article><h2>核心结论</h2><blockquote><p>第一段 <strong>重点</strong></p><p>第二段引用</p></blockquote>
+        <h3>具体步骤</h3><ol><li><p>检查输入</p></li><li><p>完成处理</p></li></ol><p>普通正文</p></article>
+        """
+        let plain = "核心结论\n第一段 **重点**\n第二段引用\n具体步骤\n1. 检查输入\n2. 完成处理\n普通正文"
+        let markdown = try await ClipboardDocument.markdown(plain: plain, html: html)
+        let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+        XCTAssertEqual(blocks.map(\.kind), [.heading2, .quote, .heading3, .numbered, .numbered, .paragraph])
+        XCTAssertEqual(blocks[0].text, "核心结论")
+        XCTAssertTrue(blocks[1].text.contains("第二段引用"))
+        XCTAssertTrue(blocks[1].formatting.contains { $0.style.bold == true })
+        XCTAssertEqual(blocks.last?.text, "普通正文")
+    }
+
     func testMarkdownTableInlineCodeHasNoVisibleDelimiterCharacters() throws {
         let source = #"""
         | 方法 | 作用 |

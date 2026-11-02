@@ -12,16 +12,183 @@ struct EditorFocusRequest: Equatable {
     let offset: Int
 }
 
+enum DocumentFindAction: Equatable { case show, replace, next, previous }
+
+struct DocumentFindMatch: Equatable {
+    let blockID: UUID?
+    let row: Int?
+    let column: Int?
+    let range: NSRange
+
+    static func search(_ query: String, title: String, blocks: [Block]) -> [Self] {
+        guard !query.isEmpty else { return [] }
+        var results: [Self] = []
+        func append(_ text: String, blockID: UUID?, row: Int? = nil, column: Int? = nil) {
+            let source = text as NSString
+            var offset = 0
+            while offset < source.length {
+                let range = source.range(of: query, options: [.caseInsensitive, .diacriticInsensitive],
+                                         range: NSRange(location: offset, length: source.length - offset))
+                guard range.location != NSNotFound, range.length > 0 else { break }
+                results.append(Self(blockID: blockID, row: row, column: column, range: range))
+                offset = NSMaxRange(range)
+            }
+        }
+        append(title, blockID: nil)
+        for block in blocks {
+            if block.kind == .table,
+               let rows = try? JSONDecoder().decode([[String]].self, from: Data(block.text.utf8)) {
+                for (row, cells) in rows.enumerated() {
+                    for (column, cell) in cells.enumerated() {
+                        append(TableCellContent.visible(cell, layout: block.tableLayout), blockID: block.id, row: row, column: column)
+                    }
+                }
+            } else if !block.kind.isMedia && ![.pdfDocument, .divider, .tableOfContents].contains(block.kind) {
+                append(block.text, blockID: block.id)
+            }
+        }
+        return results
+    }
+}
+
 @MainActor
 final class WorkspaceModel: ObservableObject {
-    @Published private(set) var pages: [Page] = []
-    @Published private(set) var blocks: [Block] = []
+    @Published private(set) var pages: [Page] = [] {
+        didSet {
+            if oldValue != pages {
+                sidebarPageIndex = SidebarPageIndex(pages: pages)
+                sidebarPageRevision = UUID()
+            }
+            refreshDocumentFind()
+        }
+    }
+    private(set) var sidebarPageIndex = SidebarPageIndex(pages: [])
+    private(set) var sidebarPageRevision = UUID()
+    @Published private(set) var blocks: [Block] = [] { didSet { refreshDocumentFind() } }
     @Published private(set) var selectedBlockIDs: Set<UUID> = []
     @Published private(set) var documentBoundaryRequest: DocumentBoundaryRequest?
     private var blockSelectionAnchor: UUID?
     var activeEditingBlockID: UUID?
-    @Published var selectedPageID: UUID?
+    @Published var selectedPageID: UUID? { didSet { if oldValue != selectedPageID { closeDocumentFind(); lastDocumentReplacement = nil } } }
     @Published var searchText = ""
+    @Published private(set) var documentFindPresented = false
+    @Published var documentFindQuery = "" { didSet { documentReplacementCount = nil; refreshDocumentFind() } }
+    @Published var documentReplacePresented = false
+    @Published var documentReplacement = "" { didSet { documentReplacementCount = nil } }
+    @Published private(set) var documentReplacementCount: Int?
+    private var replacingDocumentFind = false
+    private struct ReplacementSnapshot {
+        let pageID: UUID
+        let titleBefore: String?
+        let titleAfter: String?
+        let before: [Block]
+        let after: [Block]
+    }
+    @Published private var lastDocumentReplacement: ReplacementSnapshot?
+    var canUndoDocumentReplacement: Bool {
+        guard let snapshot = lastDocumentReplacement, snapshot.pageID == selectedPageID,
+              snapshot.titleAfter == nil || snapshot.titleAfter == selectedPage?.title else { return false }
+        return snapshot.after.allSatisfy { saved in blocks.first { $0.id == saved.id } == saved }
+    }
+    @Published private(set) var documentFindMatches: [DocumentFindMatch] = []
+    @Published private(set) var documentFindIndex = 0
+    @Published private(set) var documentFindFocusID = UUID()
+    var currentDocumentFindMatch: DocumentFindMatch? {
+        documentFindMatches.indices.contains(documentFindIndex) ? documentFindMatches[documentFindIndex] : nil
+    }
+
+    func performDocumentFind(_ action: DocumentFindAction) {
+        guard selectedPage != nil else { return }
+        if action == .replace { documentReplacePresented = true }
+        if action == .show || action == .replace || !documentFindPresented {
+            documentFindPresented = true
+            documentFindFocusID = UUID()
+            refreshDocumentFind()
+        } else if !documentFindMatches.isEmpty {
+            let delta = action == .previous ? -1 : 1
+            documentFindIndex = (documentFindIndex + delta + documentFindMatches.count) % documentFindMatches.count
+        }
+        if let id = currentDocumentFindMatch?.blockID, let block = blocks.first(where: { $0.id == id }), block.collapsed {
+            setBlockOptions(for: block, collapsed: false)
+        }
+    }
+
+    func closeDocumentFind() {
+        documentFindPresented = false
+        documentFindMatches = []; documentFindIndex = 0
+        documentReplacementCount = nil
+    }
+
+    private func refreshDocumentFind() {
+        guard documentFindPresented, !replacingDocumentFind else { return }
+        let previous = currentDocumentFindMatch
+        let matches = DocumentFindMatch.search(documentFindQuery, title: selectedPage?.title ?? "", blocks: blocks)
+        if matches != documentFindMatches { documentFindMatches = matches }
+        documentFindIndex = previous.flatMap { matches.firstIndex(of: $0) } ?? 0
+    }
+
+    func replaceDocumentMatches(all: Bool) {
+        guard documentFindPresented, !automationBusy, let pageID = selectedPageID else { return }
+        refreshDocumentFind()
+        let matches = all ? documentFindMatches : currentDocumentFindMatch.map { [$0] } ?? []
+        guard !matches.isEmpty else { documentReplacementCount = 0; return }
+        let replacement = documentReplacement
+        let grouped = Dictionary(grouping: matches, by: \.blockID)
+        let before = blocks.filter { grouped[$0.id] != nil }
+        let titleBefore = grouped[nil] == nil ? nil : selectedPage?.title
+        replacingDocumentFind = true
+        if let titleBefore, let titleMatches = grouped[nil] {
+            renameSelectedPage(RichInlineContent.replacing(titleBefore, runs: [], ranges: titleMatches.map(\.range), with: replacement).text)
+        }
+        for block in before {
+            guard let hits = grouped[block.id] else { continue }
+            if block.kind == .table,
+               let raw = try? JSONDecoder().decode([[String]].self, from: Data(block.text.utf8)) {
+                var rows = raw.map { $0.map { TableCellContent.visible($0, layout: block.tableLayout) } }
+                for row in rows.indices {
+                    for column in rows[row].indices {
+                        let ranges = hits.filter { $0.row == row && $0.column == column }.map(\.range)
+                        rows[row][column] = RichInlineContent.replacing(rows[row][column], runs: [], ranges: ranges, with: replacement).text
+                    }
+                }
+                changeTableCells(rows, in: block)
+            } else {
+                let changed = RichInlineContent.replacing(block.text, runs: block.formatting, ranges: hits.map(\.range), with: replacement)
+                changeRichText(changed.text, formatting: changed.runs, in: block)
+            }
+            editorContentRevisions[block.id, default: 0] &+= 1
+        }
+        lastDocumentReplacement = ReplacementSnapshot(pageID: pageID, titleBefore: titleBefore,
+            titleAfter: titleBefore == nil ? nil : selectedPage?.title, before: before,
+            after: blocks.filter { grouped[$0.id] != nil })
+        replacingDocumentFind = false
+        refreshDocumentFind()
+        if !all, let previous = matches.first {
+            func position(_ match: DocumentFindMatch) -> (Int, Int, Int, Int) {
+                (match.blockID.flatMap { id in blocks.firstIndex { $0.id == id } }.map { $0 + 1 } ?? 0,
+                 match.row ?? -1, match.column ?? -1, match.range.location)
+            }
+            var next = previous
+            next = DocumentFindMatch(blockID: next.blockID, row: next.row, column: next.column,
+                                     range: NSRange(location: previous.range.location + replacement.utf16.count, length: 0))
+            documentFindIndex = documentFindMatches.firstIndex { position($0) >= position(next) } ?? 0
+        } else { documentFindIndex = 0 }
+        documentReplacementCount = matches.count
+    }
+
+    func undoDocumentReplacement() {
+        guard canUndoDocumentReplacement, let snapshot = lastDocumentReplacement else { return }
+        replacingDocumentFind = true
+        if let title = snapshot.titleBefore { renameSelectedPage(title) }
+        for block in snapshot.before {
+            changeRichText(block.text, formatting: block.formatting, in: block)
+            if block.kind == .table { changeTableLayout(block.tableLayout, in: block) }
+            editorContentRevisions[block.id, default: 0] &+= 1
+        }
+        lastDocumentReplacement = nil; documentReplacementCount = nil
+        replacingDocumentFind = false
+        refreshDocumentFind()
+    }
     @Published var errorMessage: String?
     @Published private(set) var saving = false
     @Published private(set) var automationBusy = false
@@ -133,11 +300,31 @@ final class WorkspaceModel: ObservableObject {
     func createPage(parentID: UUID? = nil) {
         Task {
             do {
-                let page = try await store.createPage(parentID: parentID)
-                await refreshPages()
+                let (page, firstBlock) = try await store.createPageWithInitialBlock(parentID: parentID)
+                pages.append(page)
+                pages.sort { $0.order == $1.order ? $0.id.uuidString < $1.id.uuidString : $0.order < $1.order }
+                pageCache[page.id] = [firstBlock]
+                cachedPageOrder.append(page.id)
                 select(page.id)
+                requestFocus(firstBlock.id, offset: 0)
             } catch { report(error) }
         }
+    }
+
+    func duplicatePage(_ page: Page) async throws {
+        guard !workspaceTransitioning, !automationBusy else { throw AppError.message(L10n.tr("正在执行其他操作，请稍后重试")) }
+        automationBusy = true; defer { automationBusy = false }
+        await flushAll()
+        guard !saving else { throw AppError.message(L10n.tr("存在未保存内容，创建副本已停止")) }
+        let id = try await store.duplicatePage(page.id)
+        await refreshPages()
+        select(id)
+    }
+
+    func beginTitleEditing() {
+        clearBlockSelection()
+        activeEditingBlockID = nil
+        editorFocusRequest = nil
     }
 
     func renameSelectedPage(_ title: String) {
@@ -173,18 +360,40 @@ final class WorkspaceModel: ObservableObject {
         var visited: Set<UUID> = []
         while let id = current, visited.insert(id).inserted {
             if id == pageID { return true }
-            current = pages.first(where: { $0.id == id })?.parentID
+            current = sidebarPageIndex.byID[id]?.parentID
         }
         return false
     }
 
+    private var pageMoveQueued = false
+
     func move(_ page: Page, to parentID: UUID?, before beforeID: UUID? = nil) {
-        Task {
-            do {
-                try await store.movePage(page.id, toParent: parentID, before: beforeID)
-                await refreshPages()
-            } catch { report(error) }
+        guard !pageMoveQueued, !automationBusy, !workspaceTransitioning else { return }
+        pageMoveQueued = true
+        // Native menus and drag sessions use nested tracking loops. Reordering
+        // their owning List rows inside those callbacks invalidates active hosts.
+        // Apply structural mutations only after returning to the default mode.
+        RunLoop.main.perform(inModes: [.default]) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                Task { await self.performPageMove(page.id, to: parentID, before: beforeID) }
+            }
         }
+    }
+
+    private func performPageMove(_ id: UUID, to parentID: UUID?, before beforeID: UUID?) async {
+        defer { pageMoveQueued = false }
+        guard !automationBusy, !workspaceTransitioning else { return }
+        automationBusy = true
+        defer { automationBusy = false }
+        do {
+            await flushAll()
+            guard !saving else { throw AppError.message(L10n.tr("存在未保存内容，操作已停止")) }
+            let reordered = try await store.movePage(id, toParent: parentID, before: beforeID)
+            // Reordering does not change block contents. Keep the live editor,
+            // selection, focus and visited-page cache rather than reloading them.
+            if pages != reordered { pages = reordered }
+        } catch { report(error) }
     }
 
     func move(_ page: Page, by offset: Int) {
@@ -237,11 +446,29 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func returnFromSingleLineBlock(_ block: Block, text: String, formatting: [TextStyleRun], selection: NSRange) -> Bool {
-        guard block.kind.isHeading || [.bullet, .numbered, .todo].contains(block.kind) || block.kind.isMedia else { return false }
-        if block.kind.isMedia { exitBlock(block); return true }
+        guard let current = blocks.first(where: { $0.id == block.id }), selectedPageID == block.pageID else { return false }
+        if current.kind.isMedia { exitBlock(current); return true }
+        if current.kind.exitsOnTrailingEmptyLine {
+            // Leave a multiline prose block only from its final empty line.
+            // Keep source editors and table cells outside this rule.
+            guard selection.length == 0, selection.location == text.utf16.count,
+                  text.isEmpty || text.hasSuffix("\n") else { return false }
+            let body = text.isEmpty ? "" : String(text.dropLast())
+            let runs = formatting.compactMap { run -> TextStyleRun? in
+                guard let valid = run.validRange(in: text) else { return nil }
+                let range = NSIntersectionRange(valid, NSRange(location: 0, length: body.utf16.count))
+                return range.length > 0 ? TextStyleRun(location: range.location, length: range.length, style: run.style) : nil
+            }
+            changeRichText(body, formatting: runs, in: current)
+            exitBlock(current)
+            return true
+        }
+        guard current.kind.returnSplitsBlock else { return false }
         guard let index = blocks.firstIndex(where: { $0.id == block.id }), selectedPageID == block.pageID,
               selection.location <= text.utf16.count, selection.length <= text.utf16.count - selection.location else { return false }
-        if text.isEmpty { insertSlashCommand(.paragraph, in: blocks[index], text: ""); return true }
+        if text.isEmpty, current.kind != .paragraph {
+            insertSlashCommand(.paragraph, in: blocks[index], text: ""); return true
+        }
         let original = blocks[index]
         // Return at the start of a heading creates room above it. Splitting
         // the heading here would turn all of its content into body text.
@@ -374,6 +601,11 @@ final class WorkspaceModel: ObservableObject {
                 }
                 else { imported = try DocumentTransfer.markdown(combined, title: "", consumeLeadingTitle: false).pages[0].blocks }
                 if imported.isEmpty { imported = [TransferBlock(.paragraph)] }
+                imported = try await LocalDocumentImages.blocks(imported)
+                guard selectedPageID == current.pageID,
+                      let latest = blocks.first(where: { $0.id == current.id }), latest == current else {
+                    throw AppError.message("图片下载期间目标内容已变化，请重新粘贴")
+                }
                 pendingWrites[current.id]?.cancel(); pendingWrites[current.id] = nil
                 latestText[current.id] = nil; latestFormatting[current.id] = nil; latestTableLayouts[current.id] = nil
                 let inserted = try await store.replaceBlock(current.id, pageID: current.pageID, with: imported)
@@ -382,6 +614,60 @@ final class WorkspaceModel: ObservableObject {
                 saving = !latestText.isEmpty || !pendingConversions.isEmpty
                 clearBlockSelection()
                 if let last = inserted.last { requestFocus(last.id, offset: last.text.utf16.count) }
+            } catch { report(error) }
+        }
+    }
+
+    func mergeImageWithFollowingText(_ image: Block) {
+        Task {
+            guard !automationBusy, !workspaceTransitioning else { return }
+            automationBusy = true; defer { automationBusy = false }
+            do {
+                await flushAll()
+                guard !saving, let index = blocks.firstIndex(where: { $0.id == image.id }), blocks[index].kind == .image else { return }
+                let following = Array(blocks.dropFirst(index + 1).prefix(3).prefix { $0.kind.supportsProseConversion && !$0.text.isEmpty })
+                guard following.count >= 2 else { throw AppError.message("图片下方至少需要标题和说明两段文字") }
+                let sources = [blocks[index]] + following
+                let initial = ImageTextCard(image: blocks[index].text, title: following[0].text, body: following[1].text, caption: following.count > 2 ? following[2].text : "")
+                let localized = try await LocalDocumentImages.blocks([TransferBlock(.imageCard, initial.encoded)])
+                guard sources.allSatisfy({ old in blocks.contains(old) }), let card = ImageTextCard.decode(localized[0].text) else { throw AppError.message("内容已变化，请重试") }
+                try await store.mergeImageCard(sources, card: card)
+                blocks[index].kind = .imageCard; blocks[index].text = card.encoded; blocks[index].imageWidth = nil
+                blocks.removeSubrange((index + 1)...(index + following.count))
+            } catch { report(error) }
+        }
+    }
+
+    func localizePageImages() {
+        Task {
+            guard !automationBusy, !workspaceTransitioning, let pageID = selectedPageID else { return }
+            automationBusy = true; defer { automationBusy = false }
+            do {
+                await flushAll()
+                guard !saving else { throw AppError.message("存在未保存内容，请稍后重试") }
+                let originals = blocks.filter { $0.kind == .image && ($0.text.hasPrefix("http://") || $0.text.hasPrefix("https://")) }
+                guard !originals.isEmpty else { return }
+                let converted = try await LocalDocumentImages.blocks(originals.map(TransferBlock.init))
+                guard selectedPageID == pageID, originals.allSatisfy({ old in blocks.contains { $0 == old } }) else {
+                    throw AppError.message("图片下载期间页面已变化，请重试")
+                }
+                let images = Dictionary(uniqueKeysWithValues: zip(originals, converted).map { ($0.0.id, $0.1.text) })
+                try await store.embedPageImages(images, expected: Dictionary(uniqueKeysWithValues: originals.map { ($0.id, $0.text) }), pageID: pageID)
+                for index in blocks.indices { if let source = images[blocks[index].id] { blocks[index].text = source } }
+            } catch { report(error) }
+        }
+    }
+
+    func localizeImage(_ block: Block) { setImageSource(block.text, in: block) }
+
+    func setImageSource(_ source: String, in block: Block) {
+        Task {
+            do {
+                let converted = try await LocalDocumentImages.blocks([TransferBlock(.image, try ImageSource.validated(source))])
+                guard selectedPageID == block.pageID, let current = blocks.first(where: { $0.id == block.id }), current == block else {
+                    throw AppError.message("图片已变化，未覆盖当前内容")
+                }
+                if let image = converted.first { changeText(image.text, in: current); await flushAll() }
             } catch { report(error) }
         }
     }
@@ -403,6 +689,37 @@ final class WorkspaceModel: ObservableObject {
         scheduleWrite(block.id)
     }
 
+    func setListStart(_ start: Int?, in block: Block) async throws {
+        guard !workspaceTransitioning, blocks.contains(where: { $0.id == block.id && $0.kind == .numbered }) else { return }
+        let value = ListNumbering.start(start)
+        try await store.setListStart(value, for: block.id)
+        pageCache[block.pageID] = nil
+        cachedPageOrder.removeAll { $0 == block.pageID }
+        if let index = blocks.firstIndex(where: { $0.id == block.id }), blocks[index].kind == .numbered { blocks[index].listStart = value }
+    }
+
+    func continueListNumbering(in block: Block) async throws {
+        guard let index = blocks.firstIndex(where: { $0.id == block.id }) else { return }
+        var counter = 0
+        var previous: Int?
+        for item in blocks[..<index] {
+            let number = ListNumbering.advance(kind: item.kind, start: item.listStart, counter: &counter)
+            if item.kind == .numbered { previous = number }
+        }
+        try await setListStart(previous.map { min($0 + 1, 1_000_000_000) } ?? 1, in: block)
+    }
+
+    func resizeImage(_ width: Double?, in block: Block) async throws {
+        guard !workspaceTransitioning, let current = blocks.first(where: { $0.id == block.id }), current.kind == .image else { return }
+        let value = ImageSizing.width(width)
+        try await store.setImageWidth(value, for: block.id)
+        pageCache[block.pageID] = nil
+        cachedPageOrder.removeAll { $0 == block.pageID }
+        if let index = blocks.firstIndex(where: { $0.id == block.id }), blocks[index].kind == .image {
+            blocks[index].imageWidth = value
+        }
+    }
+
     func changeTableLayout(_ layout: TableLayout, in block: Block) {
         guard let index = blocks.firstIndex(where: { $0.id == block.id }), blocks[index].kind == .table,
               blocks[index].tableLayout != layout else { return }
@@ -420,6 +737,44 @@ final class WorkspaceModel: ObservableObject {
         changeText(String(decoding: data, as: UTF8.self), in: current)
         var layout = current.tableLayout.fitted(rows: rows.count, columns: columns)
         layout.cellsArePlain = true
+        changeTableLayout(layout, in: current)
+    }
+
+    func appendTableAxes(row: Bool, column: Bool, in block: Block) {
+        guard row || column, let current = blocks.first(where: { $0.id == block.id }), current.kind == .table,
+              let raw = try? JSONDecoder().decode([[String]].self, from: Data(current.text.utf8)),
+              let columns = raw.first?.count, columns > 0, raw.allSatisfy({ $0.count == columns }) else { return }
+        var cells = raw.map { $0.map { TableCellContent.visible($0, layout: current.tableLayout) } }
+        if column { cells = cells.map { $0 + [""] } }
+        if row { cells.append(Array(repeating: "", count: columns + (column ? 1 : 0))) }
+        changeTableCells(cells, in: current)
+    }
+
+    func deleteTableRow(_ row: Int, in block: Block) {
+        deleteTableAxis(row: row, column: nil, in: block)
+    }
+
+    func deleteTableColumn(_ column: Int, in block: Block) {
+        deleteTableAxis(row: nil, column: column, in: block)
+    }
+
+    private func deleteTableAxis(row: Int?, column: Int?, in block: Block) {
+        guard let current = blocks.first(where: { $0.id == block.id }), current.kind == .table,
+              var rows = try? JSONDecoder().decode([[String]].self, from: Data(current.text.utf8)),
+              let columns = rows.first?.count, columns > 0, rows.allSatisfy({ $0.count == columns }) else { return }
+        var layout = current.tableLayout.fitted(rows: rows.count, columns: columns)
+        if let row {
+            guard rows.count > 1, rows.indices.contains(row) else { return }
+            rows.remove(at: row); layout.rowHeights.remove(at: row)
+        } else if let column {
+            guard columns > 1, (0..<columns).contains(column) else { return }
+            rows = rows.map { values in var values = values; values.remove(at: column); return values }
+            layout.columnWidths.remove(at: column)
+        } else { return }
+        // Keep raw cell encoding and its plain/inline flag unchanged. Deleting
+        // an axis must not reinterpret code markers or shift another axis's sizes.
+        guard let data = try? JSONEncoder().encode(rows) else { return }
+        changeText(String(decoding: data, as: UTF8.self), in: current)
         changeTableLayout(layout, in: current)
     }
 
@@ -475,7 +830,8 @@ final class WorkspaceModel: ObservableObject {
         automationBusy = true; defer { automationBusy = false }
         await flushAll()
         guard !saving else { throw AppError.message(L10n.tr("存在未保存内容，导入已停止")) }
-        let ids = try await store.importTransfer(document)
+        let localDocument = try await LocalDocumentImages.document(document)
+        let ids = try await store.importTransfer(localDocument)
         await refreshPages()
         if let first = ids.first(where: { id in pages.contains { $0.id == id && !$0.archived } }) { select(first) }
         return ids.count
@@ -488,11 +844,11 @@ final class WorkspaceModel: ObservableObject {
         defer { automationBusy = false }
         await flushAll()
         guard !saving else { throw AppError.message(L10n.tr("尚有内容未保存，请稍后重试")) }
-        if kind == .image { _ = try ImageSource.validated(text) }
+        let content = kind == .image ? try await LocalDocumentImages.blocks([TransferBlock(.image, try ImageSource.validated(text))])[0].text : text
         let block = try await store.createBlock(pageID: pageID, kind: kind)
-        try await store.updateBlock(block.id, text: text)
+        try await store.updateBlock(block.id, text: content)
         if selectedPageID == pageID {
-            var inserted = block; inserted.text = text; blocks.append(inserted)
+            var inserted = block; inserted.text = content; blocks.append(inserted)
         }
     }
 
@@ -522,7 +878,7 @@ final class WorkspaceModel: ObservableObject {
         updated.kind = kind
         updated.text = text ?? kind.initialText
         updated.formatting = formatting; updated.checked = false
-        updated.language = "Plain Text"; updated.collapsed = false; updated.tableLayout = TableLayout()
+        updated.language = "Plain Text"; updated.collapsed = false; updated.tableLayout = TableLayout(); updated.imageWidth = nil; updated.listStart = nil
         pendingWrites[block.id]?.cancel(); pendingWrites[block.id] = nil
         latestText[block.id] = nil; latestFormatting[block.id] = nil; latestTableLayouts[block.id] = nil
         blocks[index] = updated
@@ -573,6 +929,7 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func changeKind(_ kind: BlockKind, of block: Block) {
+        guard let current = blocks.first(where: { $0.id == block.id }), current.kind.canConvert(to: kind) else { return }
         if kind.isHeading, let current = blocks.first(where: { $0.id == block.id }) {
             convertToHeading(kind == .heading ? 1 : kind == .heading2 ? 2 : 3, text: current.text,
                              formatting: current.formatting, selection: NSRange(location: current.text.utf16.count, length: 0), in: current)
@@ -580,12 +937,15 @@ final class WorkspaceModel: ObservableObject {
         }
         guard let index = blocks.firstIndex(where: { $0.id == block.id }), blocks[index].kind != kind else { return }
         let previous = blocks[index].kind
+        let previousStart = blocks[index].listStart
         blocks[index].kind = kind
+        blocks[index].listStart = nil
         Task {
             do { try await store.setBlockKind(block.id, kind: kind) }
             catch {
                 if let index = blocks.firstIndex(where: { $0.id == block.id }), blocks[index].kind == kind {
                     blocks[index].kind = previous
+                    blocks[index].listStart = previousStart
                 }
                 report(error)
             }
@@ -647,10 +1007,44 @@ final class WorkspaceModel: ObservableObject {
     }
     func clearBlockSelection() { selectedBlockIDs = []; blockSelectionAnchor = nil }
 
+    func duplicateBlocks(_ ids: Set<UUID>) async throws {
+        guard !workspaceTransitioning, !automationBusy, let pageID = selectedPageID, !ids.isEmpty else { return }
+        automationBusy = true; defer { automationBusy = false }
+        await flushAll()
+        guard !saving else { throw AppError.message(L10n.tr("存在未保存内容，创建副本已停止")) }
+        guard selectedPageID == pageID else { return }
+        let previousIDs = Set(blocks.map(\.id))
+        let ordered = try await store.duplicateBlocks(ids, pageID: pageID)
+        guard selectedPageID == pageID else { return }
+        // Preserve edits made while the database actor was processing the copy.
+        let live = Dictionary(uniqueKeysWithValues: blocks.map { ($0.id, $0) })
+        blocks = ordered.map { item in
+            var current = live[item.id] ?? item; current.order = item.order; return current
+        }
+        selectedBlockIDs = Set(ordered.map(\.id)).subtracting(previousIDs)
+        blockSelectionAnchor = ordered.first(where: { selectedBlockIDs.contains($0.id) })?.id
+    }
+
+    func clipboardBlocks(_ ids: Set<UUID>) -> [TransferBlock] {
+        var counter = 0
+        var selected: [TransferBlock] = []
+        var previousIndex: Int?
+        for (index, block) in blocks.enumerated() {
+            let number = ListNumbering.advance(kind: block.kind, start: block.listStart, counter: &counter)
+            guard ids.contains(block.id) else { continue }
+            var copy = TransferBlock(block)
+            if block.kind == .numbered, copy.listStart == nil, number != 1,
+               previousIndex != index - 1 || selected.last?.kind != .numbered { copy.listStart = number }
+            selected.append(copy)
+            previousIndex = index
+        }
+        return selected
+    }
+
     func copySelectedBlocks() {
-        let selected = blocks.filter { selectedBlockIDs.contains($0.id) }
+        let selected = clipboardBlocks(selectedBlockIDs)
         guard !selected.isEmpty else { return }
-        ClipboardDocument.copyBlocks(selected.map(TransferBlock.init))
+        ClipboardDocument.copyBlocks(selected)
     }
 
     func jumpToDocumentBoundary(atStart: Bool, extend: Bool = false) {
@@ -808,6 +1202,9 @@ extension WorkspaceModel {
             ("trash_page", "Move a page and its active descendants to trash, recoverably.", ["page_id"], ["page_id"]),
             ("restore_page", "Restore a trashed page and its deletion batch.", ["page_id"], ["page_id"]),
             ("append_text", "Append a plain text block to an active page.", ["page_id", "text"], ["page_id", "text"]),
+            ("append_document", "Parse Markdown, HTML or text and append editable blocks to an existing page, preserving existing content. format: markdown/html/text. Read the page first; do not retry writes blindly.", ["page_id", "content", "format"], ["page_id", "content", "format"]),
+            ("import_document", "Create a new page from Markdown, HTML or text. format: markdown/html/text. Does not overwrite existing pages.", ["title", "content", "format"], ["title", "content", "format"]),
+            ("import_file", "Import one existing local file (Markdown/TXT/HTML/JSON/PDF/DOCX/DOC/RTF). Absolute path is on the Velora computer. With page_id, append into that page; otherwise create new pages. Never retry blindly.", ["path", "page_id"], ["path"]),
             ("open_page", "Open an active page in Velora.", ["page_id"], ["page_id"])
         ]
         return definitions.map { name, description, properties, required in
@@ -873,6 +1270,44 @@ extension WorkspaceModel {
             guard let text = arguments["text"], !text.isEmpty else { throw AppError.message(L10n.tr("正文不能为空")) }
             let block = try await store.createBlock(pageID: pageID, kind: .paragraph)
             try await store.updateBlock(block.id, text: text)
+        case "append_document", "import_document", "import_file":
+            let target = arguments["page_id"].flatMap(UUID.init(uuidString:))
+            if name == "append_document" || arguments["page_id"] != nil {
+                guard let target else { throw AppError.message("缺少有效的 page_id") }
+                try active(target)
+            }
+            let document: TransferDocument
+            if name == "import_file" {
+                guard let path = arguments["path"], path.hasPrefix("/"),
+                      (try? URL(fileURLWithPath: path).resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+                    throw AppError.message("请选择 Velora 所在电脑上的绝对文件路径")
+                }
+                document = try await DocumentTransfer.load(URL(fileURLWithPath: path))
+            } else {
+                guard let content = arguments["content"], !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      content.utf8.count <= 900000 else { throw AppError.message("内容为空或超过 900 KB；大文件请使用 import_file") }
+                let title = arguments["title"] ?? "导入内容"
+                switch arguments["format"] {
+                case "markdown": document = try DocumentTransfer.markdown(content, title: title, consumeLeadingTitle: false)
+                case "html":
+                    let markdown = try await DocumentRenderSession.markdown(fromHTML: content)
+                    document = try DocumentTransfer.markdown(markdown, title: title, consumeLeadingTitle: false)
+                case "text": document = TransferDocument(name: title, pages: [TransferPage(title: title, blocks: [TransferBlock(.paragraph, content)])])
+                default: throw AppError.message("format 必须是 markdown、html 或 text")
+                }
+            }
+            let localDocument = try await LocalDocumentImages.document(document)
+            if let target {
+                let ordered = try localDocument.orderedPages()
+                let items = ordered.flatMap { page in
+                    (ordered.count > 1 ? [TransferBlock(.heading2, page.title)] : []) + page.blocks
+                }
+                let ids = try await store.appendTransferBlocks(items, to: target)
+                result = ["page_id": target.uuidString, "block_ids": ids.map(\.uuidString), "appended_blocks": ids.count] as [String: Any]
+            } else {
+                let ids = try await store.importTransfer(localDocument)
+                result = ["page_ids": ids.map(\.uuidString), "created_pages": ids.count] as [String: Any]
+            }
         case "open_page":
             let pageID = try id("page_id"); try active(pageID)
             selectedPageID = pageID

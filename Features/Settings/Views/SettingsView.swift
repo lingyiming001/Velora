@@ -186,8 +186,10 @@ struct SettingsView: View {
                 Text("http://127.0.0.1:\(mcpPort)/mcp").font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                 HStack {
                     Button(L10n.tr("复制连接配置")) { services.copyMCPConfig() }
+                    Button(L10n.tr("复制 stdio 配置")) { services.copyMCPConfig(stdio: true) }
                     Button(L10n.tr("更新访问令牌")) { services.rotateMCPToken() }
                 }
+                Text(L10n.tr("支持追加 Markdown、HTML、纯文本和导入本机文件。仅支持 stdio 的客户端可复制 stdio 配置，需安装 Python 3 并保持 Velora 运行。")).font(.caption).foregroundStyle(.secondary)
                 Text(L10n.tr("使用 Streamable HTTP 和 Bearer 令牌，仅监听本机。将连接配置导入支持 HTTP MCP 的客户端；客户端的具体配置字段可能不同。启用或更改读写权限后，请在客户端重新连接。")).font(.caption).foregroundStyle(.secondary)
             }
         }

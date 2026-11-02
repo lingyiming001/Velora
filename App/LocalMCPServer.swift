@@ -8,11 +8,12 @@ final class LocalMCPServer {
     private let token: String
     private let port: UInt16
     private let model: WorkspaceModel
+    private let defaults: UserDefaults
     private var connections: [UUID: NWConnection] = [:]
     var onStatus: ((String) -> Void)?
 
-    init(port: UInt16, token: String, model: WorkspaceModel) throws {
-        self.token = token; self.port = port; self.model = model
+    init(port: UInt16, token: String, model: WorkspaceModel, defaults: UserDefaults = .standard) throws {
+        self.token = token; self.port = port; self.model = model; self.defaults = defaults
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!)
         listener = try NWListener(using: parameters)
@@ -35,7 +36,7 @@ final class LocalMCPServer {
                 self.connections[id] = connection
                 connection.start(queue: .main)
                 self.receive(connection, id: id, buffer: Data())
-                DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 120) { [weak self] in
                     self?.connections[id]?.cancel(); self?.connections[id] = nil
                 }
             }
@@ -85,7 +86,7 @@ final class LocalMCPServer {
     }
 
     private func handle(_ connection: NWConnection, id connectionID: UUID, firstLine: String, headers: [String: String], body: Data) async {
-        guard UserDefaults.standard.bool(forKey: "mcpEnabled") else { reply(connection, id: connectionID, status: 403); return }
+        guard defaults.bool(forKey: "mcpEnabled") else { reply(connection, id: connectionID, status: 403); return }
         let parts = firstLine.split(separator: " ")
         guard parts.count == 3, parts[1] == "/mcp" else { reply(connection, id: connectionID, status: 404); return }
         guard headers["authorization"] == "Bearer \(token)" else { reply(connection, id: connectionID, status: 401); return }
@@ -112,17 +113,22 @@ final class LocalMCPServer {
                 "instructions": "Control the local Velora workspace. Writes require the user to enable MCP write access in Velora settings."] as [String: Any]
         case "ping": response["result"] = [:] as [String: Any]
         case "tools/list":
-            let writeEnabled = UserDefaults.standard.bool(forKey: "mcpAllowWrites")
+            let writeEnabled = defaults.bool(forKey: "mcpAllowWrites")
             response["result"] = ["tools": WorkspaceModel.automationTools.filter { writeEnabled || ["list_pages", "read_page"].contains($0["name"] as? String ?? "") }]
         case "tools/call":
             do {
                 guard let name = params["name"] as? String,
                       WorkspaceModel.automationTools.contains(where: { $0["name"] as? String == name }) else { throw AppError.message("未知工具") }
-                if !["list_pages", "read_page"].contains(name), !UserDefaults.standard.bool(forKey: "mcpAllowWrites") {
+                if !["list_pages", "read_page"].contains(name), !defaults.bool(forKey: "mcpAllowWrites") {
                     throw AppError.message("外部写入已关闭，请在 Velora 设置中启用")
                 }
                 let raw = params["arguments"] as? [String: Any] ?? [:]
                 guard raw.values.allSatisfy({ $0 is String }) else { throw AppError.message("工具参数必须为字符串") }
+                let definition = WorkspaceModel.automationTools.first { $0["name"] as? String == name }!
+                let schema = definition["inputSchema"] as! [String: Any]
+                let properties = schema["properties"] as! [String: Any]
+                let required = schema["required"] as! [String]
+                guard raw.keys.allSatisfy({ properties[$0] != nil }), required.allSatisfy({ raw[$0] != nil }) else { throw AppError.message("缺少必要参数或包含未知参数") }
                 let output = try await model.executeTool(name, arguments: raw.mapValues { $0 as! String })
                 let text = String(decoding: try JSONSerialization.data(withJSONObject: output, options: [.sortedKeys]), as: UTF8.self)
                 response["result"] = ["content": [["type": "text", "text": text]], "isError": false] as [String: Any]

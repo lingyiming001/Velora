@@ -14,6 +14,11 @@ struct NativeTextEditor: NSViewRepresentable {
     var onDocumentBoundary: (Bool, Bool) -> Bool = { _, _ in false }
     var onBlockMouseDown: (NSEvent.ModifierFlags) -> Bool = { _ in false }
     var onPasteDocument: ((String?, String?, String, [TextStyleRun], NSRange) -> Bool)? = nil
+    var onDeleteTableRow: (() -> Void)? = nil
+    var onDeleteTableColumn: (() -> Void)? = nil
+    var onDocumentFind: ((DocumentFindAction) -> Void)? = nil
+    var findRanges: [NSRange] = []
+    var currentFindRange: NSRange? = nil
     var codeLanguage: String? = nil
     var sanitizePastedLaTeX = false
     var showCodeLineNumbers = true
@@ -51,13 +56,16 @@ struct NativeTextEditor: NSViewRepresentable {
         let scrollView = NSScrollView()
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
+        scrollView.focusRingType = .none
         scrollView.hasHorizontalRuler = false
         scrollView.hasVerticalRuler = false
         scrollView.rulersVisible = false
         scrollView.hasVerticalScroller = false
         scrollView.hasHorizontalScroller = false
         let view = CodeTextView(frame: NSRect(origin: .zero, size: scrollView.contentSize))
+        view.focusRingType = .none
         view.delegate = context.coordinator
+        view.isEditable = context.environment.isEnabled
         view.isRichText = true
         view.importsGraphics = false
         view.isAutomaticLinkDetectionEnabled = false
@@ -91,6 +99,7 @@ struct NativeTextEditor: NSViewRepresentable {
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let view = scrollView.documentView as? NSTextView else { return }
+        view.isEditable = context.environment.isEnabled
         context.coordinator.parent = self
         if codeLanguage == nil {
             let paragraph = NSMutableParagraphStyle()
@@ -107,12 +116,14 @@ struct NativeTextEditor: NSViewRepresentable {
         if let codeView = view as? CodeTextView { configureCallbacks(codeView, coordinator: context.coordinator) }
         context.coordinator.synchronize(view)
         context.coordinator.style(view)
+        context.coordinator.applyFindHighlights(to: view)
         let coordinator = context.coordinator
         coordinator.pendingUpdate?.cancel()
         let update = DispatchWorkItem { [weak coordinator, weak view] in
             guard let coordinator, coordinator.isActive, let view else { return }
             coordinator.measure(view)
             coordinator.applyFocus(to: view)
+            coordinator.applyFindHighlights(to: view)
         }
         coordinator.pendingUpdate = update
         DispatchQueue.main.async(execute: update)
@@ -132,6 +143,9 @@ struct NativeTextEditor: NSViewRepresentable {
         }
         view.copySelectionAsText = codeLanguage != nil
         view.pasteBaseFont = font
+        view.deleteTableRowAction = onDeleteTableRow
+        view.deleteTableColumnAction = onDeleteTableColumn
+        view.documentFind = onDocumentFind
         view.pasteDocument = codeLanguage == nil ? { [weak view] plain, html, original, selection in
             guard let view else { return false }
             return onPasteDocument?(plain, html, original, RichTextFormatting.runs(view.attributedString(), base: font), selection) ?? false
@@ -156,6 +170,7 @@ struct NativeTextEditor: NSViewRepresentable {
         coordinator.isActive = false
         coordinator.pendingUpdate?.cancel()
         coordinator.pendingUpdate = nil
+        (view.documentView as? CodeTextView)?.clearEditingUndoHistory()
         (view.documentView as? NSTextView)?.delegate = nil
         coordinator.formatPopover.close()
     }
@@ -196,6 +211,23 @@ struct NativeTextEditor: NSViewRepresentable {
             view.scrollRangeToVisible(view.selectedRange())
         }
 
+        private var lastFindScrollRange: NSRange?
+        func applyFindHighlights(to view: NSTextView) {
+            guard let layout = view.layoutManager else { return }
+            let full = NSRange(location: 0, length: view.string.utf16.count)
+            layout.removeTemporaryAttribute(.backgroundColor, forCharacterRange: full)
+            for range in parent.findRanges where range.location >= 0 && NSMaxRange(range) <= full.length {
+                layout.addTemporaryAttribute(.backgroundColor, value: NSColor.systemYellow.withAlphaComponent(0.35), forCharacterRange: range)
+            }
+            if let range = parent.currentFindRange, range.location >= 0, NSMaxRange(range) <= full.length {
+                layout.addTemporaryAttribute(.backgroundColor, value: NSColor.systemOrange.withAlphaComponent(0.55), forCharacterRange: range)
+                if lastFindScrollRange != range, view.window != nil {
+                    lastFindScrollRange = range
+                    view.scrollRangeToVisible(range)
+                }
+            } else { lastFindScrollRange = nil }
+        }
+
         func synchronize(_ view: NSTextView) {
             guard !view.hasMarkedText(), parent.contentRevision >= lastContentRevision else { return }
             // Focus/height updates can carry the last model snapshot while the
@@ -211,6 +243,9 @@ struct NativeTextEditor: NSViewRepresentable {
             let useModel = explicitReset || (modelChanged && !staleAcknowledgement)
             let fontChanged = lastBaseFont != parent.font || lastLineSpacing != parent.lineSpacing
             if (useModel && (view.string != parent.text || lastAppliedRuns != parent.formatting)) || fontChanged {
+                // An external model replacement invalidates AppKit's recorded
+                // ranges. Native edit acknowledgements must retain their undo.
+                if useModel { (view as? CodeTextView)?.clearEditingUndoHistory() }
                 let range = view.selectedRange()
                 let text = useModel ? parent.text : view.string
                 let runs = useModel ? parent.formatting : lastAppliedRuns
@@ -449,11 +484,12 @@ struct NativeTextEditor: NSViewRepresentable {
 struct TableResizeGrip: NSViewRepresentable {
     let horizontal: Bool
     let index: Int
+    var identifierPrefix = "table"
     let resize: (Double, Bool) -> Void
     func makeNSView(context: Context) -> TableResizeGripView { TableResizeGripView() }
     func updateNSView(_ view: TableResizeGripView, context: Context) {
         view.horizontal = horizontal
-        view.identifier = NSUserInterfaceItemIdentifier("table-" + (horizontal ? "column-" : "row-") + String(index))
+        view.identifier = NSUserInterfaceItemIdentifier(identifierPrefix + "-" + (horizontal ? "column-" : "row-") + String(index))
         view.resize = resize
         view.window?.invalidateCursorRects(for: view)
     }
@@ -586,6 +622,35 @@ final class EditorPopupPanel: NSPanel {
 /// Draw the gutter inside the text view, bounded by the editor itself.
 /// Avoid NSRulerView's separate layer and coordinate system inside a SwiftUI ScrollView.
 final class CodeTextView: NSTextView {
+    // NSTextView otherwise uses the window's shared manager, whose text undo
+    // operations can outlive a SwiftUI block and reference a dead text view.
+    private let editingUndoManager = UndoManager()
+    override var undoManager: UndoManager? { editingUndoManager }
+    deinit { editingUndoManager.removeAllActions() }
+
+    func clearEditingUndoHistory() {
+        breakUndoCoalescing()
+        editingUndoManager.removeAllActions()
+    }
+
+    @objc func undo(_ sender: Any?) {
+        guard isEditable, editingUndoManager.canUndo else { return }
+        breakUndoCoalescing()
+        editingUndoManager.undo()
+    }
+
+    @objc func redo(_ sender: Any?) {
+        guard isEditable, editingUndoManager.canRedo else { return }
+        breakUndoCoalescing()
+        editingUndoManager.redo()
+    }
+
+    override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(undo(_:)) { return isEditable && editingUndoManager.canUndo }
+        if item.action == #selector(redo(_:)) { return isEditable && editingUndoManager.canRedo }
+        return super.validateUserInterfaceItem(item)
+    }
+
     private var gutterText = ""
     private(set) var gutterLineStarts: [Int] = [0]
 
@@ -632,6 +697,28 @@ final class CodeTextView: NSTextView {
     var literalPasteInProgress = false
     var copySelectionAsText = false
     var pasteBaseFont: NSFont?
+    var documentFind: ((DocumentFindAction) -> Void)?
+    var deleteTableRowAction: (() -> Void)?
+    var deleteTableColumnAction: (() -> Void)?
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let menu = super.menu(for: event) ?? NSMenu()
+        if deleteTableRowAction != nil || deleteTableColumnAction != nil {
+            menu.addItem(.separator())
+            if deleteTableRowAction != nil {
+                let item = NSMenuItem(title: L10n.tr("删除所在行"), action: #selector(deleteTableRowFromMenu(_:)), keyEquivalent: "")
+                item.target = self; menu.addItem(item)
+            }
+            if deleteTableColumnAction != nil {
+                let item = NSMenuItem(title: L10n.tr("删除所在列"), action: #selector(deleteTableColumnFromMenu(_:)), keyEquivalent: "")
+                item.target = self; menu.addItem(item)
+            }
+        }
+        return menu
+    }
+
+    @objc func deleteTableRowFromMenu(_ sender: Any?) { deleteTableRowAction?() }
+    @objc func deleteTableColumnFromMenu(_ sender: Any?) { deleteTableColumnAction?() }
     override func writeSelection(to pasteboard: NSPasteboard, types: [NSPasteboard.PasteboardType]) -> Bool {
         let written = super.writeSelection(to: pasteboard, types: types)
         if written, !copySelectionAsText {
@@ -640,6 +727,7 @@ final class CodeTextView: NSTextView {
         return written
     }
     override func copy(_ sender: Any?) {
+        if DocumentSelectionView.copySelection(in: window) { return }
         guard copySelectionAsText else { super.copy(sender); return }
         let range = selectedRange()
         guard range.length > 0, NSMaxRange(range) <= (string as NSString).length else { return }
@@ -647,6 +735,10 @@ final class CodeTextView: NSTextView {
         clipboard.clearContents()
         clipboard.setString((string as NSString).substring(with: range), forType: .string)
         clipboard.setString("1", forType: ClipboardDocument.textSelectionType)
+    }
+    override func cut(_ sender: Any?) {
+        if DocumentSelectionView.copySelection(in: window, cutting: true) { return }
+        super.cut(sender)
     }
     override func paste(_ sender: Any?) {
         let clipboard = NSPasteboard.general
@@ -717,6 +809,7 @@ final class CodeTextView: NSTextView {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         // Command combinations normally travel here before NSTextView.keyDown.
         guard window?.firstResponder === self else { return super.performKeyEquivalent(with: event) }
+        if handleDocumentFindShortcut(event) { return true }
         if handleHeadingShortcut(event) { return true }
         return super.performKeyEquivalent(with: event)
     }
@@ -728,7 +821,20 @@ final class CodeTextView: NSTextView {
         return headingShortcut(level)
     }
 
+    private func handleDocumentFindShortcut(_ event: NSEvent) -> Bool {
+        guard let documentFind else { return false }
+        let flags = event.modifierFlags.intersection([.shift, .command, .option, .control])
+        let key = event.charactersIgnoringModifiers?.lowercased()
+        if flags == .command, key == "f" { documentFind(.show); return true }
+        if flags == [.command, .option], key == "f" { documentFind(.replace); return true }
+        if key == "g", flags == .command || flags == [.command, .shift] {
+            documentFind(flags.contains(.shift) ? .previous : .next); return true
+        }
+        return false
+    }
+
     override func keyDown(with event: NSEvent) {
+        if handleDocumentFindShortcut(event) { return }
         let modifiers = event.modifierFlags.intersection([.shift, .command, .option, .control])
         if modifiers == [.command, .option], !hasMarkedText(),
            let key = event.charactersIgnoringModifiers?.lowercased(), ["c", "v"].contains(key) {
@@ -802,15 +908,41 @@ final class CodeTextView: NSTextView {
 }
 
 /// Lightweight lexical coloring; temporary layout attributes leave plain text and undo history intact.
-private enum CodeSyntax {
+enum CodeLanguage {
+    struct Group: Identifiable {
+        let title: String
+        let languages: [String]
+        var id: String { title }
+    }
+    static let groups: [Group] = [
+        Group(title: "常用语言", languages: ["Plain Text", "Swift", "Python", "JavaScript", "TypeScript", "Java", "C", "C++", "C#", "Go", "Rust"]),
+        Group(title: "网页与样式", languages: ["HTML", "XML", "CSS", "SCSS", "JSX", "TSX", "PHP", "GraphQL"]),
+        Group(title: "数据与配置", languages: ["JSON", "JSONC", "YAML", "TOML", "INI", "SQL", "Dockerfile", "Makefile"]),
+        Group(title: "脚本与其他", languages: ["Bash", "PowerShell", "Ruby", "Lua", "R", "Kotlin", "Dart", "Scala", "Objective-C", "Markdown", "Diff", "Mermaid"])
+    ]
+    static func canonical(_ name: String) -> String {
+        let key = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let aliases = ["text": "plain text", "plaintext": "plain text", "txt": "plain text", "py": "python", "js": "javascript", "ts": "typescript",
+                       "sh": "bash", "shell": "bash", "zsh": "bash", "shellscript": "bash", "ps1": "powershell", "pwsh": "powershell",
+                       "csharp": "c#", "cs": "c#", "cpp": "c++", "cc": "c++", "cxx": "c++", "rs": "rust", "golang": "go",
+                       "yml": "yaml", "md": "markdown", "rb": "ruby", "kt": "kotlin", "kts": "kotlin", "objc": "objective-c",
+                       "objectivec": "objective-c", "docker": "dockerfile", "make": "makefile", "patch": "diff", "gql": "graphql"]
+        let resolved = aliases[key] ?? key
+        return groups.flatMap(\.languages).first { $0.lowercased() == resolved } ?? (key.isEmpty ? "Plain Text" : name)
+    }
+}
+
+enum CodeSyntax {
+    struct Token: Equatable { let kind: String; let range: NSRange }
     private static let regexCache: NSCache<NSString, NSRegularExpression> = {
         let cache = NSCache<NSString, NSRegularExpression>()
-        cache.countLimit = 32
+        cache.countLimit = 96
         return cache
     }()
 
-    static func highlight(_ text: String, language: String, dark: Bool, layout: NSLayoutManager) {
-        let lang = language.lowercased()
+    static func tokens(_ text: String, language: String) -> [Token] {
+        let lang = CodeLanguage.canonical(language).lowercased()
+        guard lang != "plain text" else { return [] }
         let keywordSets: [String: String] = [
             "swift": "import let var func class struct enum protocol extension return if else guard switch case default for in while try throws throw catch do async await actor private public static self nil true false init override weak some",
             "python": "def class import from as return if elif else for in while try except finally with lambda pass raise yield async await None True False and or not is global nonlocal del assert break continue",
@@ -819,36 +951,79 @@ private enum CodeSyntax {
             "javascript": "import export from const let var function class extends return if else switch case default for of in while try catch finally throw new this null undefined true false async await typeof instanceof static get set",
             "rust": "fn let mut impl struct enum trait pub use mod match if else for in loop while return self Self Some None Ok Err async await move ref const static",
             "go": "package import func var const type struct interface map chan go defer select case default range if else for return nil true false"
+            ,"typescript": "import export from const let var function class extends implements interface type enum namespace declare abstract readonly keyof infer never unknown any string number boolean return if else switch case default for of in while try catch finally throw new this null undefined true false async await typeof instanceof static get set as satisfies"
+            ,"java": "package import class interface enum record extends implements public private protected static final abstract synchronized volatile transient native strictfp void byte short int long float double boolean char new return if else switch case default for while do break continue try catch finally throw throws this super null true false instanceof var sealed permits"
+            ,"c": "include define ifdef endif typedef struct enum union static extern const volatile restrict void char short int long float double signed unsigned sizeof return if else switch case default for while do break continue goto NULL"
+            ,"c++": "include define namespace using template typename class struct enum union public private protected virtual override final static const constexpr consteval auto decltype void bool char int long float double new delete nullptr true false return if else switch case default for while break continue try catch throw co_await co_return requires concept"
+            ,"c#": "using namespace class struct interface enum record public private protected internal static readonly const async await Task var void bool int long float double decimal string object new return if else switch case default for foreach in while break continue try catch finally throw this base null true false is as get set init required"
+            ,"kotlin": "package import fun val var class object interface data sealed enum companion override private public internal protected open suspend inline reified when is as in if else for while return throw try catch finally null true false this super by lazy"
+            ,"ruby": "def class module end do if elsif else unless while until for in case when then begin rescue ensure raise return yield require include extend attr_reader attr_accessor nil true false self super and or not"
+            ,"php": "php namespace use class interface trait extends implements function fn public private protected static final abstract const return if elseif else switch case default foreach as for while try catch finally throw new null true false echo isset empty array match readonly"
+            ,"lua": "and break do else elseif end false for function goto if in local nil not or repeat return then true until while"
+            ,"r": "function if else for in while repeat next break return TRUE FALSE NULL NA NaN Inf library require"
+            ,"dart": "import export library part class mixin enum extension abstract final const late var dynamic void int double bool String async await Future return if else switch case default for in while break continue try catch finally throw new null true false required this super"
+            ,"scala": "package import class object trait enum case def val var type given using implicit sealed final override private protected extends with match if else for yield while do return try catch finally throw new null true false"
+            ,"powershell": "param function filter class enum if elseif else switch for foreach in while do until try catch finally throw return break continue begin process end true false null"
+            ,"objective-c": "import include interface implementation protocol property synthesize end class public private protected nonatomic strong weak copy retain assign readonly readwrite self super nil YES NO void int id return if else for while switch case break"
+            ,"graphql": "query mutation subscription fragment on schema type input interface union enum scalar extend implements directive true false null"
+            ,"dockerfile": "FROM RUN CMD LABEL EXPOSE ENV ADD COPY ENTRYPOINT VOLUME USER WORKDIR ARG ONBUILD STOPSIGNAL HEALTHCHECK SHELL AS"
+            ,"makefile": "include ifdef ifndef ifeq ifneq else endif define endef export unexport override private vpath"
+            ,"json": "true false null", "jsonc": "true false null", "yaml": "true false null yes no on off", "toml": "true false", "ini": "", "html": "", "xml": "", "css": "important inherit initial unset none auto", "scss": "mixin include extend function return if else each for while use forward", "markdown": "", "diff": "", "mermaid": "flowchart graph subgraph end sequenceDiagram participant actor classDiagram class stateDiagram state erDiagram mindmap gantt pie journey timeline TD TB BT LR RL"
         ]
         let fallback = "class struct enum public private protected static void int float double bool string new return if else switch case default for while break continue try catch throw import package true false null using namespace const auto"
-        let key = ["typescript", "jsx", "tsx"].contains(lang) ? "javascript" : lang
+        let key = lang == "jsx" ? "javascript" : lang == "tsx" ? "typescript" : lang
         let keywords = (keywordSets[key] ?? fallback).split(separator: " ").map(String.init)
         let words = keywords.map(NSRegularExpression.escapedPattern(for:)).joined(separator: "|")
-        let hashComments = ["python", "bash", "ruby", "yaml"].contains(lang)
-        let comments = hashComments ? #"#[^\n]*"# : #"//[^\n]*|/\*[\s\S]*?\*/"#
-        let strings = #""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`"#
-        let pattern = "(?<comment>" + comments + ")|(?<string>" + strings + ")|(?<number>" + #"\b\d+(?:\.\d+)?\b"# + ")|(?<keyword>\\b(?:" + words + ")\\b)"
-        let cacheKey = (key + ":" + (hashComments ? "hash" : "slash")) as NSString
+        var comments = #"//[^\n]*|/\*[\s\S]*?\*/"#
+        if ["python", "bash", "ruby", "yaml", "toml", "r", "dockerfile", "makefile"].contains(lang) { comments = #"#[^\n]*"# }
+        if lang == "sql" { comments = #"--[^\n]*|/\*[\s\S]*?\*/"# }
+        if lang == "lua" { comments = #"--\[\[[\s\S]*?\]\]|--[^\n]*"# }
+        if lang == "powershell" { comments = #"<#[\s\S]*?#>|#[^\n]*"# }
+        if ["html", "xml", "markdown"].contains(lang) { comments = #"<!--[\s\S]*?-->"# }
+        if lang == "css" { comments = #"/\*[\s\S]*?\*/"# }
+        if lang == "ini" { comments = #"[#;][^\n]*"# }
+        if lang == "mermaid" { comments = #"%%[^\n]*"# }
+        if ["json", "diff"].contains(lang) { comments = "(?!)" }
+        var strings = #""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`"#
+        if ["python", "swift", "kotlin"].contains(lang) { strings = "\"\"\"[\\s\\S]*?\"\"\"|'''[\\s\\S]*?'''|" + strings }
+        if lang == "sql" { strings = #"'(?:''|[^'])*'|"(?:""|[^"])*""# }
+        if ["json", "jsonc"].contains(lang) { strings = #""(?:\\.|[^"\\])*""# }
+        var markup = "(?!)"
+        if ["html", "xml", "jsx", "tsx"].contains(lang) { markup = #"</?[A-Za-z][^>]*>"# }
+        if ["css", "scss", "yaml", "toml", "ini"].contains(lang) { markup = #"[\w.-]+(?=\s*[:=])"# }
+        if lang == "markdown" { markup = #"^\s{0,3}#{1,6}[^\n]*|\*\*[^\n]*?\*\*|\[[^\]]+\]\([^\)]+\)"# }
+        if lang == "diff" { markup = #"^[+@][^\n]*"#; comments = #"^-[^\n]*"# }
+        let pattern = "(?<comment>" + comments + ")|(?<string>" + strings + ")|(?<markup>" + markup + ")|(?<number>" + #"\b(?:0[xX][\da-fA-F]+|0[bB][01]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\b"# + ")|(?<keyword>" + (words.isEmpty ? "(?!)" : "\\b(?:" + words + ")\\b") + ")"
+        let cacheKey = lang as NSString
         let regex: NSRegularExpression
         if let cached = regexCache.object(forKey: cacheKey) {
             regex = cached
         } else {
-            guard let compiled = try? NSRegularExpression(pattern: pattern, options: lang == "sql" ? [.caseInsensitive] : []) else { return }
+            var options: NSRegularExpression.Options = [.anchorsMatchLines]
+            if ["sql", "dockerfile", "powershell"].contains(lang) { options.insert(.caseInsensitive) }
+            guard let compiled = try? NSRegularExpression(pattern: pattern, options: options) else { return [] }
             regexCache.setObject(compiled, forKey: cacheKey)
             regex = compiled
         }
-        let colors: [(String, NSColor)] = [
-            ("comment", dark ? NSColor(red: 0.45, green: 0.53, blue: 0.61, alpha: 1) : NSColor(red: 0.49, green: 0.55, blue: 0.62, alpha: 1)),
-            ("string", dark ? NSColor(red: 0.65, green: 0.8, blue: 0.57, alpha: 1) : NSColor(red: 0.2, green: 0.47, blue: 0.36, alpha: 1)),
-            ("number", dark ? NSColor(red: 0.9, green: 0.69, blue: 0.46, alpha: 1) : NSColor(red: 0.68, green: 0.39, blue: 0.19, alpha: 1)),
-            ("keyword", dark ? NSColor(red: 0.74, green: 0.64, blue: 0.96, alpha: 1) : NSColor(red: 0.44, green: 0.3, blue: 0.72, alpha: 1))
-        ]
-        regex.enumerateMatches(in: text, range: NSRange(location: 0, length: text.utf16.count)) { match, _, _ in
-            guard let match else { return }
-            for (name, color) in colors {
-                let range = match.range(withName: name)
-                if range.location != NSNotFound { layout.addTemporaryAttribute(.foregroundColor, value: color, forCharacterRange: range) }
+        return regex.matches(in: text, range: NSRange(location: 0, length: text.utf16.count)).compactMap { match in
+            for kind in ["comment", "string", "markup", "number", "keyword"] {
+                let range = match.range(withName: kind)
+                if range.location != NSNotFound { return Token(kind: kind, range: range) }
             }
+            return nil
+        }
+    }
+
+    static func highlight(_ text: String, language: String, dark: Bool, layout: NSLayoutManager) {
+        let colors: [String: NSColor] = [
+            "comment": dark ? NSColor(red: 0.45, green: 0.53, blue: 0.61, alpha: 1) : NSColor(red: 0.49, green: 0.55, blue: 0.62, alpha: 1),
+            "string": dark ? NSColor(red: 0.65, green: 0.8, blue: 0.57, alpha: 1) : NSColor(red: 0.2, green: 0.47, blue: 0.36, alpha: 1),
+            "number": dark ? NSColor(red: 0.9, green: 0.69, blue: 0.46, alpha: 1) : NSColor(red: 0.68, green: 0.39, blue: 0.19, alpha: 1),
+            "keyword": dark ? NSColor(red: 0.74, green: 0.64, blue: 0.96, alpha: 1) : NSColor(red: 0.44, green: 0.3, blue: 0.72, alpha: 1),
+            "markup": dark ? .systemTeal : .systemBlue
+        ]
+        for token in tokens(text, language: language) {
+            if let color = colors[token.kind] { layout.addTemporaryAttribute(.foregroundColor, value: color, forCharacterRange: token.range) }
         }
     }
 }
