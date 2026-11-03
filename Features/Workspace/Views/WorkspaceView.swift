@@ -250,6 +250,7 @@ struct WorkspaceView: View {
     @State private var newTitle = ""
     @State private var deletingPage: Page?
     @State private var confirmingEmpty = false
+    @State private var permanentlyDeletingWorkspace: WorkspaceProfile?
     @StateObject private var pageDrag = PageDragState()
     @State private var filter = ""
 
@@ -334,8 +335,17 @@ struct WorkspaceView: View {
         } message: { Text(L10n.tr("此页面及其所有子页面和内容将被永久删除，无法恢复。")) }
         .alert(L10n.tr("清空回收箱？"), isPresented: $confirmingEmpty) {
             Button(L10n.tr("取消"), role: .cancel) { }
-            Button(L10n.tr("清空回收箱"), role: .destructive) { model.emptyTrash() }
-        } message: { Text(L10n.tr("回收箱内的所有页面和内容将被永久删除，无法恢复。")) }
+            Button(L10n.tr("全部删除"), role: .destructive) {
+                performTrashOperation { try await services.emptyWorkspaceTrash(); model.emptyTrash() }
+            }
+        } message: { Text(L10n.tr("回收箱中的工作空间文件夹及当前空间的已删除文档将被永久删除，无法恢复。")) }
+        .alert(L10n.tr("永久删除工作空间？"), isPresented: Binding(get: { permanentlyDeletingWorkspace != nil }, set: { if !$0 { permanentlyDeletingWorkspace = nil } })) {
+            Button(L10n.tr("取消"), role: .cancel) { permanentlyDeletingWorkspace = nil }
+            Button(L10n.tr("永久删除"), role: .destructive) {
+                if let target = permanentlyDeletingWorkspace { performTrashOperation { try await services.permanentlyDeleteWorkspace(target.id) } }
+                permanentlyDeletingWorkspace = nil
+            }
+        } message: { Text(L10n.tr("整个工作空间文件夹将被永久删除，无法恢复。")) }
         .alert(L10n.tr("操作失败"), isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             Button(L10n.tr("知道了")) { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? L10n.tr("未知错误")) }
@@ -383,6 +393,12 @@ struct WorkspaceView: View {
                         }
                     }
                     Divider()
+                    Button(L10n.tr("刷新工作空间"), systemImage: "arrow.clockwise") {
+                        Task {
+                            do { try await services.refreshWorkspaces() }
+                            catch { model.errorMessage = error.localizedDescription }
+                        }
+                    }.disabled(services.busy)
                     Button(L10n.tr("管理工作空间…"), systemImage: "square.stack.3d.up") { showingWorkspaces = true }
                 } label: {
                     HStack(spacing: 8) {
@@ -453,8 +469,8 @@ struct WorkspaceView: View {
                 HStack {
                     Label(L10n.tr("回收箱"), systemImage: showingTrash ? "trash.fill" : "trash")
                     Spacer()
-                    if !model.trashedPages.isEmpty {
-                        Text("\(model.trashedPages.count)").font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                    if !model.trashedPages.isEmpty || !services.trashedWorkspaces.isEmpty {
+                        Text("\(model.trashedPages.count + services.trashedWorkspaces.count)").font(.caption).monospacedDigit().foregroundStyle(.secondary)
                     }
                 }
                 .padding(10).contentShape(Rectangle())
@@ -555,7 +571,7 @@ struct WorkspaceView: View {
         switch placement {
         case .child:
             RunLoop.main.perform(inModes: [.default]) {
-                MainActor.assumeIsolated { expansion.collapsed.remove(target.id) }
+                MainActor.assumeIsolated { _ = expansion.collapsed.remove(target.id) }
             }
             model.move(source, to: target.id)
         case .before:
@@ -593,38 +609,70 @@ struct WorkspaceView: View {
         Button(L10n.tr("移到回收箱"), role: .destructive) { model.archive(page) }
     }
 
+    private func performTrashOperation(_ operation: @escaping @MainActor () async throws -> Void) {
+        Task { do { try await operation() } catch { model.errorMessage = error.localizedDescription } }
+    }
+
     private var trash: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: 16) {
             HStack {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(L10n.tr("回收箱")).font(.largeTitle.bold())
-                    Text(L10n.tr("页面保留在此，直到你恢复或永久删除。")).foregroundStyle(.secondary)
+                    Text(L10n.tr("回收箱")).font(.title2.bold())
+                    Text(L10n.tr("删除的工作空间和当前空间的文档保留在此，直到恢复或永久删除。"))
+                        .font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button(L10n.tr("清空回收箱"), role: .destructive) { confirmingEmpty = true }.disabled(model.trashedPages.isEmpty)
+                HStack(spacing: 10) {
+                    Button(L10n.tr("全部恢复")) {
+                        performTrashOperation { try await services.restoreAllWorkspaces(); model.restoreAllPages() }
+                    }
+                    Button(L10n.tr("全部删除"), role: .destructive) { confirmingEmpty = true }
+                }.fixedSize().disabled(model.trashedPages.isEmpty && services.trashedWorkspaces.isEmpty)
+
             }.padding(.horizontal, 28).padding(.top, 28)
-            if model.trashedPages.isEmpty {
-                ContentUnavailableView(L10n.tr("回收箱为空"), systemImage: "trash", description: Text(L10n.tr("删除的页面会出现在这里。")))
+            if model.trashedPages.isEmpty && services.trashedWorkspaces.isEmpty {
+                ContentUnavailableView(L10n.tr("回收箱为空"), systemImage: "trash", description: Text(L10n.tr("删除的工作空间和文档会出现在这里。")))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(model.trashedPages) { page in
-                    HStack(spacing: 12) {
-                        Image(systemName: "doc.text").foregroundStyle(.secondary)
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text(page.title.isEmpty ? L10n.tr("未命名") : page.title).fontWeight(.medium)
-                            Text(page.updatedAt, style: .date).font(.caption).foregroundStyle(.secondary)
+                List {
+                    if !services.trashedWorkspaces.isEmpty {
+                        Section(L10n.tr("工作空间")) {
+                            ForEach(services.trashedWorkspaces) { workspace in
+                                HStack {
+                                    Image(systemName: workspace.symbol).foregroundStyle(workspace.tint)
+                                    VStack(alignment: .leading) {
+                                        Text(workspace.name).fontWeight(.medium)
+                                        if let date = workspace.trashedAt { Text(date, style: .date).font(.caption).foregroundStyle(.secondary) }
+                                    }
+                                    Spacer()
+                                    Button(L10n.tr("恢复")) { performTrashOperation { try await services.restoreWorkspace(workspace.id) } }
+                                    Button(L10n.tr("删除"), role: .destructive) { permanentlyDeletingWorkspace = workspace }
+                                }.padding(.vertical, 6)
+                            }
                         }
-                        Spacer()
-                        Button(L10n.tr("恢复")) { model.restore(page) }.buttonStyle(.bordered)
-                        Button { deletingPage = page } label: { Image(systemName: "trash") }
-                            .buttonStyle(.borderless).help(L10n.tr("永久删除")).accessibilityLabel(L10n.tr("永久删除页面"))
-                    }.padding(.vertical, 8)
+                    }
+                    Section(L10n.tr("当前工作空间的文档")) {
+                        ForEach(model.trashedPages) { page in
+                            HStack(spacing: 12) {
+                                Image(systemName: "doc.text").foregroundStyle(.secondary)
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Text(page.title.isEmpty ? L10n.tr("未命名") : page.title).fontWeight(.medium)
+                                    Text(page.updatedAt, style: .date).font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button(L10n.tr("恢复")) { model.restore(page) }.buttonStyle(.bordered)
+                                Button(L10n.tr("删除"), role: .destructive) { deletingPage = page }
+                                    .help(L10n.tr("永久删除")).accessibilityLabel(L10n.tr("永久删除页面"))
+                            }.padding(.vertical, 8)
+                        }
+                    }
                 }.listStyle(.inset)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .navigationTitle(L10n.tr("回收箱"))
     }
+
 }
 
 struct MovePagePanel: View {

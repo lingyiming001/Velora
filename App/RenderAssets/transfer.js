@@ -53,7 +53,7 @@ window.htmlToMarkdown = function(input,plainText='') {
   // Clipboard DOM may represent visual code lines as block-styled spans.
   // Record only line boundaries before source CSS is stripped.
   doc.querySelectorAll('pre').forEach(pre=>{
-    pre.querySelectorAll('span,div,p').forEach(line=>{
+    pre.querySelectorAll('span').forEach(line=>{
       const display=line.style.display.toLowerCase();
       if(display==='block'||line.classList.contains('line')){
         if(line.nextSibling&&line.lastChild?.nodeName!=='BR'&&!line.textContent.endsWith('\n'))line.append(doc.createTextNode('\n'));
@@ -127,9 +127,23 @@ window.htmlToMarkdown = function(input,plainText='') {
     return '    '.repeat(depth)+prefix+children(clone).trim().replace(/\n\n/g,'\n'+'    '.repeat(depth+1))+nested.map(n=>'\n'+list(n,depth+1)).join('');
   }).join('\n');}
   function codeSource(node){
-    const clone=node.cloneNode(true);clone.querySelectorAll('br').forEach(n=>n.replaceWith(doc.createTextNode('\n')));
-    clone.querySelectorAll('div').forEach(n=>{if(n.nextSibling)n.append(doc.createTextNode('\n'));});
-    const source=clone.textContent.replace(/\r\n?/g,'\n').replace(/\n$/,'');
+    // Read semantic line containers recursively. textContent alone joins <p>
+    // and sibling <code> lines; adding newlines to every div doubles nested rows.
+    function read(n){
+      if(n.nodeType===3)return n.textContent;
+      if(n.nodeType!==1)return '';
+      if(n.tagName==='BR')return '\n';
+      let result='';
+      for(const child of n.childNodes){
+        const block=child.nodeType===1&&(child.matches('div,p,li')||child.classList.contains('line'));
+        if(block&&result&&!result.endsWith('\n'))result+='\n';
+        const value=read(child);result+=value;
+        if(block&&!result.endsWith('\n'))result+='\n';
+        else if(block&&!value)result+='\n';
+      }
+      return result;
+    }
+    const source=read(node).replace(/\r\n?/g,'\n').replace(/\n$/,'');
     // Some rich clipboard HTML drops all visual line breaks. Plain text still
     // carries them: use it only when the exact non-whitespace source occurs once.
     const plain=plainText.replace(/\r\n?/g,'\n'),key=source.replace(/\s/g,'');
@@ -172,11 +186,16 @@ window.htmlToMarkdown = function(input,plainText='') {
       case 'BR':return '  \n';
       case 'STRONG':case 'B':return '**'+text()+'**';case 'EM':case 'I':return '*'+text()+'*';case 'DEL':case 'S':return '~~'+text()+'~~';
       case 'CODE':{const t=n.textContent;const fence='`'.repeat(Math.max(1,...(t.match(/`+/g)||[]).map(s=>s.length+1)));return fence+' '+t+' '+fence;}
-      case 'PRE':{const code=n.querySelector('code')||n;const t=codeSource(code);const fence='`'.repeat(Math.max(3,...(t.match(/`+/g)||[]).map(s=>s.length+1)));
+      case 'PRE':{const code=n.querySelector('code')||n;const t=codeSource(n);const fence='`'.repeat(Math.max(3,...(t.match(/`+/g)||[]).map(s=>s.length+1)));
         const lang=(code.className.match(/language-([\w+#.-]+)/i)||[])[1]||code.getAttribute('data-language')||n.getAttribute('data-language')||
           (n.classList.contains('mermaid')||/^(?:flowchart|graph)\s+(?:TD|TB|BT|LR|RL)\b|^(?:sequenceDiagram|classDiagram|stateDiagram|erDiagram|mindmap|gantt|pie|journey|timeline)\b/.test(t.trimStart())?'mermaid':
-            /^(?:from [\w.]+ import |(?:async )?def \w+\([^\n]*\):)/.test(t.trimStart())?'python':'');
-        const damaged=lang.toLowerCase()==='python'&&!t.includes('\n')&&/\bfrom [\w.]+ import \w+from [\w.]+ import /.test(t);
+            /^(?:import [A-Za-z_][\w.]*|from [\w.]+ import |(?:async )?def \w+\([^\n]*\):)/.test(t.trimStart())?'python':'');
+        // A flattened import followed by an assignment is invalid Python,
+        // even when the source omitted its language label. Do not guess where
+        // to split identifiers or invent indentation that the clipboard lost.
+        const damaged=lang.toLowerCase()==='python'&&!t.includes('\n')&&(
+          /\bfrom [\w.]+ import \w+from [\w.]+ import /.test(t)||
+          /^\s*(?:import |from [\w.]+ import )[^;\n]*=(?!=)/.test(t));
         const warning=damaged?'\n> [!WARNING]\n> 来源剪贴板中的 Python 代码已缺少换行。请使用 ChatGPT 代码块自身的“复制代码”按钮重新复制，再粘贴到此处；原文暂予保留，未自动猜测重排。\n':'';
         return '\n\n'+fence+lang+'\n'+t+'\n'+fence+'\n\n'+warning;}
       case 'UL':case 'OL':return '\n\n'+list(n)+'\n\n';

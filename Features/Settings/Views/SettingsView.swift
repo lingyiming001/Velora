@@ -104,8 +104,8 @@ struct SettingsView: View {
                 }
             }
             Section(L10n.tr("编辑器")) {
-                Slider(value: $editorFontSize, in: 14...22, step: 1) { Text(L10n.tr("正文字号 · \(Int(editorFontSize)) pt")) }
-                Slider(value: $codeFontSize, in: 11...18, step: 1) { Text(L10n.tr("代码字号 · \(Int(codeFontSize)) pt")) }
+                Slider(value: $editorFontSize, in: 11...22, step: 1) { Text(L10n.tr("正文字号 · \(Int(editorFontSize)) pt")) }
+                Slider(value: $codeFontSize, in: 11...22, step: 1) { Text(L10n.tr("代码字号 · \(Int(codeFontSize)) pt")) }
                 Toggle(L10n.tr("显示代码行号"), isOn: $codeLineNumbers)
                 Toggle(L10n.tr("显示代码行数"), isOn: $codeLineCount)
                 Text(L10n.tr("更改即时生效；内容在输入后自动保存。")).font(.caption).foregroundStyle(.secondary)
@@ -123,10 +123,13 @@ struct SettingsView: View {
                 Button(L10n.tr("管理工作空间…")) { showingWorkspaces = true }.disabled(services.busy)
             }
             Section(L10n.tr("统一存储位置")) {
-                pathRow(services.storagePath)
+                pathRow(services.workspaceDirectoryPath)
                 HStack {
                     Button(L10n.tr("更改位置…")) { services.chooseStorage() }.disabled(services.busy)
-                    Button(L10n.tr("在 Finder 中显示")) { reveal(services.storagePath) }
+                    Button(L10n.tr("在 Finder 中显示")) { reveal(services.workspaceDirectoryPath) }
+                }
+                if let error = services.storageError {
+                    Label(error, systemImage: "exclamationmark.triangle").font(.callout).foregroundStyle(.red).textSelection(.enabled)
                 }
                 Text(L10n.tr("所有工作空间统一存储于此。更改位置会迁移全部工作空间，保留原位置副本，不覆盖已有数据库。")).font(.caption).foregroundStyle(.secondary)
             }
@@ -135,19 +138,18 @@ struct SettingsView: View {
                 HStack {
                     Button(L10n.tr("更改位置…")) { services.chooseBackup() }.disabled(services.busy)
                     Button(L10n.tr("打开备份文件夹")) { reveal(services.backupPath) }
-                    Spacer()
-                    Button { Task { await services.backup() } } label: {
-                        if services.busy { ProgressView().controlSize(.small) }
-                        else { Text(L10n.tr("立即备份")) }
-                    }.disabled(services.busy).buttonStyle(.borderedProminent)
                 }
+                Button { Task { await services.backup() } } label: {
+                    if services.busy { ProgressView().controlSize(.small) }
+                    else { Label(L10n.tr("备份所有工作空间为 ZIP"), systemImage: "archivebox") }
+                }.disabled(services.busy).buttonStyle(.borderedProminent)
                 Button(L10n.tr("从 ZIP 备份恢复…")) { services.chooseRestore() }.disabled(services.busy)
-                Text(L10n.tr("恢复会创建并切换到新工作空间，现有工作空间不会被覆盖。")).font(.caption).foregroundStyle(.secondary)
+                Text(L10n.tr("恢复会一次创建备份中的所有工作空间，切换到备份时的当前空间，现有数据不会被覆盖。")).font(.caption).foregroundStyle(.secondary)
                 Toggle(L10n.tr("应用运行时每天自动备份"), isOn: $automaticBackup)
                 if let last = UserDefaults.standard.object(forKey: services.lastBackupKey) as? Date {
                     LabeledContent(L10n.tr("上次备份"), value: last.formatted(Date.FormatStyle(date: .abbreviated, time: .shortened).locale(L10n.language.locale)))
                 }
-                Text(L10n.tr("ZIP 压缩备份包含当前工作空间信息、页面、块、回收箱及内嵌图片和 PDF。不包含外部链接文件、应用设置或钥匙串密钥；上限 512 MB，不自动删除历史备份。")).font(.caption).foregroundStyle(.secondary)
+                Text(L10n.tr("ZIP 压缩备份包含所有工作空间的页面、块、回收箱及内嵌资源，也包含仍保留数据的已删除空间。保存在所选目录的 backup 子目录；不包含外部链接文件、应用设置或钥匙串密钥，上限 512 MB。")).font(.caption).foregroundStyle(.secondary)
             }
         }
     }

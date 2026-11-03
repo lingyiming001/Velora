@@ -19,6 +19,13 @@ actor SQLiteStore {
         guard sqlite3_open_v2(path, &db, SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
             throw StoreError.database("无法打开本地数据库")
         }
+        var version: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &version, nil) == SQLITE_OK else {
+            throw StoreError.database("无法读取数据库版本")
+        }
+        let schemaVersion = sqlite3_step(version) == SQLITE_ROW ? sqlite3_column_int(version, 0) : 0
+        sqlite3_finalize(version)
+        guard schemaVersion <= Self.currentSchemaVersion else { throw StoreError.database("数据库由更新版本的 Velora 创建，请升级应用") }
         try Self.exec(db, "PRAGMA foreign_keys=ON")
         try Self.exec(db, "PRAGMA journal_mode=WAL")
         try Self.exec(db, "PRAGMA busy_timeout=3000")
@@ -38,17 +45,11 @@ actor SQLiteStore {
             )
             """)
         try Self.exec(db, "CREATE INDEX IF NOT EXISTS blocks_page ON blocks(page_id, sort_order)")
-        var version: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &version, nil) == SQLITE_OK else {
-            throw StoreError.database("无法读取数据库版本")
-        }
-        let schemaVersion = sqlite3_step(version) == SQLITE_ROW ? sqlite3_column_int(version, 0) : 0
-        sqlite3_finalize(version)
         if schemaVersion < 2 {
             try Self.exec(db, "BEGIN IMMEDIATE")
             do {
-                try Self.exec(db, "ALTER TABLE blocks ADD COLUMN language TEXT NOT NULL DEFAULT 'Plain Text'")
-                try Self.exec(db, "ALTER TABLE blocks ADD COLUMN collapsed INTEGER NOT NULL DEFAULT 0")
+                try Self.addColumn(db, "blocks", "language", "TEXT NOT NULL DEFAULT 'Plain Text'")
+                try Self.addColumn(db, "blocks", "collapsed", "INTEGER NOT NULL DEFAULT 0")
                 try Self.exec(db, "PRAGMA user_version=2")
                 try Self.exec(db, "COMMIT")
             } catch {
@@ -59,7 +60,7 @@ actor SQLiteStore {
         if schemaVersion < 3 {
             try Self.exec(db, "BEGIN IMMEDIATE")
             do {
-                try Self.exec(db, "ALTER TABLE pages ADD COLUMN trash_batch TEXT")
+                try Self.addColumn(db, "pages", "trash_batch", "TEXT")
                 try Self.exec(db, "PRAGMA user_version=3")
                 try Self.exec(db, "COMMIT")
             } catch {
@@ -70,7 +71,7 @@ actor SQLiteStore {
         if schemaVersion < 4 {
             try Self.exec(db, "BEGIN IMMEDIATE")
             do {
-                try Self.exec(db, "ALTER TABLE blocks ADD COLUMN formatting TEXT NOT NULL DEFAULT '[]'")
+                try Self.addColumn(db, "blocks", "formatting", "TEXT NOT NULL DEFAULT '[]'")
                 try Self.exec(db, "PRAGMA user_version=4")
                 try Self.exec(db, "COMMIT")
             } catch { try? Self.exec(db, "ROLLBACK"); throw error }
@@ -79,7 +80,7 @@ actor SQLiteStore {
         if schemaVersion < 5 {
             try Self.exec(db, "BEGIN IMMEDIATE")
             do {
-                try Self.exec(db, "ALTER TABLE blocks ADD COLUMN table_layout TEXT NOT NULL DEFAULT '{}'")
+                try Self.addColumn(db, "blocks", "table_layout", "TEXT NOT NULL DEFAULT '{}'")
                 try Self.exec(db, "PRAGMA user_version=5")
                 try Self.exec(db, "COMMIT")
             } catch { try? Self.exec(db, "ROLLBACK"); throw error }
@@ -88,7 +89,7 @@ actor SQLiteStore {
         if schemaVersion < 6 {
             try Self.exec(db, "BEGIN IMMEDIATE")
             do {
-                try Self.exec(db, "ALTER TABLE blocks ADD COLUMN image_width REAL")
+                try Self.addColumn(db, "blocks", "image_width", "REAL")
                 try Self.exec(db, "PRAGMA user_version=6")
                 try Self.exec(db, "COMMIT")
             } catch { try? Self.exec(db, "ROLLBACK"); throw error }
@@ -97,7 +98,7 @@ actor SQLiteStore {
         if schemaVersion < 7 {
             try Self.exec(db, "BEGIN IMMEDIATE")
             do {
-                try Self.exec(db, "ALTER TABLE blocks ADD COLUMN ordered_start INTEGER")
+                try Self.addColumn(db, "blocks", "ordered_start", "INTEGER")
                 try Self.exec(db, "PRAGMA user_version=7")
                 try Self.exec(db, "COMMIT")
             } catch { try? Self.exec(db, "ROLLBACK"); throw error }
@@ -106,6 +107,39 @@ actor SQLiteStore {
     }
 
     deinit { if let db { sqlite3_close(db) } }
+
+    func closeForWorkspaceDeletion() throws {
+        guard let db else { return }
+        guard sqlite3_close(db) == SQLITE_OK else { throw StoreError.database("数据库仍在使用，未删除工作空间") }
+        self.db = nil
+    }
+
+    func reopenAfterDeletionFailure() throws {
+        guard db == nil else { return }
+        var connection: OpaquePointer?
+        guard sqlite3_open_v2(databaseURL.path, &connection, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
+            if let connection { sqlite3_close(connection) }
+            throw StoreError.database("无法重新打开原工作空间")
+        }
+        do {
+            try Self.exec(connection, "PRAGMA foreign_keys=ON")
+            try Self.exec(connection, "PRAGMA journal_mode=WAL")
+            try Self.exec(connection, "PRAGMA busy_timeout=3000")
+            db = connection
+        } catch { sqlite3_close(connection); throw error }
+    }
+
+    private static func addColumn(_ db: OpaquePointer?, _ table: String, _ name: String, _ definition: String) throws {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA table_info(\(table))", -1, &statement, nil) == SQLITE_OK else {
+            throw StoreError.database("无法读取数据库结构")
+        }
+        defer { sqlite3_finalize(statement) }
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let column = sqlite3_column_text(statement, 1), String(cString: column) == name { return }
+        }
+        try Self.exec(db, "ALTER TABLE \(table) ADD COLUMN \(name) \(definition)")
+    }
 
     private static func exec(_ db: OpaquePointer?, _ sql: String) throws {
         var error: UnsafeMutablePointer<CChar>?
@@ -262,6 +296,21 @@ actor SQLiteStore {
                 UNION SELECT p.id FROM pages p JOIN descendants d ON p.parent_id=d.id
             ) DELETE FROM pages WHERE id IN (SELECT id FROM descendants)
             """, [id.uuidString])
+    }
+
+    func archiveAllPages() throws {
+        let active = try pages().filter { !$0.archived }
+        let ids = Set(active.map(\.id))
+        try transaction {
+            for page in active where page.parentID == nil || !ids.contains(page.parentID!) { try archivePage(page.id, archived: true) }
+        }
+    }
+
+    func restoreAllPages() throws {
+        try transaction {
+            try run("UPDATE pages SET archived=0,trash_batch=NULL WHERE archived=1", [])
+            try run("UPDATE pages SET parent_id=NULL WHERE parent_id IS NOT NULL AND parent_id NOT IN (SELECT id FROM pages)", [])
+        }
     }
 
     func emptyTrash() throws { try run("DELETE FROM pages WHERE archived=1", []) }

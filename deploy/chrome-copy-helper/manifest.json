@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Velora — ChatGPT Copy Helper",
+  "version": "1.0.0",
+  "description": "Preserve code line breaks when copying selected ChatGPT content to Velora or other editors.",
+  "content_scripts": [{
+    "matches": ["https://chatgpt.com/*"],
+    "js": ["copy.js"],
+    "run_at": "document_start"
+  }]
+}

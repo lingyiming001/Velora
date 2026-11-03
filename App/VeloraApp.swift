@@ -121,6 +121,7 @@ struct StartupRecoveryView: View {
             }.frame(maxWidth: 600)
         } actions: {
             HStack {
+                Button(L10n.tr("选择移动后的存储目录…")) { services.chooseStorage() }
                 Button(L10n.tr("重新尝试")) { perform { try await services.retryStartup() } }
                 if !services.availableStartupWorkspaces.isEmpty {
                     Menu(L10n.tr("打开其他工作空间")) {

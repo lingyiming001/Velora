@@ -424,6 +424,20 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
+    func archiveAllPages() {
+        Task {
+            do {
+                await flushAll()
+                guard !saving else { throw AppError.message("尚有内容未保存，工作空间未切换") }
+                try await store.archiveAllPages(); await refreshPages(); select(nil)
+            } catch { report(error) }
+        }
+    }
+
+    func restoreAllPages() {
+        Task { do { try await store.restoreAllPages(); await refreshPages() } catch { report(error) } }
+    }
+
     func emptyTrash() {
         Task {
             do { try await store.emptyTrash(); await refreshPages() }

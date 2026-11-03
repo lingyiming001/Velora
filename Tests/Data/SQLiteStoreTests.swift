@@ -327,9 +327,21 @@ final class SQLiteStoreTests: XCTestCase {
         let target = conflict.appendingPathComponent("Workspaces").appendingPathComponent(first.id.uuidString).appendingPathComponent("velora.sqlite")
         try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("existing".utf8).write(to: target)
-        do { try await restarted.relocateStorage(to: conflict); XCTFail("Existing targets must not be overwritten") } catch { }
-        XCTAssertEqual(restarted.catalog?.storageRoot, before?.storageRoot)
-        XCTAssertEqual(restarted.catalog?.workspaces, before?.workspaces)
+        try await restarted.relocateStorage(to: conflict.appendingPathComponent("Workspaces"))
+        XCTAssertEqual(restarted.catalog?.storageRoot, conflict.path)
+        XCTAssertEqual(restarted.workspaceDirectoryPath, conflict.appendingPathComponent("Workspaces").path)
+        XCTAssertEqual(restarted.workspaces.map(\.id), before?.workspaces.map(\.id))
+        let migrated = try XCTUnwrap(restarted.workspaces.first { $0.id == first.id })
+        XCTAssertNotEqual(migrated.databasePath, target.path)
+        let migratedStore = try SQLiteStore(databaseURL: URL(fileURLWithPath: migrated.databasePath))
+        let migratedPages = try await migratedStore.pages()
+        XCTAssertEqual(migratedPages.first?.title, "原空间")
+        let stablePaths = restarted.workspaces.map(\.databasePath)
+        try await restarted.relocateStorage(to: conflict.appendingPathComponent("Workspaces"))
+        XCTAssertEqual(restarted.workspaces.map(\.databasePath), stablePaths)
+        let relaunched = ApplicationServices(catalogURL: catalogURL, startBackgroundServices: false)
+        XCTAssertNil(relaunched.startupError)
+        XCTAssertEqual(relaunched.workspaces.map(\.databasePath), stablePaths)
         XCTAssertEqual(try Data(contentsOf: target), Data("existing".utf8))
         XCTAssertFalse(restarted.busy)
     }
@@ -686,7 +698,7 @@ final class WorkspaceManagementTests: XCTestCase {
         XCTAssertFalse(failed.busy)
         let root = directory.appendingPathComponent("Workspaces")
         let remaining = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
-        XCTAssertTrue(remaining.isEmpty)
+        XCTAssertEqual(Set(remaining), [catalog.workspaces[0].id.uuidString])
     }
 
     func testCreateSwitchFlushEditAndRestart() async throws {
@@ -732,20 +744,20 @@ final class WorkspaceManagementTests: XCTestCase {
         XCTAssertEqual(persisted.color, "green")
     }
 
-    func testDeleteActivePreservesDataAndRejectsLastWorkspace() async throws {
+    func testDeleteActiveRemovesFolderAndRejectsLastWorkspace() async throws {
         let (directory, services) = try fixture()
         let original = try XCTUnwrap(services.currentWorkspace)
         try await services.createWorkspace(name: "临时空间", summary: "", symbol: "star.fill", color: "orange")
         let created = try XCTUnwrap(services.currentWorkspace)
         let createdStore = try XCTUnwrap(services.store)
-        let page = try await createdStore.createPage()
+        _ = try await createdStore.createPage()
         try await services.deleteWorkspace(created.id)
         XCTAssertEqual(services.currentWorkspace?.id, original.id)
         XCTAssertEqual(services.workspaces.count, 1)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: created.databasePath))
-        let preserved = try await createdStore.pages()
-        XCTAssertEqual(preserved.map(\.id), [page.id])
-        XCTAssertEqual(services.catalog?.removedWorkspaces.first?.id, created.id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: URL(fileURLWithPath: created.databasePath).deletingLastPathComponent().path))
+        XCTAssertTrue(services.trashedWorkspaces.contains { $0.id == created.id })
+        try await services.refreshWorkspaces()
+        XCTAssertEqual(services.workspaces.map(\.id), [original.id])
         do { try await services.deleteWorkspace(original.id); XCTFail("Last workspace deletion should fail") }
         catch { XCTAssertTrue(error.localizedDescription.contains(L10n.text("至少需要保留一个工作空间"))) }
         XCTAssertEqual(services.currentWorkspace?.id, original.id)
@@ -790,6 +802,7 @@ final class WorkspaceManagementTests: XCTestCase {
         let selected = services.currentWorkspace?.id
         let model = services.model
         try await services.deleteWorkspace(original.id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: URL(fileURLWithPath: original.databasePath).deletingLastPathComponent().path))
         XCTAssertEqual(services.currentWorkspace?.id, selected)
         XCTAssertTrue(services.model === model)
         XCTAssertEqual(services.workspaces.count, 1)
@@ -837,6 +850,686 @@ final class BackupAndLocalizationTests: XCTestCase {
         return (directory, services)
     }
 
+    func testAllWorkspaceBackupRestoresInactiveAndRemovedSpacesAndUsesBackupSubdirectory() async throws {
+        let (directory, services) = try fixture()
+        let first = try XCTUnwrap(services.currentWorkspace)
+        let firstPage = try await XCTUnwrap(services.store).createPage()
+        try await XCTUnwrap(services.store).renamePage(firstPage.id, title: "first space")
+        try await services.createWorkspace(name: "Second", summary: "", symbol: "book.fill", color: "blue")
+        let secondPage = try await XCTUnwrap(services.store).createPage()
+        try await XCTUnwrap(services.store).renamePage(secondPage.id, title: "second space")
+        try await services.createWorkspace(name: "Removed", summary: "", symbol: "star.fill", color: "green")
+        let removed = try XCTUnwrap(services.currentWorkspace)
+        _ = try await XCTUnwrap(services.store).createPage()
+        try await services.importExistingWorkspace(from: URL(fileURLWithPath: removed.databasePath).deletingLastPathComponent(), policy: .replace)
+        try await services.deleteWorkspace(removed.id)
+        let archive = try await services.createBackup(in: directory)
+        XCTAssertEqual(archive.deletingLastPathComponent().lastPathComponent, "backup")
+        let contents = try WorkspaceBackup.readAll(archive)
+        XCTAssertEqual(contents.workspaces.count, 4)
+        XCTAssertEqual(contents.workspaces.filter(\.removed).count, 2)
+        XCTAssertEqual(contents.activeID, first.id)
+        try await services.restoreBackup(from: archive)
+        XCTAssertEqual(services.workspaces.count, 4)
+        XCTAssertEqual(services.catalog?.removedWorkspaces.count, 4)
+        let pages = try await XCTUnwrap(services.store).pages()
+        XCTAssertEqual(pages.first?.title, "first space")
+        for profile in services.workspaces {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: URL(fileURLWithPath: profile.databasePath).deletingLastPathComponent().appendingPathComponent("workspace.json").path))
+        }
+    }
+
+    func testLegacyCatalogMissingOptionalFieldsAndMovedFolderImportPreserveWAL() async throws {
+        let (directory, services) = try fixture()
+        let profile = try XCTUnwrap(services.currentWorkspace)
+        let catalogURL = directory.appendingPathComponent("legacy.json")
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(services.catalog)) as? [String: Any])
+        json.removeValue(forKey: "removedWorkspaces"); json.removeValue(forKey: "storageRoot")
+        try JSONSerialization.data(withJSONObject: json).write(to: catalogURL)
+        let legacy = try WorkspaceCatalog.load(from: catalogURL, legacyDatabaseURL: URL(fileURLWithPath: profile.databasePath))
+        XCTAssertTrue(legacy.removedWorkspaces.isEmpty)
+        let source = directory.appendingPathComponent("Old/old-space/velora.sqlite")
+        let old = try SQLiteStore(databaseURL: source)
+        let page = try await old.createPage()
+        try await old.renamePage(page.id, title: "from WAL")
+        try await services.importExistingWorkspace(from: source.deletingLastPathComponent().deletingLastPathComponent())
+        let imported = try await XCTUnwrap(services.store).pages()
+        XCTAssertEqual(imported.first?.title, "from WAL")
+        XCTAssertNotEqual(services.currentWorkspace?.databasePath, source.path)
+        let original = try await old.pages()
+        XCTAssertEqual(original.first?.title, "from WAL")
+    }
+
+    func testCorruptSecondWorkspaceRollsBackWholeRestore() async throws {
+        let (directory, services) = try fixture()
+        try await services.createWorkspace(name: "Second", summary: "", symbol: "book.fill", color: "blue")
+        let archive = try await services.createBackup(in: directory)
+        let before = services.workspaces
+        let root = directory.appendingPathComponent("Workspaces")
+        let folders = try FileManager.default.contentsOfDirectory(atPath: root.path)
+        var files = try ZIPPackage.decode(Data(contentsOf: archive), maximumSize: WorkspaceBackup.maximumSize)
+        var manifest = try JSONDecoder().decode(WorkspaceBackup.ArchiveManifest.self, from: XCTUnwrap(files["manifest.json"]))
+        let broken = Data("not a database".utf8)
+        let path = manifest.workspaces[1].path
+        files[path] = broken
+        manifest.workspaces[1].databaseSHA256 = SHA256.hash(data: broken).map { String(format: "%02x", $0) }.joined()
+        files["manifest.json"] = try JSONEncoder().encode(manifest)
+        let bad = directory.appendingPathComponent("corrupt-second.zip")
+        try ZIPPackage.encode(files.map { ($0.key, $0.value) }, compressed: true).write(to: bad)
+        do { try await services.restoreBackup(from: bad); XCTFail("Invalid second workspace accepted") } catch { }
+        XCTAssertEqual(services.workspaces, before)
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: root.path)), Set(folders))
+        XCTAssertFalse(services.busy)
+    }
+
+    func testLegacyVersionZeroWithExistingColumnsImportsWithoutModifyingSource() async throws {
+        let (directory, services) = try fixture()
+        let source = directory.appendingPathComponent("legacy-zero.sqlite")
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(source.path, &db), SQLITE_OK)
+        let page = UUID().uuidString
+        let sql = """
+        CREATE TABLE pages (id TEXT PRIMARY KEY, parent_id TEXT, title TEXT NOT NULL, sort_order INTEGER NOT NULL, archived INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL);
+        CREATE TABLE blocks (id TEXT PRIMARY KEY, page_id TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, sort_order INTEGER NOT NULL, checked INTEGER NOT NULL DEFAULT 0, language TEXT NOT NULL DEFAULT 'Plain Text', collapsed INTEGER NOT NULL DEFAULT 0);
+        INSERT INTO pages VALUES ('\(page)', NULL, 'Legacy zero', 0, 0, 0);
+        """
+        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+        let bytes = try Data(contentsOf: source)
+        try await services.importExistingWorkspace(from: source)
+        let pages = try await XCTUnwrap(services.store).pages()
+        XCTAssertEqual(pages.first?.title, "Legacy zero")
+        XCTAssertEqual(try Data(contentsOf: source), bytes)
+    }
+
+    func testImportedWorkspaceNamesUseMetadataOrFriendlyFallbackAndUniqueNumbers() async throws {
+        let (directory, services) = try fixture()
+        let source = directory.appendingPathComponent("Existing/" + UUID().uuidString).appendingPathComponent("velora.sqlite")
+        let database = try SQLiteStore(databaseURL: source)
+        _ = try await database.createPage()
+        try await services.importExistingWorkspace(from: source.deletingLastPathComponent())
+        XCTAssertEqual(services.currentWorkspace?.name, L10n.text("导入的工作空间"))
+        try await services.importExistingWorkspace(from: source.deletingLastPathComponent())
+        XCTAssertEqual(services.currentWorkspace?.name, L10n.text("导入的工作空间") + " 2")
+        var metadata = try XCTUnwrap(services.currentWorkspace)
+        metadata.name = "项目研发"
+        try JSONEncoder().encode(metadata).write(to: source.deletingLastPathComponent().appendingPathComponent("workspace.json"))
+        try await services.importExistingWorkspace(from: source)
+        XCTAssertEqual(services.currentWorkspace?.name, "项目研发")
+        let oldID = UUID()
+        let oldSource = directory.appendingPathComponent(oldID.uuidString).appendingPathComponent("velora.sqlite")
+        metadata.id = oldID; metadata.name = "原空间名称"; metadata.databasePath = "/old/computer/velora.sqlite"
+        let recovered = WorkspaceCatalog.importedProfile(for: oldSource, knownProfiles: [metadata])
+        XCTAssertEqual(recovered.name, "原空间名称")
+    }
+
+    func testStorageRelocationKeepsMissingInactiveRecordWithoutCreatingEmptyDatabase() async throws {
+        let (directory, services) = try fixture()
+        let original = try XCTUnwrap(services.currentWorkspace)
+        try await services.createWorkspace(name: "Available", summary: "", symbol: "book.fill", color: "blue")
+        let active = try XCTUnwrap(services.currentWorkspace)
+        var catalog = try XCTUnwrap(services.catalog)
+        let missing = directory.appendingPathComponent("missing/velora.sqlite")
+        let index = try XCTUnwrap(catalog.workspaces.firstIndex { $0.id == original.id })
+        catalog.workspaces[index].databasePath = missing.path
+        try catalog.save(to: directory.appendingPathComponent("workspaces.json"))
+        let reopened = ApplicationServices(catalogURL: directory.appendingPathComponent("workspaces.json"), startBackgroundServices: false)
+        try await reopened.relocateStorage(to: directory.appendingPathComponent("Destination/Workspaces"))
+        XCTAssertEqual(reopened.workspaces.map(\.id), [active.id])
+        XCTAssertEqual(reopened.catalog?.removedWorkspaces.first { $0.id == original.id }?.databasePath, missing.path)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path))
+        XCTAssertEqual(reopened.currentWorkspace?.id, active.id)
+        _ = try await reopened.createBackup(in: directory)
+    }
+
+    func testChoosingStorageLoadsExistingFoldersAndPreservesNamesAcrossImportAndRestart() async throws {
+        let (directory, services) = try fixture()
+        let external = directory.appendingPathComponent("External")
+        let sourceServices = ApplicationServices(catalogURL: external.appendingPathComponent("workspaces.json"), legacyDatabaseURL: external.appendingPathComponent("legacy.sqlite"), startBackgroundServices: false)
+        try await sourceServices.createWorkspace(name: "设计资料", summary: "Original description", symbol: "book.fill", color: "blue")
+        let named = try XCTUnwrap(sourceServices.currentWorkspace)
+        let page = try await XCTUnwrap(sourceServices.store).createPage()
+        try await XCTUnwrap(sourceServices.store).renamePage(page.id, title: "Existing content")
+        try await services.relocateStorage(to: external.appendingPathComponent("Workspaces"))
+        let loaded = try XCTUnwrap(services.workspaces.first { $0.id == named.id })
+        XCTAssertEqual(loaded.name, "设计资料")
+        XCTAssertEqual(loaded.databasePath, named.databasePath)
+        XCTAssertEqual(loaded.summary, "Original description")
+        let count = services.workspaces.count
+        try await services.relocateStorage(to: external.appendingPathComponent("Workspaces"))
+        XCTAssertEqual(services.workspaces.count, count)
+        let restarted = ApplicationServices(catalogURL: directory.appendingPathComponent("workspaces.json"), startBackgroundServices: false)
+        XCTAssertEqual(restarted.workspaces.first { $0.id == named.id }?.name, "设计资料")
+        try await restarted.switchWorkspace(named.id)
+        let pages = try await XCTUnwrap(restarted.store).pages()
+        XCTAssertEqual(pages.first?.title, "Existing content")
+        let (_, imported) = try fixture()
+        try await imported.importExistingWorkspace(from: URL(fileURLWithPath: named.databasePath).deletingLastPathComponent())
+        XCTAssertEqual(imported.currentWorkspace?.name, "设计资料")
+    }
+
+    func testImportKeepSkipAndReplacePreserveOriginalsAndWorkspaceIdentity() async throws {
+        for policy in WorkspaceImportPolicy.allCases {
+            let (directory, services) = try fixture()
+            let original = try XCTUnwrap(services.currentWorkspace)
+            let store = try XCTUnwrap(services.store)
+            let page = try await store.createPage()
+            try await store.renamePage(page.id, title: "Original")
+            let source = directory.appendingPathComponent("Incoming/velora.sqlite")
+            try await store.snapshot(to: source)
+            try JSONEncoder().encode(original).write(to: source.deletingLastPathComponent().appendingPathComponent("workspace.json"))
+            let incoming = try SQLiteStore(databaseURL: source)
+            try await incoming.renamePage(page.id, title: "Incoming")
+            let plan = try await services.prepareWorkspaceImport(from: source.deletingLastPathComponent())
+            XCTAssertEqual(plan.conflicts, [original.name])
+            try await services.applyWorkspaceImport(plan, policy: policy)
+            let originalPages = try await store.pages()
+            XCTAssertEqual(originalPages.first?.title, "Original")
+            let incomingPages = try await incoming.pages()
+            XCTAssertEqual(incomingPages.first?.title, "Incoming")
+            let currentPages = try await XCTUnwrap(services.store).pages()
+            switch policy {
+            case .keep:
+                XCTAssertEqual(services.workspaces.count, 2)
+                XCTAssertNotEqual(services.currentWorkspace?.id, original.id)
+                XCTAssertEqual(currentPages.first?.title, "Incoming")
+            case .skip:
+                XCTAssertEqual(services.workspaces, [original])
+                XCTAssertEqual(currentPages.first?.title, "Original")
+            case .replace:
+                XCTAssertEqual(services.workspaces.count, 1)
+                XCTAssertEqual(services.currentWorkspace?.id, original.id)
+                XCTAssertNotEqual(services.currentWorkspace?.databasePath, original.databasePath)
+                XCTAssertEqual(currentPages.first?.title, "Incoming")
+                XCTAssertEqual(services.catalog?.removedWorkspaces.last?.databasePath, original.databasePath)
+                let reopened = ApplicationServices(catalogURL: directory.appendingPathComponent("workspaces.json"), startBackgroundServices: false)
+                XCTAssertNil(reopened.startupError)
+                XCTAssertEqual(reopened.currentWorkspace?.id, original.id)
+                let reopenedPages = try await XCTUnwrap(reopened.store).pages()
+                XCTAssertEqual(reopenedPages.first?.title, "Incoming")
+            }
+            XCTAssertFalse(services.busy)
+        }
+    }
+
+    func testReplacementCommitFailureRestoresOriginalMetadataAndCatalog() async throws {
+        let (directory, services) = try fixture()
+        let original = try XCTUnwrap(services.currentWorkspace)
+        let originalMetadata = URL(fileURLWithPath: original.databasePath).deletingLastPathComponent().appendingPathComponent("workspace.json")
+        let metadata = try Data(contentsOf: originalMetadata)
+        let source = directory.appendingPathComponent("Incoming/velora.sqlite")
+        try await XCTUnwrap(services.store).snapshot(to: source)
+        try JSONEncoder().encode(original).write(to: source.deletingLastPathComponent().appendingPathComponent("workspace.json"))
+        let catalogURL = directory.appendingPathComponent("workspaces.json")
+        try FileManager.default.removeItem(at: catalogURL)
+        try FileManager.default.createDirectory(at: catalogURL, withIntermediateDirectories: true)
+        do { try await services.importExistingWorkspace(from: source, policy: .replace); XCTFail("Invalid catalog target accepted") } catch { }
+        XCTAssertEqual(services.workspaces, [original])
+        XCTAssertEqual(try Data(contentsOf: originalMetadata), metadata)
+        XCTAssertTrue(services.catalog?.removedWorkspaces.isEmpty == true)
+        XCTAssertFalse(services.busy)
+    }
+
+    func testSameNameDuplicateAndImportingOwnDirectoryCanBeSkipped() async throws {
+        let (directory, services) = try fixture()
+        let original = try XCTUnwrap(services.currentWorkspace)
+        let source = directory.appendingPathComponent("Other/velora.sqlite")
+        try await XCTUnwrap(services.store).snapshot(to: source)
+        var metadata = original; metadata.id = UUID()
+        try JSONEncoder().encode(metadata).write(to: source.deletingLastPathComponent().appendingPathComponent("workspace.json"))
+        try await services.importExistingWorkspace(from: source, policy: .skip)
+        XCTAssertEqual(services.workspaces, [original])
+        try await services.importExistingWorkspace(from: URL(fileURLWithPath: original.databasePath).deletingLastPathComponent(), policy: .skip)
+        XCTAssertEqual(services.workspaces, [original])
+    }
+
+    func testMovedCurrentWorkspaceCanReconnectToRenamedStorageFolderAndCreateThere() async throws {
+        let (directory, services) = try fixture()
+        let original = try XCTUnwrap(services.currentWorkspace)
+        let page = try await XCTUnwrap(services.store).createPage()
+        let moved = directory.appendingPathComponent("Workspaces2")
+        try FileManager.default.moveItem(at: directory.appendingPathComponent("Workspaces"), to: moved)
+        // Simulate restarting after a Finder move: the old catalog points at a missing active file.
+        let reopened = ApplicationServices(catalogURL: directory.appendingPathComponent("workspaces.json"), startBackgroundServices: false)
+        XCTAssertNotNil(reopened.startupError)
+        try await reopened.relocateStorage(to: moved)
+        XCTAssertNil(reopened.startupError)
+        XCTAssertEqual(reopened.currentWorkspace?.id, original.id)
+        XCTAssertEqual(reopened.currentWorkspace?.name, original.name)
+        XCTAssertEqual(reopened.workspaceDirectoryPath, moved.path)
+        let pages = try await XCTUnwrap(reopened.store).pages()
+        XCTAssertEqual(pages.map(\.id), [page.id])
+        try await reopened.createWorkspace(name: "After move", summary: "", symbol: "book.fill", color: "blue")
+        XCTAssertTrue(try XCTUnwrap(reopened.currentWorkspace).databasePath.hasPrefix(moved.path + "/"))
+        let again = ApplicationServices(catalogURL: directory.appendingPathComponent("workspaces.json"), startBackgroundServices: false)
+        XCTAssertNil(again.startupError)
+        XCTAssertEqual(again.workspaceDirectoryPath, moved.path)
+    }
+
+    func testImportSkipRecognizesExistingUnregisteredFolder() async throws {
+        let (directory, services) = try fixture()
+        let id = UUID()
+        let source = directory.appendingPathComponent("Workspaces/" + id.uuidString).appendingPathComponent("velora.sqlite")
+        _ = try SQLiteStore(databaseURL: source)
+        var metadata = try XCTUnwrap(services.currentWorkspace)
+        metadata.id = id; metadata.name = "Already on disk"; metadata.databasePath = source.path
+        try JSONEncoder().encode(metadata).write(to: source.deletingLastPathComponent().appendingPathComponent("workspace.json"))
+        let plan = try await services.prepareWorkspaceImport(from: source)
+        XCTAssertEqual(plan.conflicts, ["Already on disk"])
+        try await services.applyWorkspaceImport(plan, policy: .skip)
+        XCTAssertEqual(services.workspaces.count, 2)
+        XCTAssertEqual(services.workspaces.first { $0.id == id }?.databasePath, source.path)
+    }
+
+    func testReplacingOwnWorkspaceIncludesPendingTextAndKeepsRecoveryCopy() async throws {
+        let (_, services) = try fixture()
+        let original = try XCTUnwrap(services.currentWorkspace)
+        let store = try XCTUnwrap(services.store)
+        let page = try await store.createPage()
+        let block = try await store.createBlock(pageID: page.id, kind: .paragraph)
+        let model = try XCTUnwrap(services.model)
+        await model.refreshPages(); model.select(page.id)
+        for _ in 0..<100 where model.blocks.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
+        model.changeText("Pending before import", in: block)
+        try await services.importExistingWorkspace(from: URL(fileURLWithPath: original.databasePath).deletingLastPathComponent(), policy: .replace)
+        XCTAssertEqual(services.currentWorkspace?.id, original.id)
+        let blocks = try await XCTUnwrap(services.store).blocks(in: page.id)
+        XCTAssertEqual(blocks.first?.text, "Pending before import")
+        XCTAssertTrue(services.catalog?.removedWorkspaces.contains { $0.databasePath == original.databasePath } == true)
+    }
+
+    func testImportCanRecoverStartupWithMissingActiveDatabaseWithoutCreatingEmptyOldFile() async throws {
+        let (directory, services) = try fixture()
+        let original = try XCTUnwrap(services.currentWorkspace)
+        let source = directory.appendingPathComponent("Saved/velora.sqlite")
+        let page = try await XCTUnwrap(services.store).createPage()
+        try await XCTUnwrap(services.store).snapshot(to: source)
+        var catalog = try XCTUnwrap(services.catalog)
+        let missing = directory.appendingPathComponent("Missing/velora.sqlite")
+        catalog.workspaces[0].databasePath = missing.path
+        try catalog.save(to: directory.appendingPathComponent("workspaces.json"))
+        let failed = ApplicationServices(catalogURL: directory.appendingPathComponent("workspaces.json"), startBackgroundServices: false)
+        XCTAssertNotNil(failed.startupError)
+        try await failed.importExistingWorkspace(from: source, policy: .keep)
+        XCTAssertNil(failed.startupError)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path))
+        XCTAssertTrue(failed.catalog?.removedWorkspaces.contains { $0.id == original.id && $0.databasePath == missing.path } == true)
+        let pages = try await XCTUnwrap(failed.store).pages()
+        XCTAssertEqual(pages.map(\.id), [page.id])
+    }
+
+    func testRefreshFindsManuallyMovedFoldersWithoutChangingCurrentEditorAndIsIdempotent() async throws {
+        let (directory, services) = try fixture()
+        let original = try XCTUnwrap(services.currentWorkspace)
+        let model = try XCTUnwrap(services.model)
+        let source = directory.appendingPathComponent("Outside/velora.sqlite")
+        let external = try SQLiteStore(databaseURL: source)
+        let page = try await external.createPage()
+        for name in ["Moved A", "Moved B"] {
+            var profile = original
+            profile.id = UUID(); profile.name = name
+            let folder = directory.appendingPathComponent("Workspaces/" + profile.id.uuidString)
+            try await external.snapshot(to: folder.appendingPathComponent("velora.sqlite"))
+            try JSONEncoder().encode(profile).write(to: folder.appendingPathComponent("workspace.json"))
+        }
+        try await services.refreshWorkspaces()
+        XCTAssertEqual(services.workspaces.count, 3)
+        XCTAssertEqual(services.currentWorkspace?.id, original.id)
+        XCTAssertTrue(services.model === model)
+        XCTAssertEqual(Set(services.workspaces.map(\.name)).count, 3)
+        try await services.refreshWorkspaces()
+        XCTAssertEqual(services.workspaces.count, 3)
+        let discovered = try XCTUnwrap(services.workspaces.first { $0.name == "Moved A" })
+        try await services.switchWorkspace(discovered.id)
+        let pages = try await XCTUnwrap(services.store).pages()
+        XCTAssertEqual(pages.map(\.id), [page.id])
+    }
+
+    func testRefreshDoesNotRestoreDeletedFoldersOrExposeReplacementArchives() async throws {
+        let (_, services) = try fixture()
+        let original = try XCTUnwrap(services.currentWorkspace)
+        try await services.importExistingWorkspace(from: URL(fileURLWithPath: original.databasePath).deletingLastPathComponent(), policy: .replace)
+        XCTAssertTrue(services.catalog?.removedWorkspaces.last?.replacementArchive == true)
+        try await services.createWorkspace(name: "Returned", summary: "", symbol: "book.fill", color: "blue")
+        let returned = try XCTUnwrap(services.currentWorkspace)
+        try await services.deleteWorkspace(returned.id)
+        try await services.refreshWorkspaces()
+        XCTAssertEqual(services.workspaces.count, 1)
+        XCTAssertFalse(services.workspaces.contains { $0.id == returned.id })
+        XCTAssertFalse(services.workspaces.contains { $0.replacementArchive == true })
+        try await services.refreshWorkspaces()
+        XCTAssertEqual(services.workspaces.count, 1)
+    }
+
+    func testMultiSelectionImportsAllDistinctFoldersAndDeduplicatesOverlappingSelection() async throws {
+        let (directory, services) = try fixture()
+        let original = try XCTUnwrap(services.currentWorkspace)
+        var urls: [URL] = []
+        for name in ["Selection A", "Selection B"] {
+            let folder = directory.appendingPathComponent("Incoming/" + UUID().uuidString)
+            try await XCTUnwrap(services.store).snapshot(to: folder.appendingPathComponent("velora.sqlite"))
+            var metadata = original
+            metadata.id = UUID(); metadata.name = name
+            try JSONEncoder().encode(metadata).write(to: folder.appendingPathComponent("workspace.json"))
+            urls.append(folder)
+        }
+        let plan = try await services.prepareWorkspaceImport(from: [urls[0], urls[1], urls[0], directory.appendingPathComponent("Incoming")])
+        XCTAssertEqual(plan.contents.workspaces.count, 2)
+        XCTAssertTrue(plan.conflicts.isEmpty)
+        try await services.applyWorkspaceImport(plan, policy: .keep)
+        XCTAssertEqual(services.workspaces.count, 3)
+        XCTAssertTrue(services.workspaces.contains { $0.name == "Selection A" })
+        XCTAssertTrue(services.workspaces.contains { $0.name == "Selection B" })
+        let repeated = try await services.prepareWorkspaceImport(from: urls)
+        XCTAssertEqual(repeated.conflicts.count, 2)
+        try await services.applyWorkspaceImport(repeated, policy: .skip)
+        XCTAssertEqual(services.workspaces.count, 3)
+    }
+
+    func testWorkspaceDeletionCatalogFailureRestoresFolderAndLiveConnection() async throws {
+        let (directory, services) = try fixture()
+        try await services.createWorkspace(name: "Delete rollback", summary: "", symbol: "book.fill", color: "blue")
+        let original = try XCTUnwrap(services.currentWorkspace)
+        let model = try XCTUnwrap(services.model)
+        let store = try XCTUnwrap(services.store)
+        let page = try await store.createPage()
+        let folder = URL(fileURLWithPath: original.databasePath).deletingLastPathComponent()
+        try Data("included file".utf8).write(to: folder.appendingPathComponent("attachment.txt"))
+        let catalogURL = directory.appendingPathComponent("workspaces.json")
+        try FileManager.default.removeItem(at: catalogURL)
+        try FileManager.default.createDirectory(at: catalogURL, withIntermediateDirectories: true)
+        do { try await services.deleteWorkspace(original.id); XCTFail("Invalid catalog destination accepted") } catch { }
+        XCTAssertEqual(services.currentWorkspace?.id, original.id)
+        XCTAssertTrue(services.model === model)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent("attachment.txt").path))
+        let pages = try await store.pages()
+        XCTAssertEqual(pages.map(\.id), [page.id])
+        _ = try await store.createPage()
+        XCTAssertFalse(services.busy)
+    }
+
+    func testWorkspaceDeletionRefusesSharedFolderAndMissingFallback() async throws {
+        let (directory, services) = try fixture()
+        let first = try XCTUnwrap(services.currentWorkspace)
+        try await services.createWorkspace(name: "Another", summary: "", symbol: "book.fill", color: "blue")
+        let second = try XCTUnwrap(services.currentWorkspace)
+        var catalog = try XCTUnwrap(services.catalog)
+        var alias = first
+        alias.id = UUID(); alias.name = "Shared alias"; alias.databasePath = second.databasePath
+        catalog.removedWorkspaces.append(alias)
+        // Write only the central catalog: this deliberately malformed reference must not rewrite folder ownership.
+        try JSONEncoder().encode(catalog).write(to: directory.appendingPathComponent("workspaces.json"), options: .atomic)
+        let reopened = ApplicationServices(catalogURL: directory.appendingPathComponent("workspaces.json"), startBackgroundServices: false)
+        try JSONEncoder().encode(second).write(to: URL(fileURLWithPath: second.databasePath).deletingLastPathComponent().appendingPathComponent("workspace.json"), options: .atomic)
+        do { try await reopened.deleteWorkspace(second.id); XCTFail("Shared folder accepted") } catch { }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: second.databasePath))
+        XCTAssertEqual(reopened.workspaces.count, 2)
+        // A missing replacement must be rejected before moving the current folder.
+        catalog.removedWorkspaces.removeAll()
+        catalog.workspaces[0].databasePath = directory.appendingPathComponent("Missing/velora.sqlite").path
+        try JSONEncoder().encode(catalog).write(to: directory.appendingPathComponent("workspaces.json"), options: .atomic)
+        let missingFallback = ApplicationServices(catalogURL: directory.appendingPathComponent("workspaces.json"), startBackgroundServices: false)
+        do { try await missingFallback.deleteWorkspace(second.id); XCTFail("Missing fallback accepted") } catch { }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: second.databasePath))
+    }
+
+    func testDeletionIgnoresMissingHistoricalNestedReferencesButPreservesTheirRecords() async throws {
+        let (directory, services) = try fixture()
+        let original = try XCTUnwrap(services.currentWorkspace)
+        try await services.createWorkspace(name: "Survivor", summary: "", symbol: "book.fill", color: "blue")
+        var catalog = try XCTUnwrap(services.catalog)
+        var stale = original
+        stale.id = UUID(); stale.name = "Old migrated space"
+        stale.databasePath = URL(fileURLWithPath: original.databasePath).deletingLastPathComponent()
+            .appendingPathComponent("Workspaces/" + stale.id.uuidString + "/velora.sqlite").path
+        catalog.removedWorkspaces.append(stale)
+        try catalog.save(to: directory.appendingPathComponent("workspaces.json"))
+        let reopened = ApplicationServices(catalogURL: directory.appendingPathComponent("workspaces.json"), startBackgroundServices: false)
+        try await reopened.deleteWorkspace(original.id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: URL(fileURLWithPath: original.databasePath).deletingLastPathComponent().path))
+        XCTAssertTrue(reopened.catalog?.removedWorkspaces.contains { $0.id == stale.id } == true)
+        XCTAssertEqual(reopened.workspaces.count, 1)
+        XCTAssertFalse(reopened.busy)
+    }
+
+    func testDeletionProtectsActualNestedHistoricalDatabase() async throws {
+        let (directory, services) = try fixture()
+        let original = try XCTUnwrap(services.currentWorkspace)
+        try await services.createWorkspace(name: "Survivor", summary: "", symbol: "book.fill", color: "blue")
+        var catalog = try XCTUnwrap(services.catalog)
+        var nested = original
+        nested.id = UUID(); nested.name = "Real nested archive"
+        let path = URL(fileURLWithPath: original.databasePath).deletingLastPathComponent()
+            .appendingPathComponent("Workspaces/" + nested.id.uuidString + "/velora.sqlite")
+        let nestedStore = try SQLiteStore(databaseURL: path)
+        let page = try await nestedStore.createPage()
+        nested.databasePath = path.path
+        catalog.removedWorkspaces.append(nested)
+        try catalog.save(to: directory.appendingPathComponent("workspaces.json"))
+        let reopened = ApplicationServices(catalogURL: directory.appendingPathComponent("workspaces.json"), startBackgroundServices: false)
+        do { try await reopened.deleteWorkspace(original.id); XCTFail("Real nested archive must be protected") } catch { }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: original.databasePath))
+        let pages = try await nestedStore.pages()
+        XCTAssertEqual(pages.map(\.id), [page.id])
+        XCTAssertEqual(reopened.workspaces.count, 2)
+    }
+
+    func testWorkspaceRecycleBinPreservesContentRestoresAfterRestartAndPurgesOnlyOnRequest() async throws {
+        let (directory, services) = try fixture()
+        let first = try XCTUnwrap(services.currentWorkspace)
+        try await services.createWorkspace(name: "Recoverable", summary: "Keep description", symbol: "book.fill", color: "blue")
+        let original = try XCTUnwrap(services.currentWorkspace)
+        let store = try XCTUnwrap(services.store)
+        let page = try await store.createPage()
+        let block = try await store.createBlock(pageID: page.id, kind: .paragraph)
+        try await store.updateBlock(block.id, text: "Keep all content")
+        let sourceFolder = URL(fileURLWithPath: original.databasePath).deletingLastPathComponent()
+        try Data("file contents".utf8).write(to: sourceFolder.appendingPathComponent("attachment.txt"))
+        try await services.deleteWorkspace(original.id)
+        XCTAssertEqual(services.currentWorkspace?.id, first.id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sourceFolder.path))
+        let recycled = try XCTUnwrap(services.trashedWorkspaces.first { $0.id == original.id })
+        let recycleFolder = URL(fileURLWithPath: recycled.databasePath).deletingLastPathComponent()
+        XCTAssertTrue(recycled.databasePath.contains("/.Trash/"))
+        XCTAssertEqual(try Data(contentsOf: recycleFolder.appendingPathComponent("attachment.txt")), Data("file contents".utf8))
+        try await services.refreshWorkspaces()
+        XCTAssertEqual(services.workspaces.count, 1)
+        let reopened = ApplicationServices(catalogURL: directory.appendingPathComponent("workspaces.json"), startBackgroundServices: false)
+        XCTAssertEqual(reopened.trashedWorkspaces.count, 1)
+        try await reopened.restoreWorkspace(original.id)
+        XCTAssertTrue(reopened.trashedWorkspaces.isEmpty)
+        let restored = try XCTUnwrap(reopened.workspaces.first { $0.id == original.id })
+        XCTAssertEqual(restored.name, original.name)
+        XCTAssertNil(restored.trashedAt)
+        let restoredStore = try SQLiteStore(databaseURL: URL(fileURLWithPath: restored.databasePath))
+        let blocks = try await restoredStore.blocks(in: page.id)
+        XCTAssertEqual(blocks.first?.text, "Keep all content")
+        try await reopened.deleteWorkspace(original.id)
+        let toPurge = try XCTUnwrap(reopened.trashedWorkspaces.first)
+        try await reopened.permanentlyDeleteWorkspace(original.id)
+        XCTAssertTrue(reopened.trashedWorkspaces.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: URL(fileURLWithPath: toPurge.databasePath).deletingLastPathComponent().path))
+    }
+
+    func testWorkspaceTrashBulkRestoreClearAndAllDeleteCreateNewBlankWorkspace() async throws {
+        let (_, services) = try fixture()
+        try await services.createWorkspace(name: "Second", summary: "", symbol: "book.fill", color: "blue")
+        let ids = Set(services.workspaces.map(\.id))
+        try await services.deleteAllWorkspaces()
+        XCTAssertEqual(services.workspaces.count, 1)
+        XCTAssertFalse(ids.contains(try XCTUnwrap(services.currentWorkspace).id))
+        XCTAssertEqual(Set(services.trashedWorkspaces.map(\.id)), ids)
+        let folders = services.trashedWorkspaces.map { URL(fileURLWithPath: $0.databasePath).deletingLastPathComponent() }
+        XCTAssertTrue(folders.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
+        try await services.restoreAllWorkspaces()
+        XCTAssertEqual(services.workspaces.count, 3)
+        XCTAssertTrue(services.trashedWorkspaces.isEmpty)
+        for id in ids { try await services.deleteWorkspace(id) }
+        let finalFolders = services.trashedWorkspaces.map { URL(fileURLWithPath: $0.databasePath).deletingLastPathComponent() }
+        try await services.emptyWorkspaceTrash()
+        XCTAssertTrue(services.trashedWorkspaces.isEmpty)
+        XCTAssertTrue(finalFolders.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        XCTAssertEqual(services.workspaces.count, 1)
+    }
+
+    func testWorkspaceTrashMovesWithStorageAndRoundTripsInFullZIP() async throws {
+        let (directory, services) = try fixture()
+        try await services.createWorkspace(name: "Deleted space", summary: "", symbol: "book.fill", color: "blue")
+        let id = try XCTUnwrap(services.currentWorkspace).id
+        let page = try await XCTUnwrap(services.store).createPage()
+        try await services.deleteWorkspace(id)
+        try await services.relocateStorage(to: directory.appendingPathComponent("NewStorage"))
+        let recycled = try XCTUnwrap(services.trashedWorkspaces.first)
+        XCTAssertTrue(recycled.databasePath.hasPrefix(directory.appendingPathComponent("NewStorage/Workspaces/.Trash").path))
+        let archive = try await services.createBackup(in: directory)
+        try await services.restoreBackup(from: archive)
+        XCTAssertEqual(services.trashedWorkspaces.count, 2)
+        let imported = try XCTUnwrap(services.trashedWorkspaces.first { $0.id != id })
+        XCTAssertTrue(imported.databasePath.contains("/.Trash/"))
+        try await services.restoreWorkspace(imported.id)
+        let profile = try XCTUnwrap(services.workspaces.first { $0.id == imported.id })
+        let database = try SQLiteStore(databaseURL: URL(fileURLWithPath: profile.databasePath))
+        let pages = try await database.pages()
+        XCTAssertEqual(pages.map(\.id), [page.id])
+    }
+
+    func testWorkspaceTrashPurgeCatalogFailureKeepsRecoverableFiles() async throws {
+        let (directory, services) = try fixture()
+        try await services.createWorkspace(name: "Purging", summary: "", symbol: "book.fill", color: "blue")
+        let id = try XCTUnwrap(services.currentWorkspace).id
+        try await services.deleteWorkspace(id)
+        let trashed = try XCTUnwrap(services.trashedWorkspaces.first)
+        let catalogURL = directory.appendingPathComponent("workspaces.json")
+        try FileManager.default.removeItem(at: catalogURL)
+        try FileManager.default.createDirectory(at: catalogURL, withIntermediateDirectories: true)
+        do { try await services.permanentlyDeleteWorkspace(id); XCTFail("Invalid catalog destination accepted") } catch { }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: trashed.databasePath))
+        XCTAssertEqual(services.trashedWorkspaces.map(\.id), [id])
+        XCTAssertFalse(services.busy)
+    }
+
+    func testDocumentsBulkTrashRestoreAndPurgeKeepIndependentDeletionBatches() async throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(".agents/test/DocumentRecycle-" + UUID().uuidString)
+        let store = try SQLiteStore(databaseURL: directory.appendingPathComponent("velora.sqlite"))
+        let a = try await store.createPage()
+        let child = try await store.createPage(parentID: a.id)
+        let b = try await store.createPage()
+        let block = try await store.createBlock(pageID: a.id, kind: .paragraph)
+        try await store.updateBlock(block.id, text: "Retained until purge")
+        try await store.archiveAllPages()
+        var pages = try await store.pages()
+        XCTAssertTrue(pages.allSatisfy(\.archived))
+        let retained = try await store.blocks(in: a.id)
+        XCTAssertEqual(retained.first?.text, "Retained until purge")
+        try await store.restorePage(a.id)
+        pages = try await store.pages()
+        XCTAssertTrue(pages.first { $0.id == b.id }?.archived == true)
+        XCTAssertTrue(pages.first { $0.id == child.id }?.archived == false)
+        try await store.restoreAllPages()
+        pages = try await store.pages()
+        XCTAssertTrue(pages.allSatisfy { !$0.archived })
+        try await store.archivePage(a.id, archived: true)
+        try await store.permanentlyDeletePage(a.id)
+        pages = try await store.pages()
+        XCTAssertEqual(pages.map(\.id), [b.id])
+        try await store.archiveAllPages(); try await store.emptyTrash()
+        pages = try await store.pages()
+        XCTAssertTrue(pages.isEmpty)
+        let removedBlocks = try await store.blocks(in: a.id)
+        XCTAssertTrue(removedBlocks.isEmpty)
+    }
+
+    func testRefreshDoesNotResurrectOldMigrationCopyOfRecycledWorkspace() async throws {
+        let (directory, services) = try fixture()
+        try await services.createWorkspace(name: "Duplicate history", summary: "", symbol: "book.fill", color: "blue")
+        let original = try XCTUnwrap(services.currentWorkspace)
+        let oldCopy = directory.appendingPathComponent("Workspaces/old-migration-copy")
+        try await XCTUnwrap(services.store).snapshot(to: oldCopy.appendingPathComponent("velora.sqlite"))
+        try JSONEncoder().encode(original).write(to: oldCopy.appendingPathComponent("workspace.json"))
+        try await services.deleteWorkspace(original.id)
+        let recyclePath = try XCTUnwrap(services.trashedWorkspaces.first).databasePath
+        try await services.refreshWorkspaces()
+        XCTAssertEqual(services.workspaces.count, 1)
+        XCTAssertEqual(services.trashedWorkspaces.map(\.id), [original.id])
+        XCTAssertEqual(services.trashedWorkspaces.first?.databasePath, recyclePath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: recyclePath))
+    }
+
+    func testRefreshArchivesDuplicateDirectoriesWithoutOverwritingCurrentOrDiscardingOlderContent() async throws {
+        let (directory, services) = try fixture()
+        let profile = try XCTUnwrap(services.currentWorkspace)
+        let store = try XCTUnwrap(services.store)
+        let page = try await store.createPage()
+        try await store.renamePage(page.id, title: "Current")
+        let duplicate = directory.appendingPathComponent("Workspaces/" + profile.id.uuidString + "-old-copy")
+        try await store.snapshot(to: duplicate.appendingPathComponent("velora.sqlite"))
+        try JSONEncoder().encode(profile).write(to: duplicate.appendingPathComponent("workspace.json"))
+        let old = try SQLiteStore(databaseURL: duplicate.appendingPathComponent("velora.sqlite"))
+        _ = try await old.createPage()
+        try await services.refreshWorkspaces()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: duplicate.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: profile.databasePath))
+        XCTAssertEqual(services.workspaces.count, 1)
+        let current = try await store.pages()
+        XCTAssertEqual(current.count, 1)
+        let backups = try FileManager.default.contentsOfDirectory(at: directory.appendingPathComponent("backup"), includingPropertiesForKeys: nil)
+        let group = try XCTUnwrap(backups.first { $0.lastPathComponent.hasPrefix("WorkspaceCopies-") })
+        let archive = group.appendingPathComponent(duplicate.lastPathComponent).appendingPathComponent("velora.sqlite")
+        let archived = try SQLiteStore(databaseURL: archive)
+        let historical = try await archived.pages()
+        XCTAssertEqual(historical.count, 2)
+        try await services.refreshWorkspaces()
+        XCTAssertEqual(services.workspaces.count, 1)
+    }
+
+    func testDeletingWorkspaceCollectsAllUnregisteredCopiesAndPermanentDeleteRemovesThem() async throws {
+        let (directory, services) = try fixture()
+        try await services.createWorkspace(name: "Copies", summary: "", symbol: "book.fill", color: "blue")
+        let original = try XCTUnwrap(services.currentWorkspace)
+        let duplicate = directory.appendingPathComponent("Workspaces/" + original.id.uuidString + "-copy")
+        try await XCTUnwrap(services.store).snapshot(to: duplicate.appendingPathComponent("velora.sqlite"))
+        try JSONEncoder().encode(original).write(to: duplicate.appendingPathComponent("workspace.json"))
+        try await services.deleteWorkspace(original.id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: duplicate.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: original.databasePath))
+        let trashed = try XCTUnwrap(services.trashedWorkspaces.first)
+        let recycleFolder = URL(fileURLWithPath: trashed.databasePath).deletingLastPathComponent()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: recycleFolder.appendingPathComponent(".MigrationCopies/" + duplicate.lastPathComponent + "/velora.sqlite").path))
+        try await services.permanentlyDeleteWorkspace(original.id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: recycleFolder.path))
+        try await services.refreshWorkspaces()
+        XCTAssertFalse(services.workspaces.contains { $0.id == original.id })
+    }
+
+    func testRestartDoesNotCloneDedicatedUUIDSuffixFolderIntoCanonicalFolder() async throws {
+        let (directory, services) = try fixture()
+        var catalog = try XCTUnwrap(services.catalog)
+        let original = catalog.active
+        let canonical = URL(fileURLWithPath: original.databasePath).deletingLastPathComponent()
+        let suffixed = canonical.deletingLastPathComponent().appendingPathComponent(original.id.uuidString + "-migration")
+        try FileManager.default.moveItem(at: canonical, to: suffixed)
+        catalog.workspaces[0].databasePath = suffixed.appendingPathComponent("velora.sqlite").path
+        try catalog.save(to: directory.appendingPathComponent("workspaces.json"))
+        for _ in 0..<2 {
+            let reopened = ApplicationServices(catalogURL: directory.appendingPathComponent("workspaces.json"), startBackgroundServices: false)
+            XCTAssertNil(reopened.startupError)
+            XCTAssertEqual(reopened.currentWorkspace?.databasePath, suffixed.appendingPathComponent("velora.sqlite").path)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: canonical.path))
+        }
+    }
+
+    func testLegacySingleWorkspaceZIPRemainsRestorable() async throws {
+        let (directory, services) = try fixture()
+        let page = try await XCTUnwrap(services.store).createPage()
+        let snapshot = directory.appendingPathComponent("legacy.sqlite")
+        try await XCTUnwrap(services.store).snapshot(to: snapshot)
+        let archive = directory.appendingPathComponent("legacy.zip")
+        try WorkspaceBackup.write(snapshot: snapshot, profile: XCTUnwrap(services.currentWorkspace), to: archive)
+        try await services.restoreBackup(from: archive)
+        let pages = try await XCTUnwrap(services.store).pages()
+        XCTAssertEqual(pages.map(\.id), [page.id])
+    }
+
     func testCompressedBackupRestoresHierarchyTrashFormattingAndEmbeddedAssetsWithoutOverwrite() async throws {
         let (directory, services) = try fixture()
         let original = try XCTUnwrap(services.currentWorkspace)
@@ -862,8 +1555,8 @@ final class BackupAndLocalizationTests: XCTestCase {
         let bytes = try Data(contentsOf: archive)
         // Raw DEFLATE in the ZIP local header, rather than a renamed uncompressed database.
         XCTAssertEqual(bytes[8], 8)
-        let unpacked = try WorkspaceBackup.read(archive)
-        XCTAssertLessThan(bytes.count, unpacked.database.count)
+        let unpacked = try WorkspaceBackup.readAll(archive)
+        XCTAssertLessThan(bytes.count, unpacked.workspaces[0].database.count)
         try await store.renamePage(parent.id, title: "备份后的改动")
         try await services.restoreBackup(from: archive)
         let restoredProfile = try XCTUnwrap(services.currentWorkspace)
@@ -897,7 +1590,8 @@ final class BackupAndLocalizationTests: XCTestCase {
         let original = try XCTUnwrap(services.currentWorkspace)
         let archive = try await services.createBackup(in: directory)
         var package = try ZIPPackage.decode(Data(contentsOf: archive), maximumSize: WorkspaceBackup.maximumSize)
-        package["workspace.sqlite"] = Data("invalid database".utf8)
+        let databasePath = try XCTUnwrap(package.keys.first { $0.hasSuffix("/velora.sqlite") })
+        package[databasePath] = Data("invalid database".utf8)
         let bad = directory.appendingPathComponent("bad.zip")
         try ZIPPackage.encode(package.map { ($0.key, $0.value) }, compressed: true).write(to: bad)
         do { try await services.restoreBackup(from: bad); XCTFail("Corrupt backup was accepted") } catch { }
@@ -905,8 +1599,8 @@ final class BackupAndLocalizationTests: XCTestCase {
         XCTAssertEqual(services.workspaces.count, 1)
         XCTAssertFalse(services.busy)
         XCTAssertFalse(services.model?.workspaceTransitioning ?? true)
-        var metadata = try JSONDecoder().decode(WorkspaceBackup.Manifest.self, from: package["manifest.json"]!)
-        metadata.databaseSHA256 = SHA256.hash(data: package["workspace.sqlite"]!).map { String(format: "%02x", $0) }.joined()
+        var metadata = try JSONDecoder().decode(WorkspaceBackup.ArchiveManifest.self, from: package["manifest.json"]!)
+        metadata.workspaces[0].databaseSHA256 = SHA256.hash(data: package[databasePath]!).map { String(format: "%02x", $0) }.joined()
         package["manifest.json"] = try JSONEncoder().encode(metadata)
         try ZIPPackage.encode(package.map { ($0.key, $0.value) }, compressed: true).write(to: bad)
         do { try await services.restoreBackup(from: bad); XCTFail("Invalid database was accepted") } catch { }

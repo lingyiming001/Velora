@@ -20,6 +20,129 @@ final class DocumentTransferTests: XCTestCase {
         XCTAssertNil(ClipboardDocument.pythonCode("from package import value\n说明文字"))
     }
 
+    func testRawPythonWithInlineHTMLRetainsCodeWhitespace() async throws {
+        let source = "import os\n\nif True:\n    print(os.getcwd())"
+        let markdown = try await ClipboardDocument.markdown(plain: source, html: "<span>import os if True: print(os.getcwd())</span>")
+        let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+        XCTAssertEqual(blocks.count, 1)
+        XCTAssertEqual(blocks.first?.kind, .code)
+        XCTAssertEqual(blocks.first?.text, source)
+    }
+
+    func testHTMLCodeParagraphLinesAndNestedRowsRetainWhitespace() async throws {
+        for body in [
+            "<p>import os</p><p></p><p>if True:</p><p>    print(1)</p>",
+            "<div><div>import os</div><div></div><div>if True:</div><div>    print(1)</div></div>"
+        ] {
+            let markdown = try await DocumentRenderSession.markdown(fromHTML: "<pre data-language='python'>" + body + "</pre>")
+            let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+            XCTAssertEqual(blocks.first?.text, "import os\n\nif True:\n    print(1)")
+        }
+    }
+
+    private func captureChatGPTBrowserCopy(_ fixture: String, selectionScript: String = "range.selectNodeContents(fixture);") async throws -> [String: String] {
+        let scriptURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("deploy/chrome-copy-helper/copy.js")
+        let helper = try String(contentsOf: scriptURL, encoding: .utf8)
+        let session = DocumentRenderSession(); defer { session.close() }
+        _ = try await session.run(helper + "\nreturn true;")
+        let result = try await session.run("""
+        const fixture=document.createElement('div');fixture.innerHTML=html;document.body.append(fixture);
+        const range=document.createRange();
+        """ + selectionScript + """
+        const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);
+        const copied={};const event=new Event('copy',{bubbles:true,cancelable:true});
+        Object.defineProperty(event,'clipboardData',{value:{setData(type,value){copied[type]=value;}}});
+        fixture.dispatchEvent(event);return copied;
+        """, arguments: ["html": fixture])
+        return try XCTUnwrap(result as? [String: String])
+    }
+
+    func testBrowserCopyHelperPreservesPythonAndPlainTextBlocksThroughPaste() async throws {
+        let python = "import sys\n\nfor path in sys.path:\n    print(path)"
+        let plain = "Windows:\n.venv/Lib/site-packages/\n\nmacOS / Linux:\n.venv/lib/pythonX.Y/site-packages/"
+        let fixture = "<p>之前</p><div>Python</div><div class='cm-editor'><div class='cm-content'>" + python.components(separatedBy: "\n").map { "<div class='cm-line'><span>" + HTMLTransfer.escape($0) + "</span></div>" }.joined() + "</div></div><p>中间</p><pre><code>" + HTMLTransfer.escape(plain) + "</code></pre><p>之后</p>"
+        let copy = try await captureChatGPTBrowserCopy(fixture)
+        XCTAssertTrue(try XCTUnwrap(copy["text/plain"]).contains(python))
+        XCTAssertTrue(try XCTUnwrap(copy["text/plain"]).contains(plain))
+        let markdown = try await ClipboardDocument.markdown(plain: copy["text/plain"], html: copy["text/html"])
+        let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+        XCTAssertEqual(blocks.filter { $0.kind == .code }.map(\.text), [python, plain])
+        XCTAssertTrue(blocks.contains { $0.text == "之前" })
+        XCTAssertTrue(blocks.contains { $0.text == "之后" })
+    }
+
+    func testBrowserCopyHelperPreservesPartialEditorSelectionAndRepeatedBlankLines() async throws {
+        let fixture = "<div class='cm-content'><div class='cm-line'><span>prefix abc</span></div><div class='cm-line'></div><div class='cm-line'></div><div class='cm-line'>    abc suffix</div></div>"
+        let copy = try await captureChatGPTBrowserCopy(fixture, selectionScript: "const lines=fixture.querySelectorAll('.cm-line');range.setStart(lines[0].firstChild.firstChild,7);range.setEnd(lines[3].firstChild,7);")
+        XCTAssertEqual(copy["text/plain"], "abc\n\n\n    abc")
+        let markdown = try await ClipboardDocument.markdown(plain: copy["text/plain"], html: copy["text/html"])
+        XCTAssertEqual(try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks.first?.text, "abc\n\n\n    abc")
+    }
+
+    func testBrowserCopyHelperLeavesProseAloneAndPreservesLineBasedPlainText() async throws {
+        let prose = try await captureChatGPTBrowserCopy("<p>普通正文</p>")
+        XCTAssertTrue(prose.isEmpty)
+        let virtualized = try await captureChatGPTBrowserCopy("<div class='cm-content'><div class='cm-line'>first</div><div class='cm-gap'></div><div class='cm-line'>last</div></div>")
+        XCTAssertTrue(virtualized.isEmpty)
+        let copy = try await captureChatGPTBrowserCopy("<pre><code><span class='line'>line 1</span><span class='line'></span><span class='line'>    line 2</span></code></pre>")
+        XCTAssertEqual(copy["text/plain"], "line 1\n\n    line 2\n")
+    }
+
+    func testLocalCodeLineRepairRestoresScreenshotWithoutChangingCharacters() throws {
+        let source = "import osapi_key = os.getenv(\"OPENAI_API_KEY\")"
+        let expected = "import os\n\napi_key = os.getenv(\"OPENAI_API_KEY\")"
+        let suggestion = try XCTUnwrap(CodeLineRepair.localSuggestion(source))
+        XCTAssertEqual(suggestion, expected)
+        XCTAssertEqual(try CodeLineRepair.validated(suggestion, original: source), expected)
+        XCTAssertNil(CodeLineRepair.localSuggestion(expected))
+        XCTAssertNil(CodeLineRepair.localSuggestion("import os"))
+        XCTAssertNil(CodeLineRepair.localSuggestion("import osapi_key = other.getenv('KEY')"))
+        XCTAssertNil(CodeLineRepair.localSuggestion("import os1key = os.getenv('KEY')"))
+    }
+
+    func testLocalCodeLineRepairRestoresJoinedImportAndSimpleLoop() throws {
+        let source = "import sysfor path in sys.path:    print(path)"
+        let expected = "import sys\n\nfor path in sys.path:\n    print(path)"
+        XCTAssertEqual(CodeLineRepair.localSuggestion(source), expected)
+        XCTAssertEqual(try CodeLineRepair.validated(expected, original: source), expected)
+        XCTAssertNil(CodeLineRepair.localSuggestion("import sysfor path in other.path:    print(path)"))
+        XCTAssertNil(CodeLineRepair.localSuggestion("import sysfor path in sys.path:    print(other)"))
+    }
+
+    func testCodeLineRepairRejectsChangedCodeAndStringContents() throws {
+        let source = "import osapi_key = os.getenv(\"OPENAI_API_KEY\")"
+        let expected = "import os\n\napi_key = os.getenv(\"OPENAI_API_KEY\")"
+        XCTAssertThrowsError(try CodeLineRepair.validated(source, original: source))
+        XCTAssertThrowsError(try CodeLineRepair.validated(expected.replacingOccurrences(of: "getenv", with: "system"), original: source))
+        XCTAssertThrowsError(try CodeLineRepair.validated(expected.replacingOccurrences(of: "OPENAI_API_KEY", with: "OPENAI API KEY"), original: source))
+        XCTAssertEqual(try CodeLineRepair.validated("```python\n" + expected + "\n```", original: source), expected)
+        for literal in [#""hello world""#, #"'a \' b'"#, #""""中文  空格""""#, #""a\" b""#] {
+            let code = "a=" + literal + ";b=1"
+            XCTAssertNoThrow(try CodeLineRepair.validated("a = " + literal + ";\nb = 1", original: code))
+            XCTAssertThrowsError(try CodeLineRepair.validated("a = " + literal.replacingOccurrences(of: " ", with: "") + ";\nb = 1", original: code))
+        }
+    }
+
+    func testChatGPTScreenshotCollapsedImportWarnsAndIntactCodeCopyWorks() async throws {
+        let damaged = "import osapi_key = os.getenv(\"OPENAI_API_KEY\")"
+        let html = "<p>更合理的做法是：</p><div><div><pre dir='ltr'><code>" + damaged + "</code></pre></div><div></div></div><p>这样，代码与密钥分离。</p>"
+        let markdown = try await ClipboardDocument.markdown(plain: "更合理的做法是：\n" + damaged + "\n这样，代码与密钥分离。", html: html)
+        let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+        let code = try XCTUnwrap(blocks.first { $0.kind == .code })
+        XCTAssertEqual(code.text, damaged)
+        XCTAssertEqual(code.language.lowercased(), "python")
+        XCTAssertTrue(blocks.contains { $0.kind == .warning && $0.text.contains("复制代码") })
+
+        let intact = "import os\n\napi_key = os.getenv(\"OPENAI_API_KEY\")"
+        let copied = try await ClipboardDocument.markdown(plain: intact, html: nil)
+        let restored = try DocumentTransfer.markdown(copied, title: "", consumeLeadingTitle: false).pages[0].blocks
+        XCTAssertEqual(restored.first?.text, intact)
+        XCTAssertEqual(restored.first?.language.lowercased(), "python")
+
+        let valid = try await ClipboardDocument.markdown(plain: nil, html: "<pre><code>import os; api_key = os.getenv(\"OPENAI_API_KEY\")</code></pre>")
+        XCTAssertFalse(valid.contains("[!WARNING]"))
+    }
+
     func testClipboardAlreadyCollapsedPythonWarnsWithoutInventingNewlines() async throws {
         let damaged = "from dotenv import load_dotenvfrom langchain_openai import ChatOpenAI# 1. 加载环境变量load_dotenv()# 2. 创建模型model = ChatOpenAI(    model=\"gpt-4o-mini\",    temperature=0)"
         let html = "<p>创建文件 <code>example_01.py</code>：</p><div><div><pre dir='ltr'><code>" + HTMLTransfer.escape(damaged) + "</code></pre></div><div></div></div>"

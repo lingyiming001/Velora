@@ -107,7 +107,8 @@ enum ClipboardDocument {
     }
     static func markdown(plain: String?, html: String?) async throws -> String {
         if let plain, let diagram = mermaidMarkdown(plain) { return diagram }
-        if (html == nil || html?.isEmpty == true), let code = pythonCode(plain) {
+        if let code = pythonCode(plain),
+           html.flatMap({ DocumentTransfer.firstMatch(#"(?i)<(?:pre|h[1-6]|table|ul|ol|blockquote)\b"#, $0) }) == nil {
             let longest = code.split(whereSeparator: { $0 != "`" }).map(\.count).max() ?? 0
             let fence = String(repeating: "`", count: max(3, longest + 1))
             return fence + "python\n" + code + (code.hasSuffix("\n") ? "" : "\n") + fence
@@ -202,5 +203,76 @@ enum ClipboardDocument {
             return before + markdown + after
         }
         return [before, markdown, after].filter { !$0.isEmpty }.joined(separator: "\n\n")
+    }
+}
+
+/// Suggestions for clipboard code whose visual line boundaries were lost.
+/// Local inference is deliberately narrow; all suggestions require review.
+enum CodeLineRepair {
+    static func localSuggestion(_ source: String) -> String? {
+        // An import joined to a simple module-attribute iteration, retaining its
+        // indentation. Backreferences establish both the module and loop variable.
+        if source.count <= 100_000, !source.contains("\n"),
+           let regex = try? NSRegularExpression(pattern: #"^(import[ \t]+)([A-Za-z_][A-Za-z0-9_]*)for([ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]+in[ \t]+\2\.[A-Za-z_][A-Za-z0-9_]*:)([ \t]{2,})(print\(\4\))[ \t]*$"#),
+           let match = regex.firstMatch(in: source, range: NSRange(source.startIndex..., in: source)) {
+            let text = source as NSString
+            return text.substring(with: match.range(at: 1)) + text.substring(with: match.range(at: 2)) + "\n\nfor"
+                + text.substring(with: match.range(at: 3)) + "\n" + text.substring(with: match.range(at: 5))
+                + text.substring(with: match.range(at: 6))
+        }
+        guard source.count <= 100_000, !source.contains("\n"),
+              let regex = try? NSRegularExpression(pattern: #"^([ \t]*import[ \t]+)([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*([A-Za-z_][A-Za-z0-9_]*)\."#),
+              let match = regex.firstMatch(in: source, range: NSRange(source.startIndex..., in: source)) else { return nil }
+        let text = source as NSString
+        let merged = text.substring(with: match.range(at: 2))
+        let module = text.substring(with: match.range(at: 3))
+        guard merged.hasPrefix(module), merged.count > module.count else { return nil }
+        let variable = String(merged.dropFirst(module.count))
+        guard variable.range(of: #"^[A-Za-z_][A-Za-z0-9_]*$"#, options: .regularExpression) != nil else { return nil }
+        let offset = match.range(at: 2).location + module.utf16.count
+        return text.substring(to: offset) + "\n\n" + text.substring(from: offset)
+    }
+
+    static func validated(_ suggestion: String, original: String) throws -> String {
+        guard original.count <= 100_000, suggestion.count <= 300_000 else {
+            throw AppError.message(L10n.tr("代码过长，请分段修复"))
+        }
+        var result = suggestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        if result.hasPrefix("```"), result.hasSuffix("```"), let first = result.firstIndex(of: "\n") {
+            result = String(result[result.index(after: first)...].dropLast(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard result != original, !result.isEmpty else { throw AppError.message(L10n.tr("没有生成不同的修复建议")) }
+        guard signature(result) == signature(original) else {
+            throw AppError.message(L10n.tr("修复建议改动了代码字符或字符串内容，已阻止替换"))
+        }
+        return result
+    }
+
+    // Ignore layout whitespace outside quoted literals, while preserving every
+    // character inside ordinary/triple quoted strings, including escaped quotes.
+    private static func signature(_ source: String) -> [String] {
+        let chars = Array(source)
+        var result: [String] = [], index = 0
+        while index < chars.count {
+            let c = chars[index]
+            if c == "\"" || c == "'" {
+                let triple = index + 2 < chars.count && chars[index + 1] == c && chars[index + 2] == c
+                let length = triple ? 3 : 1
+                var literal = String(repeating: String(c), count: length)
+                index += length
+                while index < chars.count {
+                    if chars[index] == "\\", index + 1 < chars.count {
+                        literal.append(chars[index]); literal.append(chars[index + 1]); index += 2
+                    } else if chars[index] == c && (!triple || (index + 2 < chars.count && chars[index + 1] == c && chars[index + 2] == c)) {
+                        literal += String(repeating: String(c), count: length); index += length; break
+                    } else { literal.append(chars[index]); index += 1 }
+                }
+                result.append(literal)
+            } else {
+                if !c.isWhitespace { result.append(String(c)) }
+                index += 1
+            }
+        }
+        return result
     }
 }

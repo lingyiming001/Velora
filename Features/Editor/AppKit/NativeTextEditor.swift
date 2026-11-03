@@ -518,17 +518,21 @@ final class TableResizeGripView: NSView {
 /// hit-testing bounds; the following row can consume the menu's mouse clicks.
 struct EditorCommandPopup<Content: View>: NSViewRepresentable {
     let content: Content
-    init(@ViewBuilder content: () -> Content) { self.content = content() }
+    let onDismiss: () -> Void
+    init(onDismiss: @escaping () -> Void, @ViewBuilder content: () -> Content) {
+        self.onDismiss = onDismiss
+        self.content = content()
+    }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeNSView(context: Context) -> EditorPopupAnchor {
         let anchor = EditorPopupAnchor()
         anchor.reposition = { [weak coordinator = context.coordinator] in coordinator?.schedulePosition() }
         context.coordinator.anchor = anchor
-        context.coordinator.update(content)
+        context.coordinator.update(content, onDismiss: onDismiss)
         return anchor
     }
-    func updateNSView(_ view: EditorPopupAnchor, context: Context) { context.coordinator.update(content) }
+    func updateNSView(_ view: EditorPopupAnchor, context: Context) { context.coordinator.update(content, onDismiss: onDismiss) }
     static func dismantleNSView(_ view: EditorPopupAnchor, coordinator: Coordinator) { coordinator.close() }
 
     final class Coordinator {
@@ -540,8 +544,14 @@ struct EditorCommandPopup<Content: View>: NSViewRepresentable {
         private var scrollObserver: NSObjectProtocol?
         private weak var observedClip: NSClipView?
 
-        func update(_ content: Content) {
+        private var eventMonitor: Any?
+        private var dismiss: () -> Void = {}
+
+        deinit { close() }
+
+        func update(_ content: Content, onDismiss: @escaping () -> Void) {
             guard active else { return }
+            dismiss = onDismiss
             if let host { host.rootView = content }
             else {
                 let host = EditorPopupHostingView(rootView: content)
@@ -554,6 +564,17 @@ struct EditorCommandPopup<Content: View>: NSViewRepresentable {
                 panel.contentView = host
                 panel.setAccessibilityLabel(L10n.tr("插入块"))
                 self.host = host; self.panel = panel
+                eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown]) { [weak self] event in
+                    guard let self, let panel = self.panel, panel.isVisible else { return event }
+                    if event.type == .keyDown {
+                        guard event.keyCode == 53,
+                              event.window === panel || event.window === panel.parent else { return event }
+                        self.dismissPopup()
+                        return nil
+                    }
+                    if event.window !== panel { self.dismissPopup() }
+                    return event
+                }
             }
             schedulePosition()
         }
@@ -591,8 +612,16 @@ struct EditorCommandPopup<Content: View>: NSViewRepresentable {
             }
             panel.orderFront(nil)
         }
+        private func dismissPopup() {
+            let callback = dismiss
+            close()
+            callback()
+        }
+
         func close() {
             active = false
+            if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
+            eventMonitor = nil
             pending?.cancel(); pending = nil
             if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
             scrollObserver = nil
