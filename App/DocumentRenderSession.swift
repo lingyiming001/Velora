@@ -78,7 +78,7 @@ final class DocumentRenderSession: NSObject, WKNavigationDelegate, WKScriptMessa
             let data = try Data(contentsOf: assets.appendingPathComponent(String(css[path])))
             css.replaceSubrange(range, with: "url(data:font/woff2;base64," + data.base64EncodedString() + ")")
         }
-        css += "\nhtml,body{overflow:visible;background:white;color:#24252a}body{max-width:850px;margin:40px auto;padding:0 28px}pre code{white-space:pre-wrap;overflow-wrap:anywhere}img{max-width:100%;height:auto}.code-header button{display:none}@media print{body{margin:0;max-width:none}h1,h2,h3{break-after:avoid}tr,.katex-display,img{break-inside:avoid}}"
+        css += "\nhtml,body{overflow:visible;background:white;color:#24252a}body{max-width:850px;margin:40px auto;padding:0 28px}pre code{white-space:pre-wrap;overflow-wrap:anywhere}img{max-width:100%;height:auto}.code-header button{display:none}@page{size:A4;margin:16.933mm}@media print{body{margin:0;padding:0;max-width:none}h1,h2,h3{break-after:avoid}tr,.katex-display,img{break-inside:avoid}}"
         let payload = try JSONEncoder().encode(original).base64EncodedString()
         return "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>" + HTMLTransfer.escape(original.name) + "</title><meta name=\"velora-body-sha256\" content=\"" + Self.digest(Data((body + css).utf8)) + "\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data: https: http:; font-src data:\"><style>" + css + "</style><script type=\"application/json\" id=\"velora-source\">" + payload + "</script></head><body>" + body + "</body></html>"
     }

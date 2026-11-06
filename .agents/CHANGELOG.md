@@ -95,3 +95,18 @@
 - 新增 deploy/chrome-copy-helper（Manifest V3）：document_start 的 capture copy 监听仅处理 ChatGPT 含代码选区，将 CodeMirror 行与标准 PRE 保留为真实换行的 HTML/纯文本；保留部分首尾选区、连续空行与缩进。没有网络、后台服务、存储、clipboardRead 权限；不主动调用 AI。存在 cm-gap 时交还原生复制，避免把不完整虚拟 DOM 当完整源码；网站直接写剪贴板的按钮不覆盖。
 - 添加从合成 copy 事件到 Velora HTML/Markdown 导入的集成测试，包含 Python+Plain Text+正文混排、部分代码选区、空行、普通正文不拦截、虚拟缺行不拦截。DocumentTransferTests 54 项全部通过，日志 .agents/test/browser-copy-helper-tests.log，JS 语法与 diff 检查通过。
 - 尚未加载到 Chrome、尚未在真实网页验证助手拦截效果。加载会新增 ChatGPT 页面访问权限，须取得用户同意后再执行浏览器扩展安装及 live 端到端验证。本轮未重装 Velora、未修改用户文档。
+
+## 2026-11-04 A4 页面格式
+
+- 新增 A4 纸张编辑视图与页面格式菜单，保留阅读宽度/全宽并记忆选择，窄窗口自适应。长文连续编辑，PDF/Word 导出自动分页。
+- HTML 打印指定 A4 与约 16.93 mm 页边距。macOS Debug 构建与 diff 检查通过；未安装或 UI 复验。
+
+## 2026-11-04 页面缩放
+
+- 增加50%–200%整体缩放与比例菜单，支持 ⌘+ / ⌘=、⌘−、⌘0，记忆比例，超宽横向滚动。
+- Release 构建、签名校验通过，安装并启动；正文聚焦时四种快捷键真实 UI 验证通过。
+
+## 2026-11-04 短页面布局优化
+
+- 修复双向滚动下空白/短文档垂直居中造成的顶部巨大留白；缩放后保持顶部对齐。标题改为34pt，缩放入口使用简洁加减号，A4画布改为浅灰。
+- Debug/Release构建、实际页面截图验证通过，已更新本机应用并启动。

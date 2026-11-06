@@ -10,9 +10,11 @@ struct DocumentKeyboardCapture: NSViewRepresentable {
     var escape: () -> Void
     var insertAfter: () -> Void
     var boundary: (Bool, Bool) -> Void
+    var zoom: (Int) -> Void = { _ in }
     func makeNSView(context: Context) -> DocumentSelectionView { DocumentSelectionView() }
     func updateNSView(_ view: DocumentSelectionView, context: Context) {
         view.selectAll = selectAll; view.delete = delete; view.copy = copy; view.escape = escape; view.insertAfter = insertAfter; view.boundary = boundary
+        view.zoom = zoom
         view.selectionActive = selected
         if selected {
             DispatchQueue.main.async {
@@ -45,7 +47,18 @@ final class DocumentSelectionView: NSView {
         if let keyboardMonitor { NSEvent.removeMonitor(keyboardMonitor); self.keyboardMonitor = nil }
         guard window != nil else { return }
         keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, self.selectionActive, event.window === self.window,
+            guard let self, event.window === self.window else { return event }
+            let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+            if self.window?.attachedSheet == nil,
+               modifiers == .command || modifiers == [.command, .shift] {
+                switch event.charactersIgnoringModifiers {
+                case "=", "+": self.zoom(1); return nil
+                case "-": self.zoom(-1); return nil
+                case "0" where modifiers == .command: self.zoom(0); return nil
+                default: break
+                }
+            }
+            guard self.selectionActive,
                   event.modifierFlags.intersection([.command, .option, .control, .shift]) == .command,
                   let key = event.charactersIgnoringModifiers?.lowercased(), ["c", "x"].contains(key),
                   Self.copySelection(in: self.window, cutting: key == "x") else { return event }
@@ -53,6 +66,7 @@ final class DocumentSelectionView: NSView {
         }
     }
     deinit { if let keyboardMonitor { NSEvent.removeMonitor(keyboardMonitor) } }
+    var zoom: (Int) -> Void = { _ in }
     var selectionActive = false
     var selectAll: () -> Void = {}
     var delete: () -> Void = {}

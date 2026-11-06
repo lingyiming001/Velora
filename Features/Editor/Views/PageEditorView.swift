@@ -127,23 +127,57 @@ private struct TableCellEditor: View {
     }
 }
 
+/// Reserve the transformed size so scrolling follows the visible document bounds.
+private struct PageZoomLayout: Layout {
+    let scale: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let content = subviews.first else { return .zero }
+        let size = content.sizeThatFits(.unspecified)
+        return CGSize(width: size.width * scale, height: size.height * scale)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, anchor: .topLeading, proposal: .unspecified)
+    }
+}
+
 struct PageEditorView: View {
     @ObservedObject var model: WorkspaceModel
     let page: Page
     @FocusState private var titleFocused: Bool
     @AppStorage("editorWidePage") private var widePage = false
+    @AppStorage("editorPageLayout") private var pageLayout = ""
+    @AppStorage("editorPageZoom") private var storedZoom = 1.0
+    private var zoom: Double { storedZoom.isFinite ? min(2, max(0.5, storedZoom)) : 1 }
+    private func changeZoom(_ delta: Double) {
+        storedZoom = min(2, max(0.5, ((zoom + delta) * 100).rounded() / 100))
+    }
+
+    private var effectiveLayout: String { pageLayout.isEmpty ? (widePage ? "wide" : "a4") : pageLayout }
+    private var isPaper: Bool { effectiveLayout == "a4" }
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         GeometryReader { viewport in
-        let documentWidth = max(1, min(widePage ? viewport.size.width : 820, viewport.size.width - 64))
+        // A4 at 96 screen points per inch, with the same 48 pt margins as exports.
+        // Keep the block controls in the left margin rather than shrinking the text area.
+        let paperWidth: CGFloat = 210 / 25.4 * 96
+        let paperInset: CGFloat = 64
+        let outerInset: CGFloat = isPaper ? 20 : 32
+        let sheetWidth = max(1, min(paperWidth, viewport.size.width - outerInset * 2))
+        let horizontalInset: CGFloat = isPaper ? min(paperInset, max(16, sheetWidth * 0.08)) : 0
+        let documentWidth = isPaper
+            ? max(1, sheetWidth - max(0, horizontalInset - EditorLayout.contentInset) - horizontalInset)
+            : max(1, min(effectiveLayout == "wide" ? viewport.size.width : 820, viewport.size.width - 64))
         ScrollViewReader { proxy in
-            ScrollView {
+            ScrollView([.horizontal, .vertical]) {
+                PageZoomLayout(scale: zoom) {
                 LazyVStack(alignment: .leading, spacing: 6) {
                     Color.clear.frame(height: 1).id("document-top")
                     TextField(L10n.tr("未命名"), text: Binding(get: { model.selectedPage?.title ?? page.title }, set: model.renameSelectedPage), axis: .vertical)
                         .textFieldStyle(.plain)
-                        .font(.system(size: 40, weight: .bold, design: .default))
+                        .font(.system(size: 34, weight: .bold, design: .default))
                         .accessibilityLabel(L10n.tr("页面标题"))
                         .focused($titleFocused)
                         .onChange(of: titleFocused) { _, focused in if focused { model.beginTitleEditing() } }
@@ -196,13 +230,26 @@ struct PageEditorView: View {
                 }
                 .overlay(alignment: .bottom) { Color.clear.frame(height: 1).id("document-bottom") }
                 .frame(width: documentWidth, alignment: .leading)
-                .padding(.horizontal, 32)
-                .padding(.top, 48)
-                .padding(.bottom, 180)
-                .frame(maxWidth: .infinity)
+                .padding(.leading, isPaper ? max(0, horizontalInset - EditorLayout.contentInset) : 32)
+                .padding(.trailing, isPaper ? horizontalInset : 32)
+                .padding(.top, isPaper ? paperInset : 48)
+                .padding(.bottom, isPaper ? paperInset : 180)
+                .frame(minHeight: isPaper ? sheetWidth * 297 / 210 : nil, alignment: .topLeading)
+                .background(Color(nsColor: .textBackgroundColor))
+                .overlay {
+                    if isPaper {
+                        Rectangle().strokeBorder(Color.primary.opacity(0.12), lineWidth: 1).allowsHitTesting(false)
+                    }
+                }
+                .shadow(color: .black.opacity(isPaper ? 0.08 : 0), radius: 8, y: 2)
+                .scaleEffect(zoom, anchor: .topLeading)
+                }
+                .padding(.horizontal, isPaper ? outerInset : 0)
+                .padding(.vertical, isPaper ? 24 : 0)
+                .frame(minWidth: viewport.size.width, minHeight: viewport.size.height, alignment: .top)
             }
             .scrollIndicators(.visible)
-            .background(Color(nsColor: .textBackgroundColor))
+            .background(Color(nsColor: isPaper ? .windowBackgroundColor : .textBackgroundColor))
             .safeAreaInset(edge: .top, spacing: 0) {
                 if model.documentFindPresented { DocumentFindBar(model: model) }
             }
@@ -224,11 +271,52 @@ struct PageEditorView: View {
                     .frame(width: 28, height: 28)
                     .accessibilityLabel(L10n.tr("插入块"))
                     .help(L10n.tr("插入块，也可输入 / 搜索"))
-                    Button { widePage.toggle() } label: {
-                        Label(widePage ? L10n.tr("阅读宽度") : L10n.tr("全宽页面"), systemImage: widePage ? "rectangle.center.inset.filled" : "rectangle")
-                    }.frame(width: 28, height: 28)
-                    .accessibilityLabel(widePage ? L10n.tr("阅读宽度") : L10n.tr("全宽页面"))
-                    .help(widePage ? L10n.tr("切换为阅读宽度") : L10n.tr("切换为全宽页面"))
+                    Menu {
+                        Picker(L10n.tr("页面格式"), selection: Binding(get: { effectiveLayout }, set: { pageLayout = $0 })) {
+                            Text("A4 · 210 × 297 mm").tag("a4")
+                            Text(L10n.tr("阅读宽度")).tag("reading")
+                            Text(L10n.tr("全宽页面")).tag("wide")
+                        }
+                        Text(L10n.tr("A4 连续编辑，PDF / Word 导出时自动分页"))
+                    } label: {
+                        Label(isPaper ? "A4" : L10n.tr("页面格式"), systemImage: isPaper ? "doc" : "rectangle")
+                    }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden)
+                    .frame(width: 28, height: 28)
+                    .accessibilityLabel(L10n.tr("页面格式"))
+                    .help(L10n.tr("页面格式：A4、阅读宽度或全宽页面"))
+                    Button { changeZoom(-0.1) } label: {
+                        Image(systemName: "minus").font(.system(size: 12, weight: .medium)).frame(width: 24, height: 28)
+                    }
+                    .disabled(zoom <= 0.5)
+                    .keyboardShortcut("-", modifiers: .command)
+                    .accessibilityLabel(L10n.tr("缩小页面"))
+                    .help(L10n.tr("缩小页面（⌘−）"))
+                    Menu {
+                        Button(L10n.tr("放大页面")) { changeZoom(0.1) }
+                            .keyboardShortcut("=", modifiers: .command).disabled(zoom >= 2)
+                        Button(L10n.tr("缩小页面")) { changeZoom(-0.1) }.disabled(zoom <= 0.5)
+                        Divider()
+                        ForEach([50, 75, 100, 125, 150, 175, 200], id: \.self) { percent in
+                            Button("\(percent)%") { storedZoom = Double(percent) / 100 }
+                        }
+                        Divider()
+                        Button(L10n.tr("恢复到 100%")) { storedZoom = 1 }
+                            .keyboardShortcut("0", modifiers: .command)
+                    } label: {
+                        Text("\(Int((zoom * 100).rounded()))%")
+                            .monospacedDigit().font(.system(size: 11)).frame(width: 42, height: 28)
+                    }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden)
+                    .accessibilityLabel(L10n.tr("页面缩放"))
+                    .help(L10n.tr("选择页面缩放比例"))
+                    Button { changeZoom(0.1) } label: {
+                        Image(systemName: "plus").font(.system(size: 12, weight: .medium)).frame(width: 24, height: 28)
+                    }
+                    .disabled(zoom >= 2)
+                    .keyboardShortcut("+", modifiers: .command)
+                    .accessibilityLabel(L10n.tr("放大页面"))
+                    .help(L10n.tr("放大页面（⌘+）"))
                     Menu {
                         Button(L10n.tr("在文档中查找…")) { model.performDocumentFind(.show) }
                         Divider()
@@ -251,7 +339,10 @@ struct PageEditorView: View {
             .background(DocumentKeyboardCapture(selected: !model.selectedBlockIDs.isEmpty,
                 selectAll: model.selectAllBlocks, delete: deleteSelection, copy: model.copySelectedBlocks, escape: model.clearBlockSelection,
                 insertAfter: model.continueAfterSelectedBlocks,
-                boundary: { model.jumpToDocumentBoundary(atStart: $0, extend: $1) }).frame(width: 0, height: 0))
+                boundary: { model.jumpToDocumentBoundary(atStart: $0, extend: $1) },
+                zoom: { direction in
+                    if direction == 0 { storedZoom = 1 } else { changeZoom(Double(direction) * 0.1) }
+                }).frame(width: 0, height: 0))
             .safeAreaInset(edge: .bottom) {
                 if !model.selectedBlockIDs.isEmpty {
                     HStack {
