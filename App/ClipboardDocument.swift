@@ -210,6 +210,22 @@ enum ClipboardDocument {
 /// Local inference is deliberately narrow; all suggestions require review.
 enum CodeLineRepair {
     static func localSuggestion(_ source: String) -> String? {
+        guard source.count <= 100_000, !source.contains("\n"), !source.contains("\r") else { return nil }
+        // A constructor, invocation and print joined to a from-import. Repeated
+        // names establish the split in the merged imported-name/variable token.
+        // Arguments allow quoted parentheses, but deliberately exclude nested
+        // calls and comments rather than guessing their layout.
+        let argument = #"(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^"'()#])*"#
+        let pattern = #"^(from[ \t]+[A-Za-z_][\w.]*[ \t]+import[ \t]+)([A-Za-z_]\w*?)([A-Za-z_]\w*[ \t]*=[ \t]*\2[ \t]*\("#
+            + argument + #"\))([A-Za-z_]\w*[ \t]*=[ \t]*[A-Za-z_]\w*\.invoke[ \t]*\("#
+            + argument + #"\))(print[ \t]*\([A-Za-z_]\w*\.content\))[ \t]*$"#
+        if let regex = try? NSRegularExpression(pattern: pattern),
+           let match = regex.firstMatch(in: source, range: NSRange(source.startIndex..., in: source)) {
+            let text = source as NSString
+            let suggestion = text.substring(with: match.range(at: 1)) + text.substring(with: match.range(at: 2))
+                + "\n\n" + (3...5).map { text.substring(with: match.range(at: $0)) }.joined(separator: "\n")
+            return try? validated(suggestion, original: source)
+        }
         // An import joined to a simple module-attribute iteration, retaining its
         // indentation. Backreferences establish both the module and loop variable.
         if source.count <= 100_000, !source.contains("\n"),

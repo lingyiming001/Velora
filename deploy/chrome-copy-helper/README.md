@@ -21,3 +21,7 @@
 ## 卸载
 
 在 Chrome 扩展程序管理页移除本助手即可，Velora 与原文不会被修改。
+
+## 1.1.0 常用语言统一支持
+
+按代码块结构保留源码，不依赖语言语法猜测。自动测试覆盖 Java、Python、JavaScript、TypeScript、Go、Rust、Bash、SQL、JSON、YAML、HTML、CSS、Plain Text 的多块混合复制和 Velora 导入；保留语言标签、空行、缩进和字符串。新增识别 ChatGPT `data-code-block-source` 静态代码块，避免 Plain Text 被当成普通内联代码。

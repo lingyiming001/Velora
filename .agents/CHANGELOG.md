@@ -96,6 +96,19 @@
 - 添加从合成 copy 事件到 Velora HTML/Markdown 导入的集成测试，包含 Python+Plain Text+正文混排、部分代码选区、空行、普通正文不拦截、虚拟缺行不拦截。DocumentTransferTests 54 项全部通过，日志 .agents/test/browser-copy-helper-tests.log，JS 语法与 diff 检查通过。
 - 尚未加载到 Chrome、尚未在真实网页验证助手拦截效果。加载会新增 ChatGPT 页面访问权限，须取得用户同意后再执行浏览器扩展安装及 live 端到端验证。本轮未重装 Velora、未修改用户文档。
 
+## 2026-11-04：常用语言代码块复制统一支持
+
+- 经用户明确授权，已在 Chrome 加载本地扩展 ciheichjbbkmccihdhpdmcjddeofhhna，并升级启用 1.1.0；页面已刷新，无新增权限。
+- 真实 1.0.0 复制测试证实 Python CodeMirror 行已保留；发现 Plain Text 的 data-code-block-source 无 PRE，导致仍以行内代码导入。1.1.0 统一将 data-code-block 卡片源转为 PRE，保留语言标签，移除控件；不依赖语言语法，因此兼容常用代码语言。
+- 新增13种语言/文本混合复制回归：Java/Python/JavaScript/TypeScript/Go/Rust/Bash/JSON/YAML/SQL/HTML/CSS/Plain text，验证代码字符、换行、空行、缩进、语言、控件排除和 Velora 转换。文档转换55项全部通过，日志 .agents/test/common-language-copy-tests.log；JS语法和diff检查通过，ZIP分发包更新。
+- 用户第01章5的截图损坏代码已从 ChatGPT 自身 Copy code 按钮得到原始源码恢复，32行，py_compile语法验证通过，重新打开仍正常；已删除过期警告块。
+- 1.1.0 已更新启用，但刷新后查找暂未定位到源段，尚未完成该版本真实多块粘贴复验；不宣称所有页面/未来网页结构绝对兼容。
+
+## 2026-11-04：ChatOpenAI 粘贴换行优化
+
+- 支持 from-import、模型构造、invoke 和 print 粘连的本地修复预览；保留代码字符和字符串内容。
+- HTML 已保留代码结构时优先保留其换行和缩进，不再用有损纯文本覆盖。文档转换回归 57 项通过。
+
 ## 2026-11-04 A4 页面格式
 
 - 新增 A4 纸张编辑视图与页面格式菜单，保留阅读宽度/全宽并记忆选择，窄窗口自适应。长文连续编辑，PDF/Word 导出自动分页。
@@ -110,3 +123,12 @@
 
 - 修复双向滚动下空白/短文档垂直居中造成的顶部巨大留白；缩放后保持顶部对齐。标题改为34pt，缩放入口使用简洁加减号，A4画布改为浅灰。
 - Debug/Release构建、实际页面截图验证通过，已更新本机应用并启动。
+
+## 2026-11-06 页面渲染优化
+
+- 编辑器在渲染对应块时才解码表格和计算代码行数，减少长文档在选择、聚焦和编辑时的重复计算。
+- 富文本预览跳过队列中过时的请求。仅调整字号时复用现有 Markdown、公式和图表节点。
+
+## 2026-11-06 无序列表公式修复
+
+- 导入 Markdown 或粘贴网页内容时，含 LaTeX 的无序列表保留原始公式定界符并交由 KaTeX 渲染。普通列表、行内代码及勾选项继续使用原生编辑。

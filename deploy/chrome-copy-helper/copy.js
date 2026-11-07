@@ -68,7 +68,19 @@
     if (editor && editor === end?.closest('.cm-content')) {
       root.replaceChildren(pre(doc, selectedEditorText(range, editor)));
     } else {
-      if (!root.querySelector('pre,' + editorSelector + ',' + lineSelector)) return null;
+      if (!root.querySelector('pre,[data-code-block-source],' + editorSelector + ',' + lineSelector)) return null;
+      // Normalize whole source cards across languages, including static Java,
+      // shell and Plain Text blocks that have CODE but no PRE wrapper.
+      for (const card of Array.from(root.querySelectorAll('[data-code-block]'))) {
+        const source = card.querySelector('.cm-content,[data-code-block-source],pre');
+        if (!source) continue;
+        const label = card.querySelector('[data-markdown-copy="exclude"] .truncate')?.textContent.trim() || '';
+        const language = card.getAttribute('data-language') || label.toLowerCase();
+        card.replaceWith(pre(doc, codeText(source), language));
+      }
+      for (const source of Array.from(root.querySelectorAll('[data-code-block-source]'))) {
+        source.replaceWith(pre(doc, codeText(source), source.getAttribute('data-language') || ''));
+      }
       // Normalize PRE first so editor wrappers do not create nested PRE nodes.
       for (const node of Array.from(root.querySelectorAll('pre'))) {
         const language = node.getAttribute('data-language') || (node.querySelector('code')?.className.match(/language-([\w+#.-]+)/) || [])[1] || '';
@@ -94,7 +106,7 @@
         flush();
       }
     }
-    root.querySelectorAll('button,script,style,.cm-gutters,.cm-announced,.cm-tooltip').forEach(n => n.remove());
+    root.querySelectorAll('button,script,style,[data-markdown-copy=exclude],svg,.cm-gutters,.cm-announced,.cm-tooltip').forEach(n => n.remove());
     const html = root.innerHTML;
     if (html.length > 2_000_000) return null;
     // Trim only outer prose separators; PRE text itself is never trimmed.

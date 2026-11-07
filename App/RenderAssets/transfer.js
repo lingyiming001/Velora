@@ -145,9 +145,10 @@ window.htmlToMarkdown = function(input,plainText='') {
     }
     const source=read(node).replace(/\r\n?/g,'\n').replace(/\n$/,'');
     // Some rich clipboard HTML drops all visual line breaks. Plain text still
-    // carries them: use it only when the exact non-whitespace source occurs once.
+    // carries them: use it only for flattened HTML with one exact match.
+    // Existing HTML line boundaries and indentation take precedence.
     const plain=plainText.replace(/\r\n?/g,'\n'),key=source.replace(/\s/g,'');
-    if(key.length>=12&&key.length<=200000&&plain.length<=1000000){
+    if(!source.includes('\n')&&key.length>=12&&key.length<=200000&&plain.length<=1000000){
       let compact='',positions=[];
       for(let i=0;i<plain.length;i++)if(!/\s/.test(plain[i])){compact+=plain[i];positions.push(i);}
       const match=compact.indexOf(key);
@@ -225,6 +226,7 @@ window.htmlToMarkdown = function(input,plainText='') {
   return children(clean).replace(/VELORAHTMLMATH([0-9]+)TOKEN/g,(_,i)=>formulas[Number(i)]||'').trim();
 };
 window.prepareExport = async function(){
+  renderedContent=undefined;
   document.documentElement.classList.remove('dark');
   const style=document.createElement('style');style.textContent='html,body{overflow:visible!important}#content{padding:0}pre code{white-space:pre-wrap!important;overflow-wrap:anywhere}table{table-layout:fixed}td,th{min-width:0!important;overflow-wrap:anywhere}img{max-width:100%;height:auto}.code-header button,.mermaid-source{display:none}';document.head.append(style);
   await document.fonts.ready;

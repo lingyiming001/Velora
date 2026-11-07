@@ -27,18 +27,28 @@ function unwrapEquation(source){
 function reportHeight(){
   window.webkit?.messageHandlers.layout.postMessage(Math.ceil(root.getBoundingClientRect().height));
 }
-let renderSequence=0,renderQueue=Promise.resolve();
+let renderSequence=0,renderQueue=Promise.resolve(),renderedContent;
 window.renderContent=function(source,equation,dark,fontSize,language='zh-Hans'){
   const version=++renderSequence;
   const task=renderQueue.then(()=>renderPage(source,equation,dark,fontSize,language,version));
   renderQueue=task.catch(()=>{});return task;
 };
 async function renderPage(source,equation,dark,fontSize,language='zh-Hans',version){
+  if(version!==renderSequence)return false;
+  document.body.style.fontSize=Math.max(12,Math.min(28,fontSize))+'px';
+  if(renderedContent?.source===source && renderedContent.equation===equation &&
+     renderedContent.dark===dark && renderedContent.language===language){
+    reportHeight();
+    return true;
+  }
+  // A superseded diagram render can leave partially replaced content.
+  renderedContent=undefined;
   interfaceLanguage=language;
   document.documentElement.lang=language;
   document.documentElement.classList.toggle('dark',dark);
-  document.getElementById('code-theme').setAttribute('href',dark?'highlight-dark.css':'highlight-light.css');
-  document.body.style.fontSize=Math.max(12,Math.min(28,fontSize))+'px';
+  const theme=document.getElementById('code-theme');
+  const stylesheet=dark?'highlight-dark.css':'highlight-light.css';
+  if(theme.getAttribute('href')!==stylesheet)theme.setAttribute('href',stylesheet);
   root.className=equation?'equation':'';
   if(equation){root.replaceChildren();renderMath(root,unwrapEquation(source),true);}
   else {
@@ -71,6 +81,7 @@ async function renderPage(source,equation,dark,fontSize,language='zh-Hans',versi
     root.querySelectorAll('table').forEach(table=>{const scroll=document.createElement('div');scroll.className='table-scroll';table.replaceWith(scroll);scroll.append(table);});
     root.querySelectorAll('input').forEach(input=>input.disabled=true);
   }
+  renderedContent={source,equation,dark,language};
   reportHeight();document.fonts.ready.then(reportHeight);return true;
 }
 new ResizeObserver(reportHeight).observe(root);

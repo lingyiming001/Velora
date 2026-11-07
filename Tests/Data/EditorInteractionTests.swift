@@ -3038,6 +3038,23 @@ final class EditorInteractionTests: XCTestCase {
         XCTAssertEqual(result["attacked"] as? Bool, false)
         XCTAssertEqual(result["dark"] as? Bool, true)
         XCTAssertGreaterThan(result["height"] as? Double ?? 0, 100)
+        let resized = try await view.callAsyncJavaScript("""
+            const code = document.querySelector('pre code');
+            const rendered = await renderContent(source, false, true, 22);
+            return rendered && code === document.querySelector('pre code')
+                && getComputedStyle(document.body).fontSize === '22px';
+            """, arguments: ["source": sample], in: nil, contentWorld: .page)
+        XCTAssertEqual(resized as? Bool, true, "Changing only font size should preserve the rendered content")
+
+        let superseded = try await view.callAsyncJavaScript("""
+            const code = document.querySelector('pre code');
+            const oldRender = renderContent('Superseded text', false, false, 17);
+            const latestRender = renderContent(source, false, true, 17);
+            return (await oldRender) === false && (await latestRender)
+                && code === document.querySelector('pre code');
+            """, arguments: ["source": sample], in: nil, contentWorld: .page)
+        XCTAssertEqual(superseded as? Bool, true, "Queued renders should skip superseded content")
+
         _ = try await view.callAsyncJavaScript("return renderContent(source, true, false, 17)", arguments: ["source": #"\[\begin{pmatrix}a&b\\c&d\end{pmatrix}\]"#], in: nil, contentWorld: .page)
         let matrix = try await view.evaluateJavaScript("document.querySelectorAll('.katex .mtable').length")
         XCTAssertGreaterThan(matrix as? Int ?? 0, 0)

@@ -40,6 +40,14 @@ final class DocumentTransferTests: XCTestCase {
         }
     }
 
+    func testStructuredHTMLCodeIsNotOverwrittenByLossyPlainText() async throws {
+        let source = "if True:\n    print(\"hello  world\")\n\n    print(\"done\")"
+        let plain = "if True:\nprint(\"hello world\")\nprint(\"done\")"
+        let markdown = try await ClipboardDocument.markdown(plain: plain, html: "<pre><code class='language-python'>" + HTMLTransfer.escape(source) + "</code></pre>")
+        let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+        XCTAssertEqual(blocks.first { $0.kind == .code }?.text, source)
+    }
+
     private func captureChatGPTBrowserCopy(_ fixture: String, selectionScript: String = "range.selectNodeContents(fixture);") async throws -> [String: String] {
         let scriptURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("deploy/chrome-copy-helper/copy.js")
         let helper = try String(contentsOf: scriptURL, encoding: .utf8)
@@ -69,6 +77,34 @@ final class DocumentTransferTests: XCTestCase {
         XCTAssertEqual(blocks.filter { $0.kind == .code }.map(\.text), [python, plain])
         XCTAssertTrue(blocks.contains { $0.text == "之前" })
         XCTAssertTrue(blocks.contains { $0.text == "之后" })
+    }
+
+    func testBrowserCopyHelperCommonLanguageCardsPreserveSourceAndLanguage() async throws {
+        let samples: [(String, String)] = [
+            ("Java", "class Demo {\n    String s = \"hello\";\n}"),
+            ("Python", "import os\n\nprint(os.getcwd())"),
+            ("JavaScript", "const a = {\n  value: 1\n};"),
+            ("TypeScript", "interface User {\n  name: string;\n}"),
+            ("Go", "package main\n\nfunc main() {\n\tprintln(1)\n}"),
+            ("Rust", "fn main() {\n    println!(\"ok\");\n}"),
+            ("Bash", "#!/bin/bash\n\necho \"hello world\""),
+            ("JSON", "{\n  \"a\": 1\n}"),
+            ("YAML", "items:\n  - one\n  - two"),
+            ("SQL", "SELECT name\nFROM users\nWHERE id = 1;"),
+            ("HTML", "<main>\n  <p>Hello</p>\n</main>"),
+            ("CSS", ".card {\n  color: red;\n}"),
+            ("Plain text", "Windows:\n.venv/Lib/\n\nmacOS / Linux:\n.venv/lib/")
+        ]
+        let fixture = "<p>开始</p>" + samples.map { language, source in
+            "<div data-code-block='true'><div data-markdown-copy='exclude'><div class='truncate'>" + language + "</div><button>Copy</button></div><div data-code-block-source='true'><code><span>" + HTMLTransfer.escape(source) + "</span></code></div></div>"
+        }.joined() + "<p>结束</p>"
+        let copy = try await captureChatGPTBrowserCopy(fixture)
+        let markdown = try await ClipboardDocument.markdown(plain: copy["text/plain"], html: copy["text/html"])
+        let blocks = try DocumentTransfer.markdown(markdown, title: "", consumeLeadingTitle: false).pages[0].blocks
+        XCTAssertEqual(blocks.filter { $0.kind == .code }.map(\.text), samples.map { $0.1 })
+        XCTAssertEqual(blocks.filter { $0.kind == .code }.map { $0.language.lowercased() }, samples.map { $0.0.lowercased() })
+        XCTAssertFalse(copy["text/plain"]?.contains("Copy") ?? true)
+        for (_, source) in samples { XCTAssertTrue(copy["text/plain"]?.contains(source) ?? false) }
     }
 
     func testBrowserCopyHelperPreservesPartialEditorSelectionAndRepeatedBlankLines() async throws {
@@ -107,6 +143,20 @@ final class DocumentTransferTests: XCTestCase {
         XCTAssertEqual(try CodeLineRepair.validated(expected, original: source), expected)
         XCTAssertNil(CodeLineRepair.localSuggestion("import sysfor path in other.path:    print(path)"))
         XCTAssertNil(CodeLineRepair.localSuggestion("import sysfor path in sys.path:    print(other)"))
+    }
+
+    func testLocalCodeLineRepairRestoresChatOpenAIExample() throws {
+        let source = #"from langchain_openai import ChatOpenAImodel = ChatOpenAI(    model="gpt-4o-mini")response = model.invoke("你好")print(response.content)"#
+        let expected = "from langchain_openai import ChatOpenAI\n\nmodel = ChatOpenAI(    model=\"gpt-4o-mini\")\nresponse = model.invoke(\"你好\")\nprint(response.content)"
+        XCTAssertEqual(CodeLineRepair.localSuggestion(source), expected)
+        XCTAssertEqual(try CodeLineRepair.validated(expected, original: source), expected)
+        let quoted = source.replacingOccurrences(of: "你好", with: #"你好 )print( \\\"世界\\\""#)
+        let repaired = try XCTUnwrap(CodeLineRepair.localSuggestion(quoted))
+        XCTAssertEqual(try CodeLineRepair.validated(repaired, original: quoted), repaired)
+        XCTAssertNil(CodeLineRepair.localSuggestion(expected))
+        XCTAssertNil(CodeLineRepair.localSuggestion(source.replacingOccurrences(of: "= ChatOpenAI(", with: "= OtherModel(")))
+        XCTAssertNil(CodeLineRepair.localSuggestion(source.replacingOccurrences(of: "\"你好\"", with: "get_prompt()")))
+        XCTAssertNil(CodeLineRepair.localSuggestion(source.replacingOccurrences(of: "response =", with: "# comment response =")))
     }
 
     func testCodeLineRepairRejectsChangedCodeAndStringContents() throws {
@@ -602,6 +652,51 @@ final class DocumentTransferTests: XCTestCase {
         XCTAssertEqual(zip(blocks, ListNumbering.numbers(blocks)).filter { $0.0.kind == .numbered }.map { $0.1 }, [1, 2, 3, 2, 3])
         XCTAssertNil(blocks[1].listStart)
         XCTAssertEqual(blocks[4].listStart, 2)
+    }
+
+    func testUnorderedListMathSurvivesMarkdownAndChatGPTClipboard() async throws {
+        let source = #"""
+        - \(N_{\text{cpu}}\)：可用 CPU 核数
+        - $U_{\text{cpu}}$：目标 CPU 利用率
+        - \(W\)：平均等待时间
+        - \(C\)：平均计算时间
+        """#
+        let blocks = try DocumentTransfer.markdown(source, title: "").pages[0].blocks
+        XCTAssertEqual(blocks.map(\.kind), [.markdown])
+        XCTAssertEqual(blocks.first?.text, source)
+
+        let html = #"""
+        <ul>
+        <li><span class="katex"><math><semantics><annotation encoding="application/x-tex">N_{\text{cpu}}</annotation></semantics></math></span>：可用 CPU 核数</li>
+        <li><span class="katex"><math><semantics><annotation encoding="application/x-tex">W</annotation></semantics></math></span>：平均等待时间</li>
+        </ul>
+        """#
+        let pasted = try await ClipboardDocument.markdown(plain: "(N_{\\text{cpu}})：可用 CPU 核数", html: html)
+        let pastedBlocks = try DocumentTransfer.markdown(pasted, title: "").pages[0].blocks
+        XCTAssertEqual(pastedBlocks.map(\.kind), [.markdown])
+        XCTAssertTrue(pastedBlocks.first?.text.contains(#"\(N_{\text{cpu}}\)"#) == true)
+
+        let session = DocumentRenderSession()
+        defer { session.close() }
+        for (items, count) in [(blocks, 4), (pastedBlocks, 2)] {
+            let result = try await session.run("""
+                await renderContent(source, false, false, 17);
+                return [document.querySelectorAll('#content ul > li').length,
+                        document.querySelectorAll('#content ul > li .katex').length];
+                """, arguments: ["source": try XCTUnwrap(items.first?.text)])
+            XCTAssertEqual(result as? [Int], [count, count])
+        }
+
+        let literal = #"""
+        - Plain bullet
+        - Code: `$x$`
+        - Escaped: \$x\$
+        - [x] Completed task
+        """#
+        let native = try DocumentTransfer.markdown(literal, title: "").pages[0].blocks
+        XCTAssertEqual(native.map(\.kind), [.bullet, .bullet, .bullet, .todo])
+        XCTAssertTrue(native[1].formatting.contains { $0.style.code })
+        XCTAssertTrue(native.last?.checked == true)
     }
 
     func testBrowserClipboardPrefersSemanticHTMLOverPartialMarkdownPlainText() async throws {

@@ -14,8 +14,6 @@ struct EditorRowSnapshot: Identifiable, Equatable {
     let number: Int
     let headings: [Block]
     let contentRevision: UInt64
-    let codeLineCount: Int
-    let tableCells: [[String]]
     let findMatches: [DocumentFindMatch]
     let currentFindMatch: DocumentFindMatch?
 
@@ -30,20 +28,9 @@ struct EditorRowSnapshot: Identifiable, Equatable {
                         focusRequest: focus?.blockID == block.id ? focus : nil,
                         number: displayNumber,
                         headings: block.kind == .tableOfContents ? headings : [], contentRevision: revisions[block.id] ?? 0,
-                        codeLineCount: block.kind == .code && !block.text.isEmpty ? block.text.utf8.reduce(1) { $1 == 10 ? $0 + 1 : $0 } : 0,
-                        tableCells: block.kind == .table ? tableCells(for: block) : [],
                         findMatches: findByBlock[block.id] ?? [], currentFindMatch: currentFindMatch?.blockID == block.id ? currentFindMatch : nil)
         }
     }
-    private static func tableCells(for block: Block) -> [[String]] {
-        if let rows = try? JSONDecoder().decode([[String]].self, from: Data(block.text.utf8)),
-           !rows.isEmpty, let columns = rows.first?.count, columns > 0,
-           rows.allSatisfy({ $0.count == columns }) {
-            return rows.map { $0.map { TableCellContent.visible($0, layout: block.tableLayout) } }
-        }
-        return [[block.text, ""], ["", ""]]
-    }
-
 }
 
 enum SlashCommandMenu {
@@ -940,7 +927,14 @@ private struct EditorBlockRow: View, Equatable {
         }
     }
 
-    private var cells: [[String]] { snapshot.tableCells }
+    private var tableCells: [[String]] {
+        if let rows = try? JSONDecoder().decode([[String]].self, from: Data(block.text.utf8)),
+           !rows.isEmpty, let columns = rows.first?.count, columns > 0,
+           rows.allSatisfy({ $0.count == columns }) {
+            return rows.map { $0.map { TableCellContent.visible($0, layout: block.tableLayout) } }
+        }
+        return [[block.text, ""], ["", ""]]
+    }
 
     private func saveCells(_ rows: [[String]]) { model.changeTableCells(rows, in: block) }
 
@@ -991,10 +985,6 @@ private struct EditorBlockRow: View, Equatable {
             }
     }
 
-    private var tableGridWidth: CGFloat {
-        cells[0].indices.reduce(CGFloat(2 + max(0, cells[0].count - 1))) { $0 + columnWidth($1) }
-    }
-
     private var tableControlsVisible: Bool {
         focusedTableCell != nil || snapshot.selected || columnDrag != nil || rowDrag != nil
     }
@@ -1029,7 +1019,10 @@ private struct EditorBlockRow: View, Equatable {
     }
 
     private var tableContent: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let cells = tableCells
+        let columns = cells[0].count
+        let gridWidth = (0..<columns).reduce(CGFloat(2 + max(0, columns - 1))) { $0 + columnWidth($1) }
+        return VStack(alignment: .leading, spacing: 8) {
             ScrollView(.horizontal) {
                 VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 5) {
@@ -1113,7 +1106,7 @@ private struct EditorBlockRow: View, Equatable {
                 HStack(spacing: 5) {
                     Button { model.appendTableAxes(row: true, column: false, in: block) } label: {
                         Label(L10n.tr("添加行"), systemImage: "plus").labelStyle(.iconOnly)
-                            .frame(width: tableGridWidth, height: 28).contentShape(Rectangle())
+                            .frame(width: gridWidth, height: 28).contentShape(Rectangle())
                     }
                     .buttonStyle(.plain).background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 7))
                     .help(L10n.tr("添加行"))
@@ -1315,7 +1308,8 @@ private struct EditorBlockRow: View, Equatable {
             .help(L10n.tr("选择语言"))
             Spacer(minLength: 8)
             if codeLineCount {
-                Text(L10n.tr("\(snapshot.codeLineCount) 行"))
+                let lines = block.text.isEmpty ? 0 : block.text.utf8.reduce(1) { $1 == 10 ? $0 + 1 : $0 }
+                Text(L10n.tr("\(lines) 行"))
                     .monospacedDigit().foregroundStyle(.tertiary)
             }
             Button(action: beginCodeRepair) {

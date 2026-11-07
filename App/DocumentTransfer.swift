@@ -370,6 +370,17 @@ enum DocumentTransfer {
         return trimmed
     }
 
+    // Consume escapes and inline code before looking for math delimiters.
+    private static let listInlineTokens = try! NSRegularExpression(
+        pattern: #"(?<!`)(`+)(?!`)[^\n]*?(?<!`)\1(?!`)|(\\\([^\n]+?\\\)|\\\[[^\n]+?\\\]|\$\$[^\n]+?\$\$|\$(?!\$)(?:\\.|[^\n$\\])+?\$)|\\."#
+    )
+
+    private static func listItemHasMath(_ text: String) -> Bool {
+        guard text.contains("$") || text.contains("\\(") || text.contains("\\[") else { return false }
+        return listInlineTokens.matches(in: text, range: NSRange(text.startIndex..., in: text))
+            .contains { $0.range(at: 2).location != NSNotFound }
+    }
+
     static func markdown(_ input: String, title: String, directory: URL? = nil, consumeLeadingTitle: Bool = true) throws -> TransferDocument {
         let lines = input.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n").components(separatedBy: "\n")
         var blocks: [TransferBlock] = []; var paragraph: [String] = []; var pageTitle = title; var index = 0; var consumedTitle = false
@@ -394,6 +405,20 @@ enum DocumentTransfer {
                 if nested {
                     flush(); blocks.append(TransferBlock(.markdown, lines[index..<end].joined(separator: "\n")))
                     index = end; continue
+                }
+                // Native list items parse Markdown escapes as ordinary text.
+                // Keep a list with formulas together for the KaTeX renderer.
+                var bulletEnd = index
+                var hasMath = false
+                while bulletEnd < end,
+                      firstMatch(#"^\s*[-*+]\s+(?!\[[ xX]\](?:\s|$))\S"#, lines[bulletEnd]) != nil {
+                    if !hasMath { hasMath = listItemHasMath(lines[bulletEnd]) }
+                    bulletEnd += 1
+                }
+                if hasMath {
+                    flush()
+                    blocks.append(TransferBlock(.markdown, lines[index..<bulletEnd].joined(separator: "\n")))
+                    index = bulletEnd; continue
                 }
             }
             if paragraph.isEmpty, line.hasPrefix("    ") || line.hasPrefix("\t") {
